@@ -23,6 +23,39 @@ an email land in a thank-you outbox that a human works by hand.
 
 ---
 
+## PV — Version control (done / in progress)
+
+Prerequisite for everything else: P1 deploys from a Git repository, so
+the repo must exist before hosting is configured.
+
+**Done:** `git init` at the workspace root, `main` branch, initial commit
+of the prototype and this spec. `.gitignore` excludes `*.db`, `*.ankiaddon`,
+`__pycache__/`, `.env*`, and `.DS_Store`.
+
+The database exclusion is a privacy requirement, not tidiness — the
+suggestions table stores submitter email addresses. It must never reach a
+remote, public or private.
+
+**Remaining (owner: Mario):**
+
+1. Create the GitHub repository. Private until the public `/updates`
+   ledger and the code are both ready to be seen.
+2. `git remote add origin <url>` and `git push -u origin main`.
+3. Connect the repository to Northflank so P1 builds from it.
+
+**Repository layout note.** The workspace currently nests
+`doctrine-review-proto/doctorine-proto/`. Two levels for one project is
+redundant and will read badly as a GitHub repo root. P0 flattens this:
+the inner folder's contents move up to the repository root as part of the
+rename, so the tree becomes `addon/`, `platform/`, `docs/`, `README.md`.
+
+**Secrets.** No credential is ever committed. `PIPELINE_API_KEY` (P4) and
+any future SMTP settings (P5) are set as Northflank environment
+variables. Generated reviewer passwords (P2) are displayed once in the
+browser and never written to a file.
+
+---
+
 ## P0 — Rename to Doctrine Editor
 
 Blocks everything else; every later phase touches these strings.
@@ -312,9 +345,11 @@ change. The final measured values are then written back as the defaults.
 
 ## Sequencing
 
-P0 → P1 → P2 → P3 → P4 → P5 → P6.
+PV → P0 → P1 → P2 → P3 → P4 → P5 → P6.
 
-P0 first because every later phase edits the same identifiers. P1 before
+PV first because P1 deploys from a Git remote, so the repository has to
+exist and be connected before hosting can be set up. P0 next because
+every later phase edits the same identifiers. P1 before
 P2 because `Secure` cookies require the HTTPS that hosting provides. P6
 last because it needs the other add-on running side by side to measure
 against.
