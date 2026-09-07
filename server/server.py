@@ -1262,6 +1262,40 @@ def set_active(user_id, active):
             conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
 
 
+def bootstrap_admin(username):
+    """Create the very first admin, once, from BOOTSTRAP_ADMIN.
+
+    A fresh deploy has no users at all, so there is no way in and no way
+    to create one. This closes that gap without needing shell access.
+
+    It acts ONLY when zero admins exist. Leaving the variable set is
+    therefore harmless: it cannot reset an existing admin's password and
+    cannot mint a second admin if someone changes the value.
+    """
+    username = (username or "").strip()
+    if not username:
+        return
+    if count_active_admins() > 0:
+        return
+    with db() as conn:
+        any_admin = conn.execute(
+            "SELECT id FROM users WHERE role='admin'").fetchone()
+    if any_admin:
+        return
+
+    password = auth.generate_password()
+    ok, message = create_user(username, password, "admin")
+    if not ok:
+        print(f"BOOTSTRAP_ADMIN: {message}", flush=True)
+        return
+    print("=" * 62, flush=True)
+    print(f"  Created first admin {username!r}", flush=True)
+    print(f"  Password: {password}", flush=True)
+    print("  Shown once. Sign in, change it at /account, then remove", flush=True)
+    print("  the BOOTSTRAP_ADMIN variable.", flush=True)
+    print("=" * 62, flush=True)
+
+
 def _cli_adduser(argv):
     import getpass
 
@@ -1296,6 +1330,8 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "adduser":
         raise SystemExit(_cli_adduser(sys.argv[2:]))
+
+    bootstrap_admin(os.environ.get("BOOTSTRAP_ADMIN", ""))
 
     print(f"Doctrine Editor platform — {CFG.public_base_url}", flush=True)
     print(f"  Reviewer queue:  {CFG.public_base_url}/reviewer", flush=True)
