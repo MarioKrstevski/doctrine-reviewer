@@ -1,5 +1,5 @@
 {
-  "bootstrap_url": "http://127.0.0.1:8787",
+  "bootstrap_url": "https://doctrine-editor-production.up.railway.app",
   "api_base_override": "",
   "id_field": "DoctrineID",
   "button_top_offset": 150,

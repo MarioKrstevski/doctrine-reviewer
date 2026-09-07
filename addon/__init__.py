@@ -43,7 +43,7 @@ SUGGESTION_TYPES = [
 
 # ---------------------------------------------------------------- config
 
-DEFAULT_BOOTSTRAP = "http://127.0.0.1:8787"
+DEFAULT_BOOTSTRAP = "https://doctrine-editor-production.up.railway.app"
 
 
 def get_config():
