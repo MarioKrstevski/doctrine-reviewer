@@ -30,7 +30,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import resolver, state
+from . import chunk_util, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
 
@@ -124,13 +124,21 @@ def content_hash(fields: dict, id_field: str) -> str:
 
 # ---------------------------------------------------------------- http
 
-def post_json(url: str, payload: dict, bearer: str = "") -> dict:
+# A single suggestion is small and interactive, so it fails fast. A deck
+# registration uploads every note and needs room to finish.
+SUGGEST_TIMEOUT = 20
+REGISTER_TIMEOUT = 120
+REGISTER_BATCH_SIZE = 100
+
+
+def post_json(url: str, payload: dict, bearer: str = "",
+              timeout: int = SUGGEST_TIMEOUT) -> dict:
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -391,22 +399,40 @@ def stamp_and_register_deck():
         })
 
     def task():
-        return post_json(api_base(cfg) + "/api/master/sync",
-                         {"notes": registered}, PIPELINE_API_KEY)
+        """Upload in batches: one request per deck exceeded the timeout."""
+        url = api_base(cfg) + "/api/master/sync"
+        totals = {"registered": 0, "updated": 0, "batches": 0}
+        batches = list(chunk_util.chunked(registered, REGISTER_BATCH_SIZE))
+        for index, batch in enumerate(batches, start=1):
+            mw.taskman.run_on_main(
+                lambda i=index, n=len(batches):
+                    mw.progress.update(label=f"Registering batch {i} of {n}…"))
+            result = post_json(url, {"notes": batch}, PIPELINE_API_KEY,
+                               timeout=REGISTER_TIMEOUT)
+            totals["registered"] += result.get("registered", 0)
+            totals["updated"] += result.get("updated", 0)
+            totals["batches"] += 1
+        return totals
 
     def on_done(fut):
+        mw.progress.finish()
         try:
             result = fut.result()
         except Exception as e:
-            showWarning(f"Registration failed:\n{e}")
+            showWarning(
+                f"Registration failed:\n{e}\n\n"
+                "Notes were stamped locally but the upload did not finish. "
+                "Re-run this to retry — already-stamped notes keep their IDs.")
             return
         showInfo(
-            f"Registered {result.get('registered', 0)} notes "
+            f"Registered {result.get('registered', 0)} notes in "
+            f"{result.get('batches', 0)} batch(es) "
             f"({result.get('updated', 0)} updated to a new version).\n\n"
             "Note: adding the ID field changed the note types, so Anki may "
             "ask for a full sync — that's expected on a test profile."
         )
 
+    mw.progress.start(label="Registering deck…", immediate=True)
     mw.taskman.run_in_background(task, on_done)
 
 
