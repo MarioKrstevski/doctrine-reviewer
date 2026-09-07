@@ -381,7 +381,8 @@ document.querySelectorAll('.actions input[name=publish]').forEach(cb => {{
 
 # ---------------------------------------------------------------- pages
 
-def render_reviewer():
+def render_reviewer(user=None, secret=None, session_token=None):
+    csrf = auth.csrf_token(session_token, secret) if session_token and secret else ""
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM suggestions ORDER BY "
@@ -452,6 +453,7 @@ def render_reviewer():
             actions = f"""
 <div class="actions">{expire_hint}
 <form method="post" action="/reviewer/action">
+  <input type="hidden" name="csrf" value="{csrf}">
   <input type="hidden" name="id" value="{r['id']}">
   <input type="text" name="resolution_note" class="grow" placeholder="Internal note (optional)">
   <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to updates</label>
@@ -645,7 +647,7 @@ def api_register(data):
     return 200, {"ok": True, "registered": registered, "updated": updated}
 
 
-def reviewer_action(form):
+def reviewer_action(form, user_id=None):
     sid = form.get("id", [""])[0]
     action = form.get("do", [""])[0]
     status = {"resolve": "resolved", "decline": "declined",
@@ -656,11 +658,12 @@ def reviewer_action(form):
     with db() as conn:
         conn.execute(
             """UPDATE suggestions SET status=?, resolution_note=?, published=?,
-               publish_summary=?, credit_name=?, closed_at=?
+               publish_summary=?, credit_name=?, closed_at=?, resolved_by=?
                WHERE id=? AND status='open'""",
             (status, form.get("resolution_note", [""])[0].strip() or None,
              publish, form.get("publish_summary", [""])[0].strip() or None,
-             form.get("credit_name", [""])[0].strip() or None, now(), sid))
+             form.get("credit_name", [""])[0].strip() or None, now(),
+             user_id, sid))
 
 
 # ---------------------------------------------------------------- http handler
@@ -679,6 +682,38 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, obj):
         self._send(code, json.dumps(obj), "application/json")
 
+    def _redirect(self, location, cookie=None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _cookie_token(self):
+        raw = self.headers.get("Cookie", "")
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE_NAME:
+                return value
+        return None
+
+    def _set_cookie(self, token, clear=False):
+        attrs = [f"{COOKIE_NAME}={'' if clear else token}",
+                 "Path=/", "HttpOnly", "SameSite=Lax"]
+        if CFG.public_base_url.startswith("https://"):
+            attrs.append("Secure")
+        attrs.append("Max-Age=0" if clear else f"Max-Age={auth.SESSION_DAYS * 86400}")
+        return "; ".join(attrs)
+
+    def _current_user(self):
+        return user_for_token(self._cookie_token())
+
+    def _csrf_ok(self, form):
+        token = self._cookie_token()
+        supplied = form.get("csrf", [""])[0]
+        return bool(token) and auth.csrf_ok(supplied, token, session_secret())
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/where":
@@ -691,8 +726,18 @@ class Handler(BaseHTTPRequestHandler):
                 "application/json",
                 {"Cache-Control": "public, max-age=3600"},
             )
+        elif path == "/login":
+            if self._current_user():
+                self._redirect("/reviewer")
+            else:
+                self._send(200, render_login())
         elif path in ("/", "/reviewer"):
-            self._send(200, render_reviewer())
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                self._send(200, render_reviewer(user, session_secret(),
+                                                self._cookie_token()))
         elif path == "/updates":
             self._send(200, render_updates())
         elif path.startswith("/s/"):
@@ -717,11 +762,31 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
+        elif path == "/login":
+            form = parse_qs(raw.decode("utf-8"))
+            username = form.get("username", [""])[0]
+            user_id, error = authenticate(username, form.get("password", [""])[0])
+            if user_id is None:
+                self._send(200, render_login(error, username))
+            else:
+                token = start_session(user_id)
+                self._redirect("/reviewer", self._set_cookie(token))
+        elif path == "/logout":
+            form = parse_qs(raw.decode("utf-8"))
+            if self._csrf_ok(form):
+                end_session(self._cookie_token())
+            self._redirect("/login", self._set_cookie(None, clear=True))
         elif path == "/reviewer/action":
-            reviewer_action(parse_qs(raw.decode("utf-8")))
-            self.send_response(303)
-            self.send_header("Location", "/reviewer")
-            self.end_headers()
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Invalid form token. Reload and retry.</p>"))
+            else:
+                reviewer_action(form, user["id"])
+                self._redirect("/reviewer")
         else:
             self._json(404, {"error": "Not found."})
 
@@ -745,6 +810,149 @@ class Server(ThreadingHTTPServer):
     def server_bind(self):
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
+
+
+# ---------------------------------------------------------------- auth pages
+
+def render_login(error=None, username=""):
+    err = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    body = f"""
+<div class="login-wrap">
+  <h1>Doctrine Editor</h1>
+  <p class="sub">Reviewer sign-in</p>
+  {err}
+  <form method="post" action="/login" class="login-form">
+    <label for="username">Username</label>
+    <input id="username" name="username" autocomplete="username"
+           value="{esc(username)}" autofocus required>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password"
+           autocomplete="current-password" required>
+    <button type="submit">Sign in</button>
+  </form>
+  <p class="login-note">No account? Ask an administrator to create one.
+  Forgot your password? An administrator can reset it.</p>
+</div>
+<style>
+.login-wrap {{ max-width: 340px; margin: 12vh auto; }}
+.login-form {{ display: flex; flex-direction: column; gap: 6px; }}
+.login-form label {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
+.login-form input {{ padding: 8px; font-size: 15px; border: 1px solid #ccc;
+  border-radius: 4px; }}
+.login-form button {{ margin-top: 16px; padding: 9px; font-size: 15px;
+  cursor: pointer; border: 0; border-radius: 4px; background: #2f6f4f;
+  color: #fff; }}
+.login-error {{ padding: 9px 12px; border-radius: 4px; background: #fdeaea;
+  color: #8a1f1f; font-size: 14px; }}
+.login-note {{ margin-top: 18px; font-size: 12px; color: #777;
+  line-height: 1.5; }}
+</style>"""
+    return page("Sign in", body)
+
+
+# ---------------------------------------------------------------- sessions
+
+COOKIE_NAME = "doctrine_session"
+_SECRET_KEY = "session_secret"
+
+
+def session_secret():
+    """A per-installation secret, generated once and stored in the DB.
+
+    Used only to derive CSRF tokens from session tokens. Kept out of the
+    environment so a fresh deploy cannot silently fall back to a default.
+    """
+    with db() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS settings ("
+                     "key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (_SECRET_KEY,)).fetchone()
+        if row:
+            return row["value"]
+        secret = auth.new_token()
+        conn.execute("INSERT INTO settings (key, value) VALUES (?,?)",
+                     (_SECRET_KEY, secret))
+    return secret
+
+
+def start_session(user_id):
+    token = auth.new_token()
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO sessions (token, user_id, created_at, expires_at)"
+            " VALUES (?,?,?,?)",
+            (token, user_id, now(), auth.session_expiry(auth.utcnow())),
+        )
+    return token
+
+
+def end_session(token):
+    with db() as conn:
+        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+
+
+def user_for_token(token):
+    """The active user behind a session token, or None.
+
+    Expired rows are deleted lazily here, so a stale cookie cannot be
+    reused and the table does not grow without bound.
+    """
+    if not token:
+        return None
+    with db() as conn:
+        row = conn.execute(
+            """SELECT s.token, s.expires_at, u.id, u.username, u.role, u.active
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.token=?""", (token,)).fetchone()
+        if row is None:
+            return None
+        if auth.is_expired(row["expires_at"], auth.utcnow()):
+            conn.execute("DELETE FROM sessions WHERE token=?", (token,))
+            return None
+        if not row["active"]:
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+            return None
+    return {"id": row["id"], "username": row["username"], "role": row["role"]}
+
+
+def record_attempt(username, ok):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO login_attempts (username, ok, attempted_at)"
+            " VALUES (?,?,?)", (username, 1 if ok else 0, auth.utcnow().isoformat()))
+        if ok:
+            conn.execute("DELETE FROM login_attempts WHERE username=? AND ok=0",
+                         (username,))
+
+
+def recent_failures(username):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT attempted_at FROM login_attempts"
+            " WHERE username=? AND ok=0 ORDER BY id DESC LIMIT 50",
+            (username,)).fetchall()
+    return [r["attempted_at"] for r in rows]
+
+
+def authenticate(username, password):
+    """Returns (user_id, error_message). Never says which half was wrong."""
+    username = (username or "").strip()
+    generic = "Incorrect username or password."
+    if not username or not password:
+        return None, generic
+    if auth.too_many_attempts(recent_failures(username), auth.utcnow()):
+        return None, ("Too many failed attempts. Wait a few minutes and "
+                      "try again.")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id, password_hash, active FROM users WHERE username=?",
+            (username,)).fetchone()
+    ok = row is not None and row["active"] and auth.verify_password(
+        password, row["password_hash"])
+    record_attempt(username, ok)
+    if not ok:
+        return None, generic
+    return row["id"], None
 
 
 # ---------------------------------------------------------------- users
