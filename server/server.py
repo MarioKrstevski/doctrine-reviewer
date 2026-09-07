@@ -79,6 +79,14 @@ def db():
     return conn
 
 
+def _ensure_columns(conn, table, wanted):
+    """ALTER TABLE ... ADD COLUMN for each column in `wanted` that is absent."""
+    present = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, kind in wanted.items():
+        if name not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+
+
 def init_db():
     # A container whose volume has not attached yet has no /data, and
     # SQLite cannot create a file in a directory that does not exist.
@@ -165,11 +173,22 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         """)
 
-        # suggestions predates auth in production, so add the column only
-        # when it is missing rather than recreating the table.
-        columns = {r["name"] for r in conn.execute("PRAGMA table_info(suggestions)")}
-        if "resolved_by" not in columns:
-            conn.execute("ALTER TABLE suggestions ADD COLUMN resolved_by INTEGER")
+        # suggestions predates several features in production, so columns
+        # are added in place when missing rather than recreating the table.
+        _ensure_columns(conn, "suggestions", {
+            "resolved_by": "INTEGER",
+            # P3 trace data
+            "tags_json": "TEXT",
+            "note_mod": "INTEGER",
+            "card_id": "INTEGER",
+            "card_ord": "INTEGER",
+            "template_name": "TEXT",
+            "deck_id": "INTEGER",
+            "original_deck_id": "INTEGER",
+            "install_id": "TEXT",
+            "addon_version": "TEXT",
+            "anki_version": "TEXT",
+        })
 
         # Master copies were once stored as rendered card HTML plus a per-row
         # copy of the note-type CSS: 47 KB per note against ~500 bytes of
@@ -235,6 +254,43 @@ def esc(s):
 
 
 _CLOZE = re.compile(r"\{\{c\d+::.*?\}\}", re.S)
+
+
+def tag_chips(tags_json):
+    try:
+        tags = json.loads(tags_json or "[]")
+    except ValueError:
+        tags = []
+    if not tags:
+        return ""
+    chips = "".join(f'<span class="chip" title="{esc(t)}">{esc(t.split("::")[-1])}</span>'
+                    for t in tags)
+    return f'<div class="chips">{chips}</div>'
+
+
+def trace_block(r):
+    """Collapsible identifiers for finding and reproducing the card.
+
+    Only present values are listed, so an older add-on that sent none of
+    this produces an empty block rather than a row of 'None'.
+    """
+    pairs = [
+        ("card", r["card_id"]),
+        ("cloze/ord", r["card_ord"]),
+        ("template", r["template_name"]),
+        ("deck id", r["deck_id"]),
+        ("original deck", r["original_deck_id"]),
+        ("note modified", r["note_mod"]),
+        ("install", (r["install_id"] or "")[:8] or None),
+        ("add-on", r["addon_version"]),
+        ("anki", r["anki_version"]),
+    ]
+    rows = "".join(f"<dt>{esc(k)}</dt><dd>{esc(str(v))}</dd>"
+                   for k, v in pairs if v not in (None, ""))
+    if not rows:
+        return ""
+    return (f'<details class="trace"><summary>Trace</summary>'
+            f'<dl>{rows}</dl></details>')
 
 
 def fields_pane(fields_json, label):
@@ -369,6 +425,15 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .pane .fields dd { margin:2px 0 0; white-space:pre-wrap; word-break:break-word;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
 .pane .fields mark { background:#fff1a8; padding:0 2px; border-radius:2px; }
+.chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
+.chip { font-size:11px; padding:2px 8px; border-radius:10px; background:#eef1ee;
+  color:#3a4a40; border:1px solid #dfe5df; white-space:nowrap; }
+.trace { padding:6px 16px; font-size:12px; color:var(--muted); }
+.trace summary { cursor:pointer; user-select:none; }
+.trace dl { display:grid; grid-template-columns:max-content 1fr; gap:2px 14px;
+  margin:6px 0 0; }
+.trace dt { color:var(--muted); }
+.trace dd { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 .pane iframe { width:100%; height:270px; border:none; display:block;
   background:#fff; }
 .pane.suggestion { background:#F8FAF7; }
@@ -643,7 +708,9 @@ def render_reviewer(user=None, secret=None, session_token=None):
     {f"&middot; <code>nid:{r['anki_note_id']}</code>" if r['anki_note_id'] else ""}{contact}</span>
     <time>{esc(r['created_at'])}</time>
   </div>
+  {tag_chips(r["tags_json"])}
   <div class="panes">{snapshot_pane}{master_pane}{sugg_pane}</div>
+  {trace_block(r)}
   {actions}
 </div>""")
 
@@ -744,19 +811,28 @@ def api_suggestion(data):
             return 400, {"error": "Suggestion text is required."}
 
         token = uuid.uuid4().hex[:16]
+        tags = data.get("tags")
         conn.execute(
             """INSERT INTO suggestions
                (token, doctrine_id, anki_note_id, note_type, deck,
                 suggestion_type, text, email,
                 snap_question, snap_answer, snap_css, snap_fields_json,
-                snap_hash, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                snap_hash, created_at,
+                tags_json, note_mod, card_id, card_ord, template_name,
+                deck_id, original_deck_id, install_id, addon_version,
+                anki_version)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?)""",
             (token, doc_id, data.get("anki_note_id"),
              data.get("note_type"), data.get("deck"),
              data.get("suggestion_type", "other"), text, data.get("email"),
              snap.get("question_html"), snap.get("answer_html"),
              snap.get("css"), json.dumps(snap.get("fields") or {}),
-             snap.get("content_hash"), now()),
+             snap.get("content_hash"), now(),
+             json.dumps(list(tags) if isinstance(tags, (list, tuple)) else []),
+             data.get("note_mod"), data.get("card_id"), data.get("card_ord"),
+             data.get("template_name"), data.get("deck_id"),
+             data.get("original_deck_id") or None, data.get("install_id"),
+             data.get("addon_version"), data.get("anki_version")),
         )
     return 200, {"ok": True,
                  "tracking_url": f"{CFG.public_base_url}/s/{token}"}

@@ -30,9 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import chunk_util, identity, resolver, state
+from . import chunk_util, identity, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
+ADDON_VERSION = "1.1"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -236,7 +237,11 @@ def open_suggestion_dialog():
         return
 
     fields = {name: note[name] for name in field_names}
-    payload = {
+    try:
+        from anki.buildinfo import version as anki_version
+    except Exception:
+        anki_version = None
+    body = {
         "doctrine_id": doctrine_id,
         "anki_note_id": note.id,
         "note_type": note_type["name"],
@@ -248,11 +253,23 @@ def open_suggestion_dialog():
             "fields": fields,
             "content_hash": content_hash(fields, LEGACY_ID_FIELD),
         },
+        **payload.trace(
+            tags=note.tags,
+            note_mod=note.mod,
+            card_id=card.id,
+            card_ord=card.ord,
+            template_names=[t.get("name") for t in note_type.get("tmpls", [])],
+            deck_id=card.did,
+            original_deck_id=card.odid,
+            install_id=state.install_id(user_files_dir()),
+            addon_version=ADDON_VERSION,
+            anki_version=anki_version,
+        ),
         **dlg.result_data,
     }
 
     def task():
-        return post_json(api_base(cfg) + "/api/suggestions", payload)
+        return post_json(api_base(cfg) + "/api/suggestions", body)
 
     def on_done(fut):
         try:
