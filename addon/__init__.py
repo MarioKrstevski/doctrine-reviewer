@@ -58,6 +58,14 @@ def user_files_dir():
 # releasing a new build. API_BASE_OVERRIDE is a development escape hatch --
 # set it in this file when testing against a local server, never in a
 # shipped build.
+# Dev tooling. A shipped build has DEV_MODE = False, so students never see
+# the stamp/register menu at all -- in production the generation pipeline
+# mints DoctrineIDs and the .apkg ships with them already in place.
+# PIPELINE_API_KEY must stay empty in anything that leaves this machine;
+# the server rejects the register call without it regardless.
+DEV_MODE = False
+PIPELINE_API_KEY = ""
+
 API_BASE_OVERRIDE = ""
 ID_FIELD = "DoctrineID"
 BUTTON_TOP_OFFSET = 150
@@ -116,11 +124,12 @@ def content_hash(fields: dict, id_field: str) -> str:
 
 # ---------------------------------------------------------------- http
 
-def post_json(url: str, payload: dict) -> dict:
+def post_json(url: str, payload: dict, bearer: str = "") -> dict:
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"}
-    )
+    headers = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, data=data, headers=headers)
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -382,7 +391,8 @@ def stamp_and_register_deck():
         })
 
     def task():
-        return post_json(api_base(cfg) + "/api/dev/register", {"notes": registered})
+        return post_json(api_base(cfg) + "/api/master/sync",
+                         {"notes": registered}, PIPELINE_API_KEY)
 
     def on_done(fut):
         try:
@@ -418,19 +428,20 @@ def setup_menu():
     a1.triggered.connect(open_suggestion_dialog)
     menu.addAction(a1)
 
-    menu.addSeparator()
-
-    a2 = QAction("Stamp && register a deck… (dev)", mw)
-    a2.triggered.connect(stamp_and_register_deck)
-    menu.addAction(a2)
-
-    a3 = QAction("Open reviewer queue (dev)", mw)
-    a3.triggered.connect(open_reviewer_page)
-    menu.addAction(a3)
-
     a4 = QAction("Open public updates page", mw)
     a4.triggered.connect(open_updates_page)
     menu.addAction(a4)
+
+    if DEV_MODE:
+        menu.addSeparator()
+
+        a2 = QAction("Stamp && register a deck… (dev)", mw)
+        a2.triggered.connect(stamp_and_register_deck)
+        menu.addAction(a2)
+
+        a3 = QAction("Open reviewer queue (dev)", mw)
+        a3.triggered.connect(open_reviewer_page)
+        menu.addAction(a3)
 
     mw.form.menuTools.addMenu(menu)
 

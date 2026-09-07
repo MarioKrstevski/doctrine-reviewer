@@ -7,7 +7,7 @@ import urllib.parse
 
 import auth
 import server
-from tests.helpers import running_server
+from tests.helpers import register_note, running_server
 
 
 def request(base, method, path, body=None, cookie=None, follow=False):
@@ -55,18 +55,9 @@ class PublicRoutesStayPublicTest(unittest.TestCase):
 
     def test_the_suggestion_api_needs_no_cookie(self):
         with running_server() as base:
-            parsed = urllib.parse.urlparse(base)
-            conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
-            conn.request("POST", "/api/dev/register",
-                         body=json.dumps({"notes": [{
-                             "doctrine_id": "doc-pub0000001", "anki_note_id": 1,
-                             "note_type": "Basic", "deck": "D",
-                             "fields": {"Front": "Q"}, "question_html": "Q",
-                             "answer_html": "A", "css": ""}]}),
-                         headers={"Content-Type": "application/json"})
-            self.assertEqual(200, conn.getresponse().status)
-            conn.close()
+            register_note(base, "doc-pub0000001")
 
+            parsed = urllib.parse.urlparse(base)
             conn = http.client.HTTPConnection(parsed.hostname, parsed.port)
             conn.request("POST", "/api/suggestions",
                          body=json.dumps({"doctrine_id": "doc-pub0000001",
@@ -180,18 +171,13 @@ class ThrottleRouteTest(unittest.TestCase):
 class CsrfRouteTest(unittest.TestCase):
     def _open_suggestion(self, base):
         import urllib.request
-        for path, payload in [
-            ("/api/dev/register", {"notes": [{
-                "doctrine_id": "doc-csrf000001", "anki_note_id": 1,
-                "note_type": "Basic", "deck": "D", "fields": {"Front": "Q"},
-                "question_html": "Q", "answer_html": "A", "css": ""}]}),
-            ("/api/suggestions", {"doctrine_id": "doc-csrf000001",
-                                  "text": "csrf test", "snapshot": {}}),
-        ]:
-            req = urllib.request.Request(
-                base + path, data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req).read()
+        register_note(base, "doc-csrf000001")
+        req = urllib.request.Request(
+            base + "/api/suggestions",
+            data=json.dumps({"doctrine_id": "doc-csrf000001",
+                             "text": "csrf test", "snapshot": {}}).encode(),
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req).read()
         with server.db() as conn:
             return conn.execute(
                 "SELECT id FROM suggestions ORDER BY id DESC LIMIT 1"

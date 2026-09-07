@@ -14,6 +14,7 @@ class Config:
     port: int
     db_path: str
     public_base_url: str
+    pipeline_api_key: str
 
 
 def _platform_url(env):
@@ -42,4 +43,5 @@ def load(env=None) -> Config:
         port=port,
         db_path=env.get("DB_PATH", "doctrine.db"),
         public_base_url=public.rstrip("/"),
+        pipeline_api_key=env.get("PIPELINE_API_KEY", "").strip(),
     )

@@ -3,7 +3,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from tests.helpers import running_server
+from tests.helpers import register_note, running_server
 
 PUBLIC = "https://doctrine.example"
 
@@ -19,16 +19,7 @@ def post(base, path, payload):
 
 
 def register_one(base, doctrine_id="doc-test000001"):
-    return post(base, "/api/dev/register", {"notes": [{
-        "doctrine_id": doctrine_id,
-        "anki_note_id": 1,
-        "note_type": "Basic",
-        "deck": "Test",
-        "fields": {"Front": "Q", "Back": "A"},
-        "question_html": "Q",
-        "answer_html": "A",
-        "css": "",
-    }]})
+    return register_note(base, doctrine_id)
 
 
 class TrackingUrlTest(unittest.TestCase):

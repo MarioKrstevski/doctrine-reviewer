@@ -23,6 +23,7 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+import hmac
 import os
 import socketserver
 
@@ -727,6 +728,13 @@ class Handler(BaseHTTPRequestHandler):
     def _current_user(self):
         return user_for_token(self._cookie_token())
 
+    def _bearer_ok(self, expected):
+        header = self.headers.get("Authorization", "")
+        prefix = "Bearer "
+        if not header.startswith(prefix):
+            return False
+        return hmac.compare_digest(header[len(prefix):].strip(), expected)
+
     def _csrf_ok(self, form):
         token = self._cookie_token()
         supplied = form.get("csrf", [""])[0]
@@ -791,12 +799,20 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
-        elif path == "/api/dev/register":
-            try:
-                code, obj = api_register(json.loads(raw or b"{}"))
-            except json.JSONDecodeError:
-                code, obj = 400, {"error": "Invalid JSON."}
-            self._json(code, obj)
+        elif path in ("/api/dev/register", "/api/master/sync"):
+            # Writes master card state: never public. Fails closed when no
+            # key is configured rather than falling back to open.
+            if not CFG.pipeline_api_key:
+                self._json(503, {"error": "Master sync is not enabled on "
+                                          "this server."})
+            elif not self._bearer_ok(CFG.pipeline_api_key):
+                self._json(401, {"error": "Unauthorized."})
+            else:
+                try:
+                    code, obj = api_register(json.loads(raw or b"{}"))
+                except json.JSONDecodeError:
+                    code, obj = 400, {"error": "Invalid JSON."}
+                self._json(code, obj)
         elif path == "/login":
             form = parse_qs(raw.decode("utf-8"))
             username = form.get("username", [""])[0]
