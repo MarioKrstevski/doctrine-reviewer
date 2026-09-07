@@ -7,7 +7,6 @@ state and never touch a developer's real doctrine.db.
 import contextlib
 import tempfile
 import threading
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import config
@@ -29,7 +28,7 @@ def running_server(**env):
         server.CFG = config.load(settings)
         server.init_db()
 
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()

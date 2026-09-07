@@ -23,11 +23,13 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-HOST, PORT = "127.0.0.1", 8787
-DB_PATH = "doctorine.db"
+import config
+
+CFG = config.load()
 ID_FIELD = "DoctorineID"   # excluded from content hashing, same as add-on
 
 TYPE_LABELS = {
@@ -41,7 +43,7 @@ TYPE_LABELS = {
 # ---------------------------------------------------------------- db
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(CFG.db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -667,9 +669,28 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.address_string()}] {fmt % args}")
 
 
+class Server(ThreadingHTTPServer):
+    """ThreadingHTTPServer that does not reverse-resolve its own address.
+
+    HTTPServer.server_bind() calls socket.getfqdn(), a reverse DNS lookup
+    on the bind address. On a network with no reverse zone that blocks for
+    tens of seconds before the server accepts its first connection — long
+    enough for a container health check to fail. server_name is only used
+    by the CGI handlers, which this server does not use.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 if __name__ == "__main__":
     init_db()
-    print(f"Doctorine Suggestions platform — http://{HOST}:{PORT}")
-    print(f"  Reviewer queue:  http://{HOST}:{PORT}/reviewer")
-    print(f"  Public updates:  http://{HOST}:{PORT}/updates")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    print(f"Doctorine Suggestions platform — {CFG.public_base_url}", flush=True)
+    print(f"  Reviewer queue:  {CFG.public_base_url}/reviewer", flush=True)
+    print(f"  Public updates:  {CFG.public_base_url}/updates", flush=True)
+    print(f"  Listening on {CFG.host}:{CFG.port}, db={CFG.db_path}", flush=True)
+    Server((CFG.host, CFG.port), Handler).serve_forever()
