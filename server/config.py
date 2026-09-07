@@ -16,11 +16,27 @@ class Config:
     public_base_url: str
 
 
+def _platform_url(env):
+    """Public URL supplied by the hosting platform, if any.
+
+    Railway injects RAILWAY_PUBLIC_DOMAIN as a bare hostname once a domain
+    is generated, which lets the service know its own URL without a second
+    deploy to set PUBLIC_BASE_URL by hand. Setting PUBLIC_BASE_URL
+    explicitly always wins.
+    """
+    domain = (env.get("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+    if not domain:
+        return None
+    if domain.startswith(("http://", "https://")):
+        return domain
+    return "https://" + domain
+
+
 def load(env=None) -> Config:
     env = os.environ if env is None else env
     host = env.get("HOST", "127.0.0.1")
     port = int(env.get("PORT", "8787"))
-    public = env.get("PUBLIC_BASE_URL") or f"http://{host}:{port}"
+    public = env.get("PUBLIC_BASE_URL") or _platform_url(env) or f"http://{host}:{port}"
     return Config(
         host=host,
         port=port,

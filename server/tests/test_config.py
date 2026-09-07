@@ -21,3 +21,18 @@ class LoadTest(unittest.TestCase):
     def test_explicit_public_base_url_wins_and_loses_trailing_slash(self):
         cfg = config.load({"PUBLIC_BASE_URL": "https://example.test/"})
         self.assertEqual("https://example.test", cfg.public_base_url)
+
+    def test_railway_domain_is_used_when_no_explicit_url(self):
+        cfg = config.load({"RAILWAY_PUBLIC_DOMAIN": "app.up.railway.app"})
+        self.assertEqual("https://app.up.railway.app", cfg.public_base_url)
+
+    def test_explicit_url_beats_the_railway_domain(self):
+        cfg = config.load({
+            "RAILWAY_PUBLIC_DOMAIN": "app.up.railway.app",
+            "PUBLIC_BASE_URL": "https://doctrine.example",
+        })
+        self.assertEqual("https://doctrine.example", cfg.public_base_url)
+
+    def test_railway_domain_with_a_scheme_is_not_double_prefixed(self):
+        cfg = config.load({"RAILWAY_PUBLIC_DOMAIN": "https://app.up.railway.app"})
+        self.assertEqual("https://app.up.railway.app", cfg.public_base_url)
