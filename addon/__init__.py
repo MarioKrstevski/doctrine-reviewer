@@ -11,11 +11,13 @@ Tools menu (Tools -> Doctrine Editor):
     field to every note type in a chosen deck, stamps unique IDs, and
     registers the notes as the "master" state on the platform server.
 
-Config (config.json): server_url, id_field.
+Config (config.json): bootstrap_url, api_base_override, id_field,
+button_top_offset, button_right_offset.
 """
 
 import hashlib
 import json
+import time
 import urllib.request
 import urllib.error
 import uuid
@@ -26,6 +28,8 @@ from aqt.qt import (
     QLineEdit, QPushButton, QInputDialog, Qt
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
+
+from . import resolver
 
 ADDON_NAME = "Doctrine Editor"
 
@@ -39,12 +43,47 @@ SUGGESTION_TYPES = [
 
 # ---------------------------------------------------------------- config
 
+DEFAULT_BOOTSTRAP = "http://127.0.0.1:8787"
+
+
 def get_config():
     cfg = mw.addonManager.getConfig(__name__) or {}
     return {
-        "server_url": cfg.get("server_url", "http://127.0.0.1:8787").rstrip("/"),
+        "bootstrap_url": cfg.get("bootstrap_url", DEFAULT_BOOTSTRAP).rstrip("/"),
+        "api_base_override": cfg.get("api_base_override", ""),
         "id_field": cfg.get("id_field", "DoctrineID"),
+        "button_top_offset": cfg.get("button_top_offset", 150),
+        "button_right_offset": cfg.get("button_right_offset", 12),
+        "_cache": cfg.get("_cache", {}),
     }
+
+
+def get_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def api_base(cfg) -> str:
+    """Resolve the API base, persisting any refreshed cache.
+
+    Call only from a background thread — it may make a network request.
+    """
+    cache = dict(cfg.get("_cache") or {})
+    base = resolver.resolve_api_base(cfg, cache, fetch=get_json, now=time.time)
+    if cache != (cfg.get("_cache") or {}):
+        stored = mw.addonManager.getConfig(__name__) or {}
+        stored["_cache"] = cache
+        mw.addonManager.writeConfig(__name__, stored)
+    return base
+
+
+def cached_api_base(cfg) -> str:
+    """Resolve without touching the network — safe on the UI thread."""
+    return resolver.resolve_api_base(
+        cfg, dict(cfg.get("_cache") or {}),
+        fetch=lambda url: None, now=time.time,
+    )
 
 
 # ---------------------------------------------------------------- hashing
@@ -178,10 +217,8 @@ def open_suggestion_dialog():
         **dlg.result_data,
     }
 
-    url = cfg["server_url"] + "/api/suggestions"
-
     def task():
-        return post_json(url, payload)
+        return post_json(api_base(cfg) + "/api/suggestions", payload)
 
     def on_done(fut):
         try:
@@ -196,7 +233,7 @@ def open_suggestion_dialog():
         except Exception as e:
             showWarning(
                 "Could not reach the suggestion server.\n"
-                f"Is it running at {cfg['server_url']}?\n\n{e}"
+                f"Is it running at {cached_api_base(cfg)}?\n\n{e}"
             )
             return
         tracking = result.get("tracking_url")
@@ -224,10 +261,11 @@ def on_webview_will_set_content(web_content, context):
         return
     # Hidden by default; shown per-card only when the note carries a
     # DoctrineID (see on_reviewer_did_show_question).
+    cfg = get_config()
     web_content.body += """
 <style>
 #doctrine-suggest-btn {
-  position: fixed; right: 12px; top: 150px; z-index: 300;
+  position: fixed; right: %dpx; top: %dpx; z-index: 300;
   display: none;
   padding: 4px 10px; font-size: 12px; cursor: pointer;
   border: 1px solid #888; border-radius: 4px; background: transparent;
@@ -237,7 +275,7 @@ def on_webview_will_set_content(web_content, context):
 </style>
 <button id="doctrine-suggest-btn" onclick="pycmd('doctrine_editor')"
         title="Suggest an edit to this card">&#9998; Suggest an edit</button>
-"""
+""" % (cfg["button_right_offset"], cfg["button_top_offset"])
 
 
 def on_reviewer_did_show_question(card):
@@ -328,10 +366,8 @@ def stamp_and_register_deck():
             "css": css,
         })
 
-    url = cfg["server_url"] + "/api/dev/register"
-
     def task():
-        return post_json(url, {"notes": registered})
+        return post_json(api_base(cfg) + "/api/dev/register", {"notes": registered})
 
     def on_done(fut):
         try:
@@ -350,11 +386,11 @@ def stamp_and_register_deck():
 
 
 def open_reviewer_page():
-    openLink(get_config()["server_url"] + "/reviewer")
+    openLink(cached_api_base(get_config()) + "/reviewer")
 
 
 def open_updates_page():
-    openLink(get_config()["server_url"] + "/updates")
+    openLink(cached_api_base(get_config()) + "/updates")
 
 
 # ---------------------------------------------------------------- menu & hooks

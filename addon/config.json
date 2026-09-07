@@ -1,4 +1,7 @@
 {
-  "server_url": "http://127.0.0.1:8787",
-  "id_field": "DoctrineID"
+  "bootstrap_url": "http://127.0.0.1:8787",
+  "api_base_override": "",
+  "id_field": "DoctrineID",
+  "button_top_offset": 150,
+  "button_right_offset": 12
 }
