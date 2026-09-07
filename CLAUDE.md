@@ -1,4 +1,4 @@
-# Doctorine Suggestions — project context for Claude Code
+# Doctrine Editor — project context for Claude Code
 
 Student-facing card suggestion system for a large medical Anki deck.
 Students click a "Suggest" button while reviewing, describe an issue
@@ -14,17 +14,24 @@ a tracking link. No user accounts/login — by design.
   - "✎ Suggest" button injected into the reviewer bottom bar via
     `gui_hooks.webview_will_set_content` (ReviewerBottomBar) + `pycmd`.
   - Dialog: type dropdown, text, optional email → POST /api/suggestions
-    with doctorine_id, anki_note_id, deck, note fields, rendered Q/A
+    with doctrine_id, anki_note_id, deck, note fields, rendered Q/A
     HTML, css, and a content hash (sha256 over sorted fields, excluding
     the ID field). Runs network in `mw.taskman.run_in_background`.
-  - Dev tool (Tools → Doctorine Suggestions → "Stamp & register a
-    deck…"): adds a `DoctorineID` field to note types, stamps
+  - Dev tool (Tools → Doctrine Editor → "Stamp & register a
+    deck…"): adds a `DoctrineID` field to note types, stamps
     `doc-<uuid12>`, uploads all notes as master state to
     /api/dev/register. In production the pipeline mints IDs instead.
-  - `config.json`: `server_url`, `id_field`.
+  - `resolver.py`: pure, Anki-free API-base resolution (override →
+    fresh cache → GET {bootstrap_url}/where → stale cache → bootstrap).
+    Unit-tested in `addon/tests/`.
+  - `config.json`: `bootstrap_url`, `api_base_override`, `id_field`,
+    `button_top_offset`, `button_right_offset`.
 - `server/server.py` — stdlib-only Python server + SQLite
-  (`doctorine.db`, auto-created). Port 8787.
-  - POST /api/suggestions — rejects unknown DoctorineID (404). This is
+  (`doctrine.db`, auto-created). Config via env, see `server/config.py`.
+  - `Server` subclasses ThreadingHTTPServer to skip `socket.getfqdn()`,
+    which otherwise blocks startup ~35s on networks with no reverse zone.
+  - GET /where — bootstrap endpoint returning the current `api_base`.
+  - POST /api/suggestions — rejects unknown DoctrineID (404). This is
     the real "only our deck" gate; the add-on check is courtesy.
   - POST /api/dev/register — upserts master notes; bumps `version` when
     the content hash changes.
@@ -38,7 +45,8 @@ a tracking link. No user accounts/login — by design.
   - GET /s/<token> — submitter tracking page (open/accepted/declined/
     already-fixed).
 - Hash function is duplicated in both files (`content_hash`) and MUST
-  stay identical.
+  stay identical. Enforced by `server/tests/test_hash_parity.py`, which
+  extracts both implementations and compares their output.
 
 ## Status: working end-to-end (tested)
 
@@ -53,7 +61,7 @@ Spoofed ID correctly 404s.
    - Add-on: generate a random `install_id` UUID on first run, store in
      config/meta, send with every suggestion.
    - Server: log `install_id` + client IP on each suggestion row.
-   - Rule: ONE open suggestion per (install_id, doctorine_id) — a
+   - Rule: ONE open suggestion per (install_id, doctrine_id) — a
      repeat either gets a friendly "already pending" message or appends
      to the existing item with a counter. No new queue entries.
    - Per-install_id daily rate limit (~10/day). Per-IP burst limit only
@@ -67,7 +75,7 @@ Spoofed ID correctly 404s.
 3. Media: snapshot HTML references local Anki media; images don't load.
    Production: host deck media on the platform, rewrite src paths.
    (Pipeline shipped the media, filenames match.)
-4. Dedupe across sources: same doctorine_id + near-identical text from
+4. Dedupe across sources: same doctrine_id + near-identical text from
    different people → collapse with counter (also merges legit pile-ons).
 5. Real deployment: swap HOST/PORT for a domain (tracking URLs are
    currently localhost); HTTPS; consider porting server to the existing
@@ -85,7 +93,7 @@ Spoofed ID correctly 404s.
 - No login/CAPTCHA/email-verification for students. Identity =
   install_id (+ optional purchase-time submission key later).
 - Reviewers apply edits manually; suggestions are input, never merged.
-- DoctorineID is minted by the generation pipeline in production and
+- DoctrineID is minted by the generation pipeline in production and
   ships inside the .apkg; server validates existence on every submit.
 
 ## Test loop
@@ -93,6 +101,6 @@ Spoofed ID correctly 404s.
 1. `cd server && python3 server.py`
 2. Copy `addon/` into Anki addons21 dir (TEST PROFILE — stamping alters
    note types and forces full sync), restart Anki.
-3. Tools → Doctorine Suggestions → Stamp & register a deck.
+3. Tools → Doctrine Editor → Stamp & register a deck.
 4. Review a card → ✎ Suggest → send → check /reviewer.
 5. Edit the note in Anki, re-register → badge flips to outdated.

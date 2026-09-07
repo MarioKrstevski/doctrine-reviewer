@@ -1,9 +1,9 @@
-# Doctorine Suggestions — local prototype
+# Doctrine Editor — local prototype
 
 Two pieces:
 
 - `addon/` — Anki add-on: "✎ Suggest" button in the reviewer bottom bar, plus a
-  dev tool that stamps `DoctorineID` fields onto a deck and registers it as the
+  dev tool that stamps `DoctrineID` fields onto a deck and registers it as the
   master state on the platform.
 - `server/server.py` — zero-dependency Python server (stdlib + SQLite):
   suggestion API, reviewer queue, public updates ledger, tracking pages.
@@ -15,20 +15,20 @@ Two pieces:
    cd server
    python3 server.py
    ```
-   Runs at http://127.0.0.1:8787 and creates `doctorine.db` next to it.
+   Runs at http://127.0.0.1:8787 and creates `doctrine.db` next to it.
 
 2. **Install the add-on** — use a *test Anki profile*, since stamping adds a
    field to note types. Copy the `addon/` folder into your Anki add-ons dir
    and rename it, e.g.:
-   - Windows: `%APPDATA%\Anki2\addons21\doctorine_suggest\`
-   - macOS: `~/Library/Application Support/Anki2/addons21/doctorine_suggest/`
-   - Linux: `~/.local/share/Anki2/addons21/doctorine_suggest/`
+   - Windows: `%APPDATA%\Anki2\addons21\doctrine_editor\`
+   - macOS: `~/Library/Application Support/Anki2/addons21/doctrine_editor/`
+   - Linux: `~/.local/share/Anki2/addons21/doctrine_editor/`
 
-   Restart Anki. You'll see **Tools → Doctorine Suggestions**.
+   Restart Anki. You'll see **Tools → Doctrine Editor**.
 
-3. **Register a fake deck** — Tools → Doctorine Suggestions →
+3. **Register a fake deck** — Tools → Doctrine Editor →
    **Stamp & register a deck…**, pick one of your own decks. This adds a
-   `DoctorineID` field where missing, stamps unique IDs, and uploads all notes
+   `DoctrineID` field where missing, stamps unique IDs, and uploads all notes
    as master v1. (Anki will warn about a full sync — expected on a test
    profile.)
 
@@ -54,10 +54,54 @@ Two pieces:
 
 ## What's deliberately out of scope (prototype)
 
-- No auth on /reviewer (production: put it behind login or the internal tool).
+- **No auth on /reviewer** (spec phase P2). Anyone with the URL can read
+  the queue and act on it.
 - Media files aren't rehosted — images in snapshots won't load in the iframes
   (production: serve deck media from the platform and rewrite paths).
 - No rate limiting / spam protection on the API.
-- Tracking URLs are `http://127.0.0.1` — swap `HOST/PORT` for a real domain.
 
-Config: `addon/config.json` → `server_url`, `id_field`.
+## Configuration
+
+Server (environment variables):
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `HOST` | `127.0.0.1` | bind address (`0.0.0.0` in the container) |
+| `PORT` | `8787` | bind port (`8080` in the container) |
+| `DB_PATH` | `doctrine.db` | SQLite file; mount a volume in production |
+| `PUBLIC_BASE_URL` | `http://HOST:PORT` | the origin used to build tracking links |
+
+`PUBLIC_BASE_URL` must be set in production. Tracking links are built
+from it, so leaving it unset hands every student a link to their own
+localhost.
+
+Add-on (`addon/config.json`):
+
+| Key | Purpose |
+| --- | --- |
+| `bootstrap_url` | permanent URL; the add-on GETs `/where` here to find the API |
+| `api_base_override` | set to bypass the bootstrap entirely (local development) |
+| `id_field` | note field holding the DoctrineID |
+| `button_top_offset` / `button_right_offset` | reviewer button position, in px |
+
+The add-on caches the resolved API base for 24h, so changing
+`PUBLIC_BASE_URL` server-side moves where suggestions are posted without
+anyone reinstalling.
+
+## Tests
+
+```
+cd server && python3.12 -m unittest discover -s tests -t .
+cd addon  && python3.12 -m unittest discover -s tests -t .
+```
+
+No third-party packages. `python3.12` matters: the container is 3.12
+while macOS system `python3` is 3.9.
+
+## Docker
+
+```
+docker build -t doctrine-editor .
+docker run --rm -p 8080:8080 -e PUBLIC_BASE_URL=https://your.host \
+  -v "$(pwd)/.localdata:/data" doctrine-editor
+```
