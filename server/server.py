@@ -274,13 +274,23 @@ def trace_block(r):
     Only present values are listed, so an older add-on that sent none of
     this produces an empty block rather than a row of 'None'.
     """
+    ord_ = r["card_ord"]
+    is_cloze = (r["template_name"] or "").lower() == "cloze"
+    if ord_ is not None and is_cloze:
+        ord_label, ord_value = "cloze", f"c{ord_ + 1}"   # Anki ords are 0-based
+    else:
+        ord_label, ord_value = "card no.", ord_
+    modified = r["note_mod"]
+    if isinstance(modified, (int, float)):
+        modified = datetime.fromtimestamp(modified, timezone.utc).strftime(
+            "%Y-%m-%d %H:%M UTC")
     pairs = [
         ("card", r["card_id"]),
-        ("cloze/ord", r["card_ord"]),
+        (ord_label, ord_value),
         ("template", r["template_name"]),
         ("deck id", r["deck_id"]),
         ("original deck", r["original_deck_id"]),
-        ("note modified", r["note_mod"]),
+        ("note modified", modified),
         ("install", (r["install_id"] or "")[:8] or None),
         ("add-on", r["addon_version"]),
         ("anki", r["anki_version"]),

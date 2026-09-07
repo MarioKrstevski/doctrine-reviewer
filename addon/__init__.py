@@ -25,8 +25,8 @@ import urllib.error
 
 from aqt import mw, gui_hooks
 from aqt.qt import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTextEdit,
-    QLineEdit, QPushButton, QInputDialog, Qt
+    QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
+    QTextEdit, QLineEdit, QPushButton, QInputDialog, Qt
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
@@ -205,6 +205,51 @@ class SuggestionDialog(QDialog):
         self.accept()
 
 
+class SentDialog(QDialog):
+    """Confirmation with the tracking link as a link, not a wall of text."""
+
+    def __init__(self, parent, url: str):
+        super().__init__(parent)
+        self.setWindowTitle("Suggestion sent")
+        self.setMinimumWidth(440)
+        self.url = url
+
+        layout = QVBoxLayout(self)
+        head = QLabel("<b>Thank you — your suggestion was sent.</b>")
+        layout.addWidget(head)
+
+        sub = QLabel("A reviewer will look at it. You can check what happened "
+                     "to it any time at this link:")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        link = QLabel(f'<a href="{url}">{url}</a>')
+        link.setOpenExternalLinks(True)
+        link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        link.setWordWrap(True)
+        link.setStyleSheet("padding: 8px; background: rgba(128,128,128,0.12);"
+                           " border-radius: 4px;")
+        layout.addWidget(link)
+
+        btns = QHBoxLayout()
+        copy_btn = QPushButton("Copy link")
+        copy_btn.clicked.connect(self._copy)
+        open_btn = QPushButton("Open")
+        open_btn.clicked.connect(lambda: openLink(self.url))
+        done = QPushButton("Done")
+        done.setDefault(True)
+        done.clicked.connect(self.accept)
+        btns.addWidget(copy_btn)
+        btns.addWidget(open_btn)
+        btns.addStretch()
+        btns.addWidget(done)
+        layout.addLayout(btns)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.url)
+        tooltip("Link copied", period=1500)
+
+
 # ---------------------------------------------------------------- suggest flow
 
 def open_suggestion_dialog():
@@ -289,12 +334,7 @@ def open_suggestion_dialog():
             return
         tracking = result.get("tracking_url")
         if tracking:
-            tooltip("Suggestion sent — thank you!", period=2500)
-            # Offer the tracking link once, non-blocking style:
-            showInfo(
-                "Your suggestion was sent.\n\n"
-                f"You can follow what happens to it here:\n{tracking}"
-            )
+            SentDialog(mw, tracking).exec()
         else:
             tooltip("Suggestion sent — thank you!", period=2500)
 

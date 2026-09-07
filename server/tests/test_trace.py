@@ -132,3 +132,28 @@ class RenderTest(unittest.TestCase):
         with running_server() as base:
             html = self._queue(base, dict(TRACE, original_deck_id=555))
         self.assertIn("555", html)
+
+
+class TraceFormattingTest(unittest.TestCase):
+    def _html(self, base, extra):
+        register_note(base, "6944" + "9" * 20)
+        suggest(base, extra)
+        return server.render_reviewer({"id": 1, "username": "r", "role": "reviewer"},
+                                      "secret", "sess")
+
+    def test_cloze_ordinal_is_shown_one_based(self):
+        with running_server() as base:
+            html = self._html(base, dict(TRACE, card_ord=0, template_name="Cloze"))
+        self.assertIn("<dd>c1</dd>", html)
+        self.assertNotIn("<dd>0</dd>", html)
+
+    def test_non_cloze_ordinal_is_left_as_is(self):
+        with running_server() as base:
+            html = self._html(base, dict(TRACE, card_ord=1, template_name="Card 2"))
+        self.assertIn("<dd>1</dd>", html)
+
+    def test_note_modified_renders_as_a_date(self):
+        with running_server() as base:
+            html = self._html(base, dict(TRACE, note_mod=1766286959))
+        self.assertIn("2025-12-21", html)
+        self.assertNotIn("1766286959", html)
