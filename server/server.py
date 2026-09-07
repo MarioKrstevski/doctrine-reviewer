@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Doctorine Suggestions platform — prototype server (stdlib only).
+Doctrine Editor platform — prototype server (stdlib only).
 
 Run:  python3 server.py           (listens on http://127.0.0.1:8787)
 
@@ -31,7 +31,7 @@ import config
 
 CFG = config.load()
 MIN_ADDON_VERSION = "1.0"
-ID_FIELD = "DoctorineID"   # excluded from content hashing, same as add-on
+ID_FIELD = "DoctrineID"   # excluded from content hashing, same as add-on
 
 TYPE_LABELS = {
     "typo": "Typo",
@@ -53,7 +53,7 @@ def init_db():
     with db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS notes (
-            doctorine_id TEXT PRIMARY KEY,
+            doctrine_id TEXT PRIMARY KEY,
             anki_note_id INTEGER,
             note_type TEXT,
             deck TEXT,
@@ -68,7 +68,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS suggestions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             token TEXT UNIQUE,
-            doctorine_id TEXT,
+            doctrine_id TEXT,
             anki_note_id INTEGER,
             note_type TEXT,
             deck TEXT,
@@ -308,13 +308,13 @@ def page(title, body, active=""):
         return f'<a href="{href}"{cls}>{label}</a>'
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} — Doctorine</title>
+<title>{esc(title)} — Doctrine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400..600;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap">
 <style>{BASE_CSS}{LEDGER_CSS}</style></head><body>
 <header class="site"><div class="wrap">
-  <span class="brand">Doctorine<small>Card quality</small></span>
+  <span class="brand">Doctrine<small>Card quality</small></span>
   <nav>
     {nav_link("/updates", "Community updates", "updates")}
     {nav_link("/reviewer", "Reviewer queue", "reviewer")}
@@ -340,7 +340,7 @@ def render_reviewer():
             "SELECT * FROM suggestions ORDER BY "
             "CASE status WHEN 'open' THEN 0 ELSE 1 END, id DESC"
         ).fetchall()
-        masters = {r["doctorine_id"]: r for r in conn.execute("SELECT * FROM notes")}
+        masters = {r["doctrine_id"]: r for r in conn.execute("SELECT * FROM notes")}
 
     if not rows:
         body = ('<h1>Reviewer queue</h1><p class="sub">Suggestions from students '
@@ -352,7 +352,7 @@ def render_reviewer():
 
     items = []
     for r in rows:
-        master = masters.get(r["doctorine_id"])
+        master = masters.get(r["doctrine_id"])
         stale_cls = ""
         if master is None:
             state_badge = '<span class="badge bad">Unknown card</span>'
@@ -434,7 +434,7 @@ def render_reviewer():
   <div class="card-head">
     {status_badge} {state_badge}
     <span class="meta"><b>#{r['id']}</b> &middot; {esc(r['deck'])} &middot;
-    {esc(r['note_type'])} &middot; <code>{esc(r['doctorine_id'])}</code>
+    {esc(r['note_type'])} &middot; <code>{esc(r['doctrine_id'])}</code>
     {f"&middot; <code>nid:{r['anki_note_id']}</code>" if r['anki_note_id'] else ""}{contact}</span>
     <time>{esc(r['created_at'])}</time>
   </div>
@@ -522,13 +522,13 @@ def render_status(token):
 # ---------------------------------------------------------------- api
 
 def api_suggestion(data):
-    doc_id = (data.get("doctorine_id") or "").strip()
+    doc_id = (data.get("doctrine_id") or "").strip()
     if not doc_id:
-        return 400, {"error": "Missing doctorine_id."}
+        return 400, {"error": "Missing doctrine_id."}
 
     with db() as conn:
         master = conn.execute(
-            "SELECT doctorine_id FROM notes WHERE doctorine_id=?", (doc_id,)
+            "SELECT doctrine_id FROM notes WHERE doctrine_id=?", (doc_id,)
         ).fetchone()
         if master is None:
             return 404, {"error": "This card is not part of a registered deck."}
@@ -541,7 +541,7 @@ def api_suggestion(data):
         token = uuid.uuid4().hex[:16]
         conn.execute(
             """INSERT INTO suggestions
-               (token, doctorine_id, anki_note_id, note_type, deck,
+               (token, doctrine_id, anki_note_id, note_type, deck,
                 suggestion_type, text, email,
                 snap_question, snap_answer, snap_css, snap_fields_json,
                 snap_hash, created_at)
@@ -562,18 +562,18 @@ def api_register(data):
     registered = updated = 0
     with db() as conn:
         for n in notes:
-            doc_id = (n.get("doctorine_id") or "").strip()
+            doc_id = (n.get("doctrine_id") or "").strip()
             if not doc_id:
                 continue
             fields = n.get("fields") or {}
             h = content_hash(fields)
             existing = conn.execute(
-                "SELECT content_hash, version FROM notes WHERE doctorine_id=?",
+                "SELECT content_hash, version FROM notes WHERE doctrine_id=?",
                 (doc_id,)
             ).fetchone()
             if existing is None:
                 conn.execute(
-                    """INSERT INTO notes (doctorine_id, anki_note_id, note_type,
+                    """INSERT INTO notes (doctrine_id, anki_note_id, note_type,
                        deck, fields_json, question_html, answer_html, css,
                        content_hash, version, updated_at)
                        VALUES (?,?,?,?,?,?,?,?,?,1,?)""",
@@ -587,7 +587,7 @@ def api_register(data):
                     """UPDATE notes SET anki_note_id=?, note_type=?, deck=?,
                        fields_json=?, question_html=?, answer_html=?, css=?,
                        content_hash=?, version=version+?, updated_at=?
-                       WHERE doctorine_id=?""",
+                       WHERE doctrine_id=?""",
                     (n.get("anki_note_id"), n.get("note_type"), n.get("deck"),
                      json.dumps(fields), n.get("question_html"),
                      n.get("answer_html"), n.get("css"), h,
@@ -702,7 +702,7 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     init_db()
-    print(f"Doctorine Suggestions platform — {CFG.public_base_url}", flush=True)
+    print(f"Doctrine Editor platform — {CFG.public_base_url}", flush=True)
     print(f"  Reviewer queue:  {CFG.public_base_url}/reviewer", flush=True)
     print(f"  Public updates:  {CFG.public_base_url}/updates", flush=True)
     print(f"  Listening on {CFG.host}:{CFG.port}, db={CFG.db_path}", flush=True)
