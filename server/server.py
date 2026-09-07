@@ -176,18 +176,40 @@ def init_db():
         # content, 2 GB for the real deck. Drop those columns in place; the
         # fields are the record now.
         note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)")}
-        dropped = False
-        for col in ("question_html", "answer_html", "css"):
-            if col in note_cols:
-                conn.execute(f"ALTER TABLE notes DROP COLUMN {col}")
-                dropped = True
-        if "tags_json" not in note_cols:
+        rebuilt = False
+        if note_cols & {"question_html", "answer_html", "css"}:
+            # Rebuild rather than DROP COLUMN: each DROP rewrites the whole
+            # table, and at 2 GB three of them plus a VACUUM blocked boot
+            # for minutes. One SELECT of the surviving columns into a fresh
+            # table is a single pass.
+            print("Migrating master storage to fields-only...", flush=True)
+            tags_src = "tags_json" if "tags_json" in note_cols else "NULL"
+            conn.executescript(f"""
+                CREATE TABLE notes_new (
+                    doctrine_id TEXT PRIMARY KEY,
+                    anki_note_id INTEGER,
+                    note_type TEXT,
+                    deck TEXT,
+                    fields_json TEXT,
+                    tags_json TEXT,
+                    content_hash TEXT,
+                    version INTEGER DEFAULT 1,
+                    updated_at TEXT
+                );
+                INSERT INTO notes_new
+                    SELECT doctrine_id, anki_note_id, note_type, deck,
+                           fields_json, {tags_src}, content_hash, version,
+                           updated_at
+                    FROM notes;
+                DROP TABLE notes;
+                ALTER TABLE notes_new RENAME TO notes;
+            """)
+            rebuilt = True
+        elif "tags_json" not in note_cols:
             conn.execute("ALTER TABLE notes ADD COLUMN tags_json TEXT")
 
-    if dropped:
-        # Reclaim the space the dropped columns occupied. One-off, at boot.
-        print("Migrating master storage to fields-only; reclaiming space...",
-              flush=True)
+    if rebuilt:
+        # Reclaim the space the dropped table occupied. One-off, at boot.
         with db() as conn:
             conn.execute("VACUUM")
         print("  done: %.0f MB" % (os.path.getsize(CFG.db_path) / 1e6), flush=True)
