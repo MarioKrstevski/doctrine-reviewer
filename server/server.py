@@ -25,6 +25,8 @@ import uuid
 from datetime import datetime, timezone
 import os
 import socketserver
+
+import auth
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -103,7 +105,37 @@ def init_db():
             created_at TEXT,
             closed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'reviewer',   -- admin|reviewer
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT,
+            password_changed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            created_at TEXT,
+            expires_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            ok INTEGER,
+            attempted_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_attempts_username
+            ON login_attempts(username, attempted_at);
+        CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
         """)
+
+        # suggestions predates auth in production, so add the column only
+        # when it is missing rather than recreating the table.
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(suggestions)")}
+        if "resolved_by" not in columns:
+            conn.execute("ALTER TABLE suggestions ADD COLUMN resolved_by INTEGER")
 
 
 def now():
@@ -715,8 +747,89 @@ class Server(ThreadingHTTPServer):
         self.server_name, self.server_port = self.server_address[:2]
 
 
+# ---------------------------------------------------------------- users
+
+def create_user(username, password, role="reviewer"):
+    """Insert a user. Returns (ok, message)."""
+    username = (username or "").strip()
+    if not username:
+        return False, "Username is required."
+    if role not in ("admin", "reviewer"):
+        return False, f"Unknown role: {role}"
+    if not password:
+        return False, "Password is required."
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username=?", (username,)
+        ).fetchone()
+        if existing:
+            return False, f"User {username!r} already exists."
+        conn.execute(
+            """INSERT INTO users
+               (username, password_hash, role, active, created_at, password_changed_at)
+               VALUES (?,?,?,1,?,?)""",
+            (username, auth.hash_password(password), role, now(), now()),
+        )
+    return True, f"Created {role} {username!r}."
+
+
+def set_password(user_id, password):
+    """Change a password and invalidate that user's live sessions.
+
+    Killing the sessions is the point: otherwise "this person is out"
+    would not take effect until their cookie expired days later.
+    """
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET password_hash=?, password_changed_at=? WHERE id=?",
+            (auth.hash_password(password), now(), user_id),
+        )
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+
+def set_active(user_id, active):
+    with db() as conn:
+        conn.execute("UPDATE users SET active=? WHERE id=?",
+                     (1 if active else 0, user_id))
+        if not active:
+            conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+
+
+def _cli_adduser(argv):
+    import getpass
+
+    if not argv:
+        print("usage: server.py adduser <username> [--admin] [--generate]")
+        return 2
+    username = argv[0]
+    role = "admin" if "--admin" in argv else "reviewer"
+
+    if "--generate" in argv:
+        password = auth.generate_password()
+    else:
+        password = getpass.getpass("Password: ")
+        if password != getpass.getpass("Repeat password: "):
+            print("Passwords did not match.")
+            return 1
+        if len(password) < 8:
+            print("Password must be at least 8 characters.")
+            return 1
+
+    ok, message = create_user(username, password, role)
+    print(message)
+    if ok and "--generate" in argv:
+        print(f"\n  Password: {password}\n\nShown once. Copy it now.")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    import sys
+
     init_db()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "adduser":
+        raise SystemExit(_cli_adduser(sys.argv[2:]))
+
     print(f"Doctrine Editor platform — {CFG.public_base_url}", flush=True)
     print(f"  Reviewer queue:  {CFG.public_base_url}/reviewer", flush=True)
     print(f"  Public updates:  {CFG.public_base_url}/updates", flush=True)
