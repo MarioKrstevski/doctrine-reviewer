@@ -5,14 +5,14 @@ Two pieces:
 - `addon/` — Anki add-on: "✎ Suggest" button in the reviewer bottom bar, plus a
   dev tool that stamps `DoctorineID` fields onto a deck and registers it as the
   master state on the platform.
-- `platform/server.py` — zero-dependency Python server (stdlib + SQLite):
+- `server/server.py` — zero-dependency Python server (stdlib + SQLite):
   suggestion API, reviewer queue, public updates ledger, tracking pages.
 
 ## Setup (5 minutes)
 
 1. **Start the server**
    ```
-   cd platform
+   cd server
    python3 server.py
    ```
    Runs at http://127.0.0.1:8787 and creates `doctorine.db` next to it.

@@ -22,7 +22,7 @@ a tracking link. No user accounts/login — by design.
     `doc-<uuid12>`, uploads all notes as master state to
     /api/dev/register. In production the pipeline mints IDs instead.
   - `config.json`: `server_url`, `id_field`.
-- `platform/server.py` — stdlib-only Python server + SQLite
+- `server/server.py` — stdlib-only Python server + SQLite
   (`doctorine.db`, auto-created). Port 8787.
   - POST /api/suggestions — rejects unknown DoctorineID (404). This is
     the real "only our deck" gate; the add-on check is courtesy.
@@ -90,7 +90,7 @@ Spoofed ID correctly 404s.
 
 ## Test loop
 
-1. `cd platform && python3 server.py`
+1. `cd server && python3 server.py`
 2. Copy `addon/` into Anki addons21 dir (TEST PROFILE — stamping alters
    note types and forces full sync), restart Anki.
 3. Tools → Doctorine Suggestions → Stamp & register a deck.
