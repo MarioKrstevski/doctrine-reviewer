@@ -17,6 +17,7 @@ button_top_offset, button_right_offset.
 
 import hashlib
 import json
+import os
 import time
 import urllib.request
 import urllib.error
@@ -29,7 +30,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import resolver
+from . import resolver, state
 
 ADDON_NAME = "Doctrine Editor"
 
@@ -46,7 +47,19 @@ SUGGESTION_TYPES = [
 DEFAULT_BOOTSTRAP = "https://doctrine-editor-production.up.railway.app"
 
 
+def user_files_dir():
+    """Anki preserves user_files/ across add-on updates."""
+    return os.path.join(os.path.dirname(__file__), "user_files")
+
+
 def get_config():
+    """Visible settings from config.json, plus internal state.
+
+    Only the button offsets are exposed in Anki's Config panel. The
+    bootstrap URL, the override and the ID field stay code-level defaults
+    so students cannot redirect or break their own submissions -- a
+    developer can still add those keys by hand when testing locally.
+    """
     cfg = mw.addonManager.getConfig(__name__) or {}
     return {
         "bootstrap_url": cfg.get("bootstrap_url", DEFAULT_BOOTSTRAP).rstrip("/"),
@@ -54,7 +67,7 @@ def get_config():
         "id_field": cfg.get("id_field", "DoctrineID"),
         "button_top_offset": cfg.get("button_top_offset", 150),
         "button_right_offset": cfg.get("button_right_offset", 12),
-        "_cache": cfg.get("_cache", {}),
+        "_cache": state.load(user_files_dir()),
     }
 
 
@@ -72,9 +85,7 @@ def api_base(cfg) -> str:
     cache = dict(cfg.get("_cache") or {})
     base = resolver.resolve_api_base(cfg, cache, fetch=get_json, now=time.time)
     if cache != (cfg.get("_cache") or {}):
-        stored = mw.addonManager.getConfig(__name__) or {}
-        stored["_cache"] = cache
-        mw.addonManager.writeConfig(__name__, stored)
+        state.save(user_files_dir(), cache)
     return base
 
 

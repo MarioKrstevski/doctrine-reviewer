@@ -1,7 +1,4 @@
 {
-  "bootstrap_url": "https://doctrine-editor-production.up.railway.app",
-  "api_base_override": "",
-  "id_field": "DoctrineID",
   "button_top_offset": 150,
   "button_right_offset": 12
 }
