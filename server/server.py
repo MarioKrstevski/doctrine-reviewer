@@ -51,8 +51,29 @@ TYPE_LABELS = {
 
 # ---------------------------------------------------------------- db
 
+class _Connection(sqlite3.Connection):
+    """sqlite3's context manager commits or rolls back but never closes.
+
+    A lingering connection keeps its lock until garbage collection, which
+    under a threaded server means writers stall on ghosts. Close on exit.
+    """
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return super().__exit__(exc_type, exc, tb)
+        finally:
+            self.close()
+
+
+# How long a connection waits for a lock before giving up. The default is
+# 5s; a 100-note registration batch can hold the write lock longer than
+# that, which is exactly what took the login path down in production.
+DB_BUSY_TIMEOUT = 30
+
+
 def db():
-    conn = sqlite3.connect(CFG.db_path)
+    conn = sqlite3.connect(CFG.db_path, timeout=DB_BUSY_TIMEOUT,
+                           factory=_Connection)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -71,6 +92,15 @@ def init_db():
             f"should be a mounted volume, DATA WILL BE LOST on restart.",
             flush=True,
         )
+
+    # WAL: readers never wait for the writer and the writer never waits
+    # for readers. Persistent in the file, so setting it once here covers
+    # every later connection. synchronous=NORMAL is durable under WAL for
+    # everything except power loss mid-checkpoint, which is acceptable
+    # for a suggestion queue.
+    with db() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
 
     with db() as conn:
         conn.executescript("""
@@ -744,7 +774,26 @@ class Handler(BaseHTTPRequestHandler):
         supplied = form.get("csrf", [""])[0]
         return bool(token) and auth.csrf_ok(supplied, token, session_secret())
 
+    def _db_unavailable(self):
+        body = page("Busy", "<h1>Busy</h1><p>The database is momentarily "
+                            "locked by another request. Please retry.</p>")
+        self._send(503, body, headers={"Retry-After": "2"})
+
     def do_GET(self):
+        try:
+            self._do_GET()
+        except sqlite3.OperationalError as e:
+            print(f"[db] {e} on GET {self.path}", flush=True)
+            self._db_unavailable()
+
+    def do_POST(self):
+        try:
+            self._do_POST()
+        except sqlite3.OperationalError as e:
+            print(f"[db] {e} on POST {self.path}", flush=True)
+            self._db_unavailable()
+
+    def _do_GET(self):
         path = urlparse(self.path).path
         if path == "/where":
             self._send(
@@ -792,7 +841,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, page("Not found", "<h1>Not found</h1>"))
 
-    def do_POST(self):
+    def _do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
         path = urlparse(self.path).path
