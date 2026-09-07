@@ -256,3 +256,161 @@ class CsrfRouteTest(unittest.TestCase):
                 row = conn.execute("SELECT status FROM suggestions WHERE id=?",
                                    (sid,)).fetchone()
             self.assertEqual("open", row["status"])
+
+
+def admin(base, username="boss"):
+    make_user(username, "adminpassword1", "admin")
+    return login(base, username, "adminpassword1")
+
+
+def csrf_for(cookie):
+    return auth.csrf_token(cookie.split("=", 1)[1], server.session_secret())
+
+
+class AdminAccessTest(unittest.TestCase):
+    def test_a_reviewer_cannot_reach_the_admin_page(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            status, _, _ = request(base, "GET", "/admin/users", cookie=cookie)
+            self.assertEqual(403, status)
+
+    def test_an_admin_can_reach_the_admin_page(self):
+        with running_server() as base:
+            _, cookie = admin(base)
+            status, _, body = request(base, "GET", "/admin/users", cookie=cookie)
+            self.assertEqual(200, status)
+            self.assertIn("boss", body)
+
+    def test_logged_out_admin_page_redirects(self):
+        with running_server() as base:
+            status, _, _ = request(base, "GET", "/admin/users")
+            self.assertEqual(303, status)
+
+    def test_a_reviewer_cannot_create_users(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            status, _, _ = request(base, "POST", "/admin/users",
+                                   {"do": "create", "username": "sneaky",
+                                    "csrf": csrf_for(cookie)}, cookie=cookie)
+            self.assertEqual(403, status)
+            with server.db() as conn:
+                self.assertIsNone(conn.execute(
+                    "SELECT id FROM users WHERE username='sneaky'").fetchone())
+
+    def test_an_admin_creates_a_reviewer_and_sees_the_password_once(self):
+        with running_server() as base:
+            _, cookie = admin(base)
+            status, _, body = request(base, "POST", "/admin/users",
+                                      {"do": "create", "username": "newbie",
+                                       "csrf": csrf_for(cookie)}, cookie=cookie)
+            self.assertEqual(200, status)
+            with server.db() as conn:
+                row = conn.execute(
+                    "SELECT role, active FROM users WHERE username='newbie'"
+                ).fetchone()
+            self.assertIsNotNone(row, "user was not created")
+            self.assertEqual("reviewer", row["role"])
+            self.assertIn("newbie", body)
+
+    def test_creating_a_duplicate_username_is_refused(self):
+        with running_server() as base:
+            _, cookie = admin(base)
+            make_user("taken", "somepassword12")
+            request(base, "POST", "/admin/users",
+                    {"do": "create", "username": "taken", "csrf": csrf_for(cookie)},
+                    cookie=cookie)
+            with server.db() as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) c FROM users WHERE username='taken'"
+                ).fetchone()["c"]
+            self.assertEqual(1, count)
+
+    def test_an_admin_reset_kills_the_target_session(self):
+        with running_server() as base:
+            _, admin_cookie = admin(base)
+            user, pw = make_user("victim", "victimpassword1")
+            _, victim_cookie = login(base, "victim", "victimpassword1")
+            self.assertEqual(200, request(base, "GET", "/reviewer",
+                                          cookie=victim_cookie)[0])
+
+            with server.db() as conn:
+                uid = conn.execute("SELECT id FROM users WHERE username='victim'"
+                                   ).fetchone()["id"]
+            request(base, "POST", "/admin/users",
+                    {"do": "reset", "user_id": uid, "csrf": csrf_for(admin_cookie)},
+                    cookie=admin_cookie)
+
+            self.assertEqual(303, request(base, "GET", "/reviewer",
+                                          cookie=victim_cookie)[0])
+
+    def test_an_admin_cannot_deactivate_the_last_admin(self):
+        with running_server() as base:
+            _, cookie = admin(base)
+            with server.db() as conn:
+                uid = conn.execute("SELECT id FROM users WHERE username='boss'"
+                                   ).fetchone()["id"]
+            request(base, "POST", "/admin/users",
+                    {"do": "deactivate", "user_id": uid, "csrf": csrf_for(cookie)},
+                    cookie=cookie)
+            with server.db() as conn:
+                still = conn.execute("SELECT active FROM users WHERE id=?",
+                                     (uid,)).fetchone()["active"]
+            self.assertEqual(1, still, "locked out the only admin")
+
+    def test_deactivating_a_user_keeps_their_history(self):
+        with running_server() as base:
+            _, cookie = admin(base)
+            make_user("leaver", "leaverpassword1")
+            with server.db() as conn:
+                uid = conn.execute("SELECT id FROM users WHERE username='leaver'"
+                                   ).fetchone()["id"]
+            request(base, "POST", "/admin/users",
+                    {"do": "deactivate", "user_id": uid, "csrf": csrf_for(cookie)},
+                    cookie=cookie)
+            with server.db() as conn:
+                row = conn.execute("SELECT active FROM users WHERE id=?",
+                                   (uid,)).fetchone()
+            self.assertIsNotNone(row, "the user row was deleted, losing history")
+            self.assertEqual(0, row["active"])
+
+
+class AccountTest(unittest.TestCase):
+    def test_a_user_changes_their_own_password(self):
+        with running_server() as base:
+            user, pw = make_user("selfserve", "oldpassword123")
+            _, cookie = login(base, "selfserve", "oldpassword123")
+            status, _, _ = request(base, "POST", "/account",
+                                   {"current": "oldpassword123",
+                                    "new": "newpassword456",
+                                    "confirm": "newpassword456",
+                                    "csrf": csrf_for(cookie)}, cookie=cookie)
+            self.assertIn(status, (200, 303))
+            self.assertIsNone(login(base, "selfserve", "oldpassword123")[1])
+            self.assertIsNotNone(login(base, "selfserve", "newpassword456")[1])
+
+    def test_the_current_password_is_required(self):
+        with running_server() as base:
+            make_user("careful", "realpassword123")
+            _, cookie = login(base, "careful", "realpassword123")
+            request(base, "POST", "/account",
+                    {"current": "wrongpassword", "new": "newpassword456",
+                     "confirm": "newpassword456", "csrf": csrf_for(cookie)},
+                    cookie=cookie)
+            self.assertIsNotNone(login(base, "careful", "realpassword123")[1],
+                                 "password changed without the current one")
+
+    def test_mismatched_confirmation_is_refused(self):
+        with running_server() as base:
+            make_user("typo", "realpassword123")
+            _, cookie = login(base, "typo", "realpassword123")
+            request(base, "POST", "/account",
+                    {"current": "realpassword123", "new": "newpassword456",
+                     "confirm": "different999", "csrf": csrf_for(cookie)},
+                    cookie=cookie)
+            self.assertIsNotNone(login(base, "typo", "realpassword123")[1])
+
+    def test_account_page_requires_login(self):
+        with running_server() as base:
+            self.assertEqual(303, request(base, "GET", "/account")[0])

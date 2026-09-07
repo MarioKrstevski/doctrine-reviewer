@@ -349,23 +349,41 @@ LEDGER_CSS = """
 """
 
 
-def page(title, body, active=""):
+def page(title, body, active="", user=None, csrf=""):
     def nav_link(href, label, key):
         cls = ' class="active"' if key == active else ""
         return f'<a href="{href}"{cls}>{label}</a>'
+    admin_link = (nav_link("/admin/users", "Reviewers", "admin")
+                  if user and user.get("role") == "admin" else "")
+    account_link = nav_link("/account", "Account", "account") if user else ""
+    signed_in = ""
+    if user:
+        signed_in = (
+            f'<form method="post" action="/logout" class="signout">'
+            f'<input type="hidden" name="csrf" value="{csrf}">'
+            f'<span>{esc(user["username"])}</span>'
+            f'<button type="submit">Sign out</button></form>')
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} — Doctrine</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400..600;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap">
-<style>{BASE_CSS}{LEDGER_CSS}</style></head><body>
+<style>{BASE_CSS}{LEDGER_CSS}
+.signout {{ display: inline-flex; align-items: center; gap: 8px;
+  margin-left: auto; font-size: 12px; color: #777; }}
+.signout button {{ padding: 3px 9px; font-size: 12px; cursor: pointer;
+  background: transparent; border: 1px solid #bbb; border-radius: 3px;
+  color: inherit; }}
+header.site .wrap {{ display: flex; align-items: center; gap: 18px; }}
+</style></head><body>
 <header class="site"><div class="wrap">
   <span class="brand">Doctrine<small>Card quality</small></span>
   <nav>
     {nav_link("/updates", "Community updates", "updates")}
     {nav_link("/reviewer", "Reviewer queue", "reviewer")}
-  </nav>
+    {admin_link}{account_link}
+  </nav>{signed_in}
 </div></header>
 <div class="wrap">{body}</div>
 <script>
@@ -396,7 +414,7 @@ def render_reviewer(user=None, secret=None, session_token=None):
                 'version.</p><div class="empty"><b>The queue is clear</b>'
                 'When a student clicks &#9998; Suggest inside Anki, their note '
                 'arrives here with the exact card they were looking at.</div>')
-        return page("Reviewer queue", body, "reviewer")
+        return page("Reviewer queue", body, "reviewer", user, csrf)
 
     items = []
     for r in rows:
@@ -498,7 +516,7 @@ def render_reviewer(user=None, secret=None, session_token=None):
             f'<p class="queue-count"><b>{n_open} open</b> &middot; '
             f'{len(rows) - n_open} closed</p>'
             + "".join(items))
-    return page("Reviewer queue", body, "reviewer")
+    return page("Reviewer queue", body, "reviewer", user, csrf)
 
 
 def render_updates():
@@ -731,6 +749,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/reviewer")
             else:
                 self._send(200, render_login())
+        elif path == "/account":
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                self._send(200, render_account(
+                    user, auth.csrf_token(self._cookie_token(), session_secret())))
+        elif path == "/admin/users":
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin":
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Administrators only.</p>"))
+            else:
+                self._send(200, render_admin_users(
+                    user, auth.csrf_token(self._cookie_token(), session_secret())))
         elif path in ("/", "/reviewer"):
             user = self._current_user()
             if user is None:
@@ -776,6 +811,42 @@ class Handler(BaseHTTPRequestHandler):
             if self._csrf_ok(form):
                 end_session(self._cookie_token())
             self._redirect("/login", self._set_cookie(None, clear=True))
+        elif path == "/admin/users":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin":
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Administrators only.</p>"))
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Invalid form token.</p>"))
+            else:
+                notice, new_password = admin_action(form)
+                self._send(200, render_admin_users(
+                    user, auth.csrf_token(self._cookie_token(), session_secret()),
+                    notice, new_password))
+        elif path == "/account":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Invalid form token.</p>"))
+            else:
+                ok, message = change_own_password(
+                    user["id"], form.get("current", [""])[0],
+                    form.get("new", [""])[0], form.get("confirm", [""])[0])
+                if ok:
+                    # set_password cleared every session, this one included.
+                    self._redirect("/login", self._set_cookie(None, clear=True))
+                else:
+                    self._send(200, render_account(
+                        user,
+                        auth.csrf_token(self._cookie_token(), session_secret()),
+                        error=message))
         elif path == "/reviewer/action":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -848,6 +919,194 @@ def render_login(error=None, username=""):
   line-height: 1.5; }}
 </style>"""
     return page("Sign in", body)
+
+
+def render_admin_users(user, csrf, notice=None, new_password=None):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, username, role, active, created_at FROM users"
+            " ORDER BY role='reviewer', username").fetchall()
+
+    banner = ""
+    if new_password:
+        banner = f"""
+<div class="pw-reveal">
+  <p><strong>Password for {esc(new_password[0])}</strong></p>
+  <code>{esc(new_password[1])}</code>
+  <p class="pw-note">Shown once. Copy it now and send it to them —
+  it cannot be retrieved later, only reset.</p>
+</div>"""
+    elif notice:
+        banner = f'<p class="notice">{esc(notice)}</p>'
+
+    items = []
+    for r in rows:
+        state = "active" if r["active"] else "inactive"
+        toggle = "deactivate" if r["active"] else "activate"
+        items.append(f"""
+<tr class="{state}">
+  <td>{esc(r['username'])}</td>
+  <td><span class="role role-{r['role']}">{r['role']}</span></td>
+  <td>{state}</td>
+  <td class="row-actions">
+    <form method="post" action="/admin/users" class="inline">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <input type="hidden" name="user_id" value="{r['id']}">
+      <button name="do" value="reset" class="ghost">Reset password</button>
+    </form>
+    <form method="post" action="/admin/users" class="inline">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <input type="hidden" name="user_id" value="{r['id']}">
+      <button name="do" value="{toggle}" class="ghost">{toggle.title()}</button>
+    </form>
+  </td>
+</tr>""")
+
+    body = f"""
+<h1>Reviewers</h1>
+<p class="sub">Signed in as {esc(user['username'])} (admin)</p>
+{banner}
+<form method="post" action="/admin/users" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="hidden" name="do" value="create">
+  <input type="text" name="username" placeholder="New reviewer username" required>
+  <label class="chk"><input type="checkbox" name="admin" value="1"> Administrator</label>
+  <button type="submit">Create</button>
+</form>
+<table class="users">
+  <thead><tr><th>User</th><th>Role</th><th>Status</th><th></th></tr></thead>
+  <tbody>{''.join(items)}</tbody>
+</table>
+<p class="admin-note">Deactivating keeps a person's review history intact
+and signs them out immediately. Resetting a password also signs them out.
+There is no email in this system — hand credentials over directly.</p>
+<style>
+.pw-reveal {{ margin: 16px 0; padding: 14px 16px; border-radius: 6px;
+  background: #eef7f0; border: 1px solid #bcdcc6; }}
+.pw-reveal code {{ display: inline-block; margin: 6px 0; padding: 6px 10px;
+  font-size: 17px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }}
+.pw-note {{ font-size: 12px; color: #55694d; margin: 4px 0 0; }}
+.notice {{ padding: 9px 12px; border-radius: 4px; background: #f4f4f4; }}
+.create-form {{ display: flex; gap: 8px; align-items: center; margin: 18px 0; }}
+.create-form input[type=text] {{ padding: 7px; min-width: 240px;
+  border: 1px solid #ccc; border-radius: 4px; }}
+table.users {{ width: 100%; border-collapse: collapse; }}
+table.users th, table.users td {{ text-align: left; padding: 8px 6px;
+  border-bottom: 1px solid #eee; font-size: 14px; }}
+tr.inactive {{ opacity: 0.5; }}
+.role {{ font-size: 11px; padding: 2px 7px; border-radius: 10px;
+  background: #eee; }}
+.role-admin {{ background: #e5edf7; }}
+form.inline {{ display: inline; }}
+.row-actions {{ text-align: right; }}
+.admin-note {{ margin-top: 22px; font-size: 12px; color: #777; line-height: 1.6; }}
+</style>"""
+    return page("Reviewers", body, "admin", user, csrf)
+
+
+def render_account(user, csrf, notice=None, error=None):
+    msg = ""
+    if error:
+        msg = f'<p class="login-error">{esc(error)}</p>'
+    elif notice:
+        msg = f'<p class="notice">{esc(notice)}</p>'
+    body = f"""
+<h1>Your account</h1>
+<p class="sub">Signed in as {esc(user['username'])} ({esc(user['role'])})</p>
+{msg}
+<form method="post" action="/account" class="login-form" style="max-width:340px">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <label for="current">Current password</label>
+  <input id="current" name="current" type="password" required>
+  <label for="new">New password</label>
+  <input id="new" name="new" type="password" required>
+  <label for="confirm">Repeat new password</label>
+  <input id="confirm" name="confirm" type="password" required>
+  <button type="submit">Change password</button>
+</form>
+<p class="admin-note">Forgot your password? An administrator can reset it —
+there is no email recovery.</p>
+<style>
+.login-form {{ display: flex; flex-direction: column; gap: 6px; }}
+.login-form label {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
+.login-form input {{ padding: 8px; font-size: 15px; border: 1px solid #ccc;
+  border-radius: 4px; }}
+.login-form button {{ margin-top: 16px; padding: 9px; cursor: pointer;
+  border: 0; border-radius: 4px; background: #2f6f4f; color: #fff; }}
+.login-error {{ padding: 9px 12px; border-radius: 4px; background: #fdeaea;
+  color: #8a1f1f; }}
+.notice {{ padding: 9px 12px; border-radius: 4px; background: #eef7f0; }}
+.admin-note {{ margin-top: 22px; font-size: 12px; color: #777; }}
+</style>"""
+    return page("Your account", body, "account", user, csrf)
+
+
+def count_active_admins(exclude_id=None):
+    query = "SELECT COUNT(*) c FROM users WHERE role='admin' AND active=1"
+    params = ()
+    if exclude_id is not None:
+        query += " AND id != ?"
+        params = (exclude_id,)
+    with db() as conn:
+        return conn.execute(query, params).fetchone()["c"]
+
+
+def admin_action(form):
+    """Apply an admin action. Returns (notice, new_password_tuple_or_None)."""
+    action = form.get("do", [""])[0]
+
+    if action == "create":
+        username = form.get("username", [""])[0].strip()
+        role = "admin" if form.get("admin") else "reviewer"
+        password = auth.generate_password()
+        ok, message = create_user(username, password, role)
+        return (None, (username, password)) if ok else (message, None)
+
+    try:
+        user_id = int(form.get("user_id", [""])[0])
+    except (TypeError, ValueError):
+        return "Unknown user.", None
+
+    with db() as conn:
+        target = conn.execute("SELECT username, role, active FROM users WHERE id=?",
+                              (user_id,)).fetchone()
+    if target is None:
+        return "Unknown user.", None
+
+    if action == "reset":
+        password = auth.generate_password()
+        set_password(user_id, password)
+        return None, (target["username"], password)
+
+    if action == "deactivate":
+        # Refuse to remove the last way into the admin page.
+        if target["role"] == "admin" and count_active_admins(exclude_id=user_id) == 0:
+            return ("That is the only active administrator — create another "
+                    "one before deactivating this account."), None
+        set_active(user_id, False)
+        return f"Deactivated {target['username']}.", None
+
+    if action == "activate":
+        set_active(user_id, True)
+        return (f"Reactivated {target['username']}. Reset their password to "
+                "give them a way back in."), None
+
+    return "Unknown action.", None
+
+
+def change_own_password(user_id, current, new, confirm):
+    """Returns (ok, message)."""
+    if not new or len(new) < 8:
+        return False, "New password must be at least 8 characters."
+    if new != confirm:
+        return False, "The new passwords did not match."
+    with db() as conn:
+        row = conn.execute("SELECT password_hash FROM users WHERE id=?",
+                           (user_id,)).fetchone()
+    if row is None or not auth.verify_password(current, row["password_hash"]):
+        return False, "Current password is incorrect."
+    set_password(user_id, new)
+    return True, "Password changed. Your other sessions were signed out."
 
 
 # ---------------------------------------------------------------- sessions
