@@ -30,6 +30,7 @@ from urllib.parse import urlparse, parse_qs
 import config
 
 CFG = config.load()
+MIN_ADDON_VERSION = "1.0"
 ID_FIELD = "DoctorineID"   # excluded from content hashing, same as add-on
 
 TYPE_LABELS = {
@@ -618,11 +619,13 @@ def reviewer_action(form):
 # ---------------------------------------------------------------- http handler
 
 class Handler(BaseHTTPRequestHandler):
-    def _send(self, code, body, ctype="text/html; charset=utf-8"):
+    def _send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -631,7 +634,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
-        if path in ("/", "/reviewer"):
+        if path == "/where":
+            self._send(
+                200,
+                json.dumps({
+                    "api_base": CFG.public_base_url,
+                    "min_addon_version": MIN_ADDON_VERSION,
+                }),
+                "application/json",
+                {"Cache-Control": "public, max-age=3600"},
+            )
+        elif path in ("/", "/reviewer"):
             self._send(200, render_reviewer())
         elif path == "/updates":
             self._send(200, render_updates())
