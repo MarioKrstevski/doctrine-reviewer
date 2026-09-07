@@ -168,6 +168,18 @@ def init_db():
             ok INTEGER,
             attempted_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suggestion_id INTEGER NOT NULL UNIQUE,
+            email TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'thank_you',
+            status TEXT NOT NULL DEFAULT 'pending',   -- pending|thanked|skipped
+            created_at TEXT,
+            actioned_at TEXT,
+            actioned_by INTEGER
+        );
         CREATE INDEX IF NOT EXISTS idx_attempts_username
             ON login_attempts(username, attempted_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -888,6 +900,63 @@ def api_register(data):
     return 200, {"ok": True, "registered": registered, "updated": updated}
 
 
+THANK_YOU_QUOTE_CHARS = 160
+
+
+def render_thank_you(deck, text, tracking_url, credit_name, published):
+    """Plain-text subject and body for a human to paste into an email.
+
+    Plain text on purpose: it is copied into whatever mail client the
+    reviewer uses, so no HTML and no escaping.
+    """
+    quote = (text or "").strip().replace("\n", " ")
+    if len(quote) > THANK_YOU_QUOTE_CHARS:
+        quote = quote[:THANK_YOU_QUOTE_CHARS].rstrip() + "…"
+
+    subject = "Thank you — your Doctrine suggestion was accepted"
+    lines = [
+        "Hi,",
+        "",
+        f"Thank you for your suggestion on a card in {deck or 'the deck'}:",
+        f'"{quote}"',
+        "",
+        "A reviewer accepted it, and the fix ships in the next deck update.",
+    ]
+    if published:
+        credited = f" It is credited to {credit_name}." if credit_name else ""
+        lines += [f"We have listed it on the community updates page.{credited}",
+                  f"{CFG.public_base_url}/updates"]
+    lines += [
+        "",
+        "You can see its status any time here:",
+        tracking_url,
+        "",
+        "— The Doctrine team",
+    ]
+    return subject, "\n".join(lines)
+
+
+def queue_thank_you(conn, sid):
+    """Queue a thank-you for a just-resolved suggestion, if it left an email.
+
+    Called inside the resolving transaction. The UNIQUE(suggestion_id)
+    constraint plus INSERT OR IGNORE make this safe to call more than once.
+    """
+    r = conn.execute(
+        "SELECT deck, text, email, token, credit_name, published "
+        "FROM suggestions WHERE id=?", (sid,)).fetchone()
+    if r is None or not (r["email"] or "").strip():
+        return
+    subject, body = render_thank_you(
+        r["deck"], r["text"], f"{CFG.public_base_url}/s/{r['token']}",
+        r["credit_name"], bool(r["published"]))
+    conn.execute(
+        """INSERT OR IGNORE INTO notifications
+           (suggestion_id, email, subject, body, created_at)
+           VALUES (?,?,?,?,?)""",
+        (sid, r["email"].strip(), subject, body, now()))
+
+
 def reviewer_action(form, user_id=None):
     sid = form.get("id", [""])[0]
     action = form.get("do", [""])[0]
@@ -897,14 +966,18 @@ def reviewer_action(form, user_id=None):
         return
     publish = 1 if (status == "resolved" and form.get("publish")) else 0
     with db() as conn:
-        conn.execute(
+        changed = conn.execute(
             """UPDATE suggestions SET status=?, resolution_note=?, published=?,
                publish_summary=?, credit_name=?, closed_at=?, resolved_by=?
                WHERE id=? AND status='open'""",
             (status, form.get("resolution_note", [""])[0].strip() or None,
              publish, form.get("publish_summary", [""])[0].strip() or None,
              form.get("credit_name", [""])[0].strip() or None, now(),
-             user_id, sid))
+             user_id, sid)).rowcount
+        # Only a genuine open -> resolved transition earns a thank-you;
+        # declines, expirations and repeat submits of the form do not.
+        if changed == 1 and status == "resolved":
+            queue_thank_you(conn, sid)
 
 
 # ---------------------------------------------------------------- http handler
