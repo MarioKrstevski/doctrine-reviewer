@@ -434,14 +434,42 @@ document.querySelectorAll('.actions input[name=publish]').forEach(cb => {{
 
 # ---------------------------------------------------------------- pages
 
+RECENT_CLOSED_SHOWN = 50
+_IN_CHUNK = 500   # stay well under SQLite's bound-parameter limit
+
+
+def fetch_masters(conn, doctrine_ids):
+    """Master rows for exactly these ids, never the whole table.
+
+    The reviewer page once did SELECT * FROM notes to build this dict:
+    every note's fields, rendered HTML and a copy of the note-type CSS,
+    on every page view. At 34,704 real notes that was hundreds of MB per
+    request and the container was OOM-killed.
+    """
+    ids = sorted(i for i in doctrine_ids if i)
+    masters = {}
+    for start in range(0, len(ids), _IN_CHUNK):
+        chunk = ids[start:start + _IN_CHUNK]
+        marks = ",".join("?" * len(chunk))
+        for r in conn.execute(
+                f"SELECT * FROM notes WHERE doctrine_id IN ({marks})", chunk):
+            masters[r["doctrine_id"]] = r
+    return masters
+
+
 def render_reviewer(user=None, secret=None, session_token=None):
     csrf = auth.csrf_token(session_token, secret) if session_token and secret else ""
     with db() as conn:
+        # Every open item, plus a bounded tail of closed ones. Neither
+        # query may scale with the size of the deck or of history.
         rows = conn.execute(
-            "SELECT * FROM suggestions ORDER BY "
-            "CASE status WHEN 'open' THEN 0 ELSE 1 END, id DESC"
+            "SELECT * FROM suggestions WHERE status='open' ORDER BY id DESC"
         ).fetchall()
-        masters = {r["doctrine_id"]: r for r in conn.execute("SELECT * FROM notes")}
+        rows += conn.execute(
+            "SELECT * FROM suggestions WHERE status!='open' "
+            "ORDER BY id DESC LIMIT ?", (RECENT_CLOSED_SHOWN,)
+        ).fetchall()
+        masters = fetch_masters(conn, {r["doctrine_id"] for r in rows})
 
     if not rows:
         body = ('<h1>Reviewer queue</h1><p class="sub">Suggestions from students '
