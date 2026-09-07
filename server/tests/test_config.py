@@ -36,3 +36,29 @@ class LoadTest(unittest.TestCase):
     def test_railway_domain_with_a_scheme_is_not_double_prefixed(self):
         cfg = config.load({"RAILWAY_PUBLIC_DOMAIN": "https://app.up.railway.app"})
         self.assertEqual("https://app.up.railway.app", cfg.public_base_url)
+
+
+class DatabaseDirectoryTest(unittest.TestCase):
+    """init_db() must not crash when the DB's parent directory is absent.
+
+    A container whose volume has not attached yet has no /data, and SQLite
+    cannot create a file in a directory that does not exist. Crash-looping
+    there is worse than creating the directory and logging the path.
+    """
+
+    def test_init_db_creates_a_missing_parent_directory(self):
+        import tempfile
+        from pathlib import Path
+
+        import config
+        import server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = Path(tmp) / "not" / "created" / "yet" / "doctrine.db"
+            previous = server.CFG
+            try:
+                server.CFG = config.load({"DB_PATH": str(nested)})
+                server.init_db()
+                self.assertTrue(nested.exists(), "database file was not created")
+            finally:
+                server.CFG = previous

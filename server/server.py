@@ -23,6 +23,7 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+import os
 import socketserver
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -50,6 +51,20 @@ def db():
 
 
 def init_db():
+    # A container whose volume has not attached yet has no /data, and
+    # SQLite cannot create a file in a directory that does not exist.
+    # Create it rather than crash-loop -- but say so loudly, because a
+    # mounted volume always exists already: if we had to create it, this
+    # process is probably writing to ephemeral storage that will be lost.
+    parent = os.path.dirname(os.path.abspath(CFG.db_path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+        print(
+            f"WARNING: created {parent} -- it did not exist. If this path "
+            f"should be a mounted volume, DATA WILL BE LOST on restart.",
+            flush=True,
+        )
+
     with db() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS notes (
