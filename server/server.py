@@ -553,7 +553,7 @@ def api_suggestion(data):
              snap.get("content_hash"), now()),
         )
     return 200, {"ok": True,
-                 "tracking_url": f"http://{HOST}:{PORT}/s/{token}"}
+                 "tracking_url": f"{CFG.public_base_url}/s/{token}"}
 
 
 def api_register(data):
