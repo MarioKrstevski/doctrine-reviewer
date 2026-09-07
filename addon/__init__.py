@@ -11,8 +11,8 @@ Tools menu (Tools -> Doctrine Editor):
     field to every note type in a chosen deck, stamps unique IDs, and
     registers the notes as the "master" state on the platform server.
 
-Config (config.json): bootstrap_url, api_base_override, id_field,
-button_top_offset, button_right_offset.
+No user-facing config: the endpoint, button position and ID field are
+constants below, changed by shipping a new build.
 """
 
 import hashlib
@@ -52,21 +52,25 @@ def user_files_dir():
     return os.path.join(os.path.dirname(__file__), "user_files")
 
 
-def get_config():
-    """Visible settings from config.json, plus internal state.
+# Everything below is ours, not the student's. The add-on deliberately
+# ships no config.json, so Anki shows no Config panel at all: the endpoint,
+# the button position and the ID field are decisions we make and change by
+# releasing a new build. API_BASE_OVERRIDE is a development escape hatch --
+# set it in this file when testing against a local server, never in a
+# shipped build.
+API_BASE_OVERRIDE = ""
+ID_FIELD = "DoctrineID"
+BUTTON_TOP_OFFSET = 150
+BUTTON_RIGHT_OFFSET = 12
 
-    Only the button offsets are exposed in Anki's Config panel. The
-    bootstrap URL, the override and the ID field stay code-level defaults
-    so students cannot redirect or break their own submissions -- a
-    developer can still add those keys by hand when testing locally.
-    """
-    cfg = mw.addonManager.getConfig(__name__) or {}
+
+def get_config():
     return {
-        "bootstrap_url": cfg.get("bootstrap_url", DEFAULT_BOOTSTRAP).rstrip("/"),
-        "api_base_override": cfg.get("api_base_override", ""),
-        "id_field": cfg.get("id_field", "DoctrineID"),
-        "button_top_offset": cfg.get("button_top_offset", 150),
-        "button_right_offset": cfg.get("button_right_offset", 12),
+        "bootstrap_url": DEFAULT_BOOTSTRAP,
+        "api_base_override": API_BASE_OVERRIDE,
+        "id_field": ID_FIELD,
+        "button_top_offset": BUTTON_TOP_OFFSET,
+        "button_right_offset": BUTTON_RIGHT_OFFSET,
         "_cache": state.load(user_files_dir()),
     }
 
