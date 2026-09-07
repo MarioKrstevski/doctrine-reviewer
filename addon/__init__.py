@@ -1,13 +1,13 @@
 """
-Doctorine Suggestions — Anki add-on prototype.
+Doctrine Editor — Anki add-on prototype.
 
 Adds a "Suggest" button to the reviewer bottom bar. Clicking it opens a
 dialog where the student picks a suggestion type and writes a comment.
-The add-on silently attaches the card's DoctorineID, note id, deck,
+The add-on silently attaches the card's DoctrineID, note id, deck,
 fields, rendered HTML and a content hash, and POSTs it to the platform.
 
-Tools menu (Tools -> Doctorine Suggestions):
-  - "Stamp & register a deck..." : dev helper that adds a DoctorineID
+Tools menu (Tools -> Doctrine Editor):
+  - "Stamp & register a deck..." : dev helper that adds a DoctrineID
     field to every note type in a chosen deck, stamps unique IDs, and
     registers the notes as the "master" state on the platform server.
 
@@ -27,7 +27,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-ADDON_NAME = "Doctorine Suggestions"
+ADDON_NAME = "Doctrine Editor"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -43,7 +43,7 @@ def get_config():
     cfg = mw.addonManager.getConfig(__name__) or {}
     return {
         "server_url": cfg.get("server_url", "http://127.0.0.1:8787").rstrip("/"),
-        "id_field": cfg.get("id_field", "DoctorineID"),
+        "id_field": cfg.get("id_field", "DoctrineID"),
     }
 
 
@@ -150,7 +150,7 @@ def open_suggestion_dialog():
         )
         return
 
-    doctorine_id = note[cfg["id_field"]].strip()
+    doctrine_id = note[cfg["id_field"]].strip()
     deck_name = mw.col.decks.name(card.did)
 
     try:
@@ -164,7 +164,7 @@ def open_suggestion_dialog():
 
     fields = {name: note[name] for name in field_names}
     payload = {
-        "doctorine_id": doctorine_id,
+        "doctrine_id": doctrine_id,
         "anki_note_id": note.id,
         "note_type": note_type["name"],
         "deck": deck_name,
@@ -223,20 +223,20 @@ def on_webview_will_set_content(web_content, context):
     if not isinstance(context, Reviewer):
         return
     # Hidden by default; shown per-card only when the note carries a
-    # DoctorineID (see on_reviewer_did_show_question).
+    # DoctrineID (see on_reviewer_did_show_question).
     web_content.body += """
 <style>
-#doctorine-suggest-btn {
+#doctrine-suggest-btn {
   position: fixed; right: 12px; top: 150px; z-index: 300;
   display: none;
   padding: 4px 10px; font-size: 12px; cursor: pointer;
   border: 1px solid #888; border-radius: 4px; background: transparent;
   color: inherit;
 }
-#doctorine-suggest-btn:hover { background: rgba(128,128,128,0.15); }
+#doctrine-suggest-btn:hover { background: rgba(128,128,128,0.15); }
 </style>
-<button id="doctorine-suggest-btn" onclick="pycmd('doctorine_suggest')"
-        title="Suggest an edit to this card">&#9998; Suggest Edit on Doctrine</button>
+<button id="doctrine-suggest-btn" onclick="pycmd('doctrine_editor')"
+        title="Suggest an edit to this card">&#9998; Suggest an edit</button>
 """
 
 
@@ -247,13 +247,13 @@ def on_reviewer_did_show_question(card):
         cfg["id_field"] in note.keys() and note[cfg["id_field"]].strip()
     )
     mw.reviewer.web.eval(
-        "var b = document.getElementById('doctorine-suggest-btn');"
+        "var b = document.getElementById('doctrine-suggest-btn');"
         "if (b) b.style.display = '%s';" % ("block" if supported else "none")
     )
 
 
 def on_js_message(handled, message, context):
-    if message == "doctorine_suggest":
+    if message == "doctrine_editor":
         open_suggestion_dialog()
         return (True, None)
     return handled
@@ -318,7 +318,7 @@ def stamp_and_register_deck():
             deck_of_card = mw.col.decks.name(c.did)
 
         registered.append({
-            "doctorine_id": note[id_field].strip(),
+            "doctrine_id": note[id_field].strip(),
             "anki_note_id": note.id,
             "note_type": m["name"],
             "deck": deck_of_card,
