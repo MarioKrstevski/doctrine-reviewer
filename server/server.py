@@ -35,7 +35,11 @@ import config
 
 CFG = config.load()
 MIN_ADDON_VERSION = "1.0"
-ID_FIELD = "DoctrineID"   # excluded from content hashing, same as add-on
+# Identity is the note guid (the deck pipeline sets it to the card's
+# database id). Nothing is stamped. This legacy field name is only
+# excluded from content hashing, mirroring the add-on, so a profile
+# stamped by an older build hashes identically to a clean import.
+ID_FIELD = "DoctrineID"
 
 TYPE_LABELS = {
     "typo": "Typo",

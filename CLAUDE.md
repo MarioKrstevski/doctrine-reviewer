@@ -17,10 +17,11 @@ a tracking link. No user accounts/login — by design.
     with doctrine_id, anki_note_id, deck, note fields, rendered Q/A
     HTML, css, and a content hash (sha256 over sorted fields, excluding
     the ID field). Runs network in `mw.taskman.run_in_background`.
-  - Dev tool (Tools → Doctrine Editor → "Stamp & register a
-    deck…"): adds a `DoctrineID` field to note types, stamps
-    `doc-<uuid12>`, uploads all notes as master state to
-    /api/dev/register. In production the pipeline mints IDs instead.
+  - Dev tool (Tools → Doctrine Editor → "Register a deck as master…",
+    DEV_MODE builds only): uploads a deck's notes keyed by guid to
+    /api/master/sync in batches of 100 with the pipeline bearer key.
+    Read-only against the collection. Per release: import the new .apkg
+    into a throwaway profile, run this once.
   - `resolver.py`: pure, Anki-free API-base resolution (override →
     fresh cache → GET {bootstrap_url}/where → stale cache → bootstrap).
     Unit-tested in `addon/tests/`.
@@ -93,14 +94,23 @@ Spoofed ID correctly 404s.
 - No login/CAPTCHA/email-verification for students. Identity =
   install_id (+ optional purchase-time submission key later).
 - Reviewers apply edits manually; suggestions are input, never merged.
-- DoctrineID is minted by the generation pipeline in production and
-  ships inside the .apkg; server validates existence on every submit.
+- Identity = the Anki note **guid**. The deck pipeline already sets it to
+  the card's MongoDB ObjectId (24 lowercase hex), verified 100% preserved
+  across export -> import on Doctrine 0.1 (34,704/34,704). Nothing is
+  stamped, no field is added, the add-on never writes to the collection,
+  so students are never forced into a full sync. The server column is
+  still called `doctrine_id`; its value is the guid. Client-side button
+  gate = ObjectId-shaped guid OR top-level deck named "Doctrine"
+  (`addon/identity.py`); the server's "is this guid registered?" check is
+  the real gate.
 
 ## Test loop
 
 1. `cd server && python3 server.py`
-2. Copy `addon/` into Anki addons21 dir (TEST PROFILE — stamping alters
-   note types and forces full sync), restart Anki.
-3. Tools → Doctrine Editor → Stamp & register a deck.
+2. Install the DEV build into a test profile that has Doctrine X.Y.apkg
+   imported, restart Anki.
+3. Tools → Doctrine Editor → Register a deck as master (DEV build).
 4. Review a card → ✎ Suggest → send → check /reviewer.
 5. Edit the note in Anki, re-register → badge flips to outdated.
+   (`DoctrineID` is excluded from the content hash on both sides only as
+   a legacy no-op, so a profile stamped by an older build still matches.)

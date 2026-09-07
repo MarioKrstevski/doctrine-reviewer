@@ -7,9 +7,10 @@ The add-on silently attaches the card's DoctrineID, note id, deck,
 fields, rendered HTML and a content hash, and POSTs it to the platform.
 
 Tools menu (Tools -> Doctrine Editor):
-  - "Stamp & register a deck..." : dev helper that adds a DoctrineID
-    field to every note type in a chosen deck, stamps unique IDs, and
-    registers the notes as the "master" state on the platform server.
+  - "Register a deck..." : dev helper that uploads a deck's notes as the
+    master state on the platform. Read-only: it never modifies the
+    collection. Identity is the note guid, which the deck pipeline sets
+    to the card's database id.
 
 No user-facing config: the endpoint, button position and ID field are
 constants below, changed by shipping a new build.
@@ -21,7 +22,6 @@ import os
 import time
 import urllib.request
 import urllib.error
-import uuid
 
 from aqt import mw, gui_hooks
 from aqt.qt import (
@@ -30,7 +30,7 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import chunk_util, resolver, state
+from . import chunk_util, identity, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
 
@@ -67,7 +67,10 @@ DEV_MODE = False
 PIPELINE_API_KEY = ""
 
 API_BASE_OVERRIDE = ""
-ID_FIELD = "DoctrineID"
+# Identity is the note guid; nothing is stamped. LEGACY_ID_FIELD is only
+# excluded from content hashing, so a profile that was stamped by an older
+# build still hashes identically to a clean import of the same deck.
+LEGACY_ID_FIELD = "DoctrineID"
 BUTTON_TOP_OFFSET = 150
 BUTTON_RIGHT_OFFSET = 12
 
@@ -76,7 +79,6 @@ def get_config():
     return {
         "bootstrap_url": DEFAULT_BOOTSTRAP,
         "api_base_override": API_BASE_OVERRIDE,
-        "id_field": ID_FIELD,
         "button_top_offset": BUTTON_TOP_OFFSET,
         "button_right_offset": BUTTON_RIGHT_OFFSET,
         "_cache": state.load(user_files_dir()),
@@ -213,16 +215,16 @@ def open_suggestion_dialog():
     cfg = get_config()
     note = card.note()
     field_names = list(note.keys())
+    deck_name = mw.col.decks.name(card.did)
 
-    if cfg["id_field"] not in field_names or not note[cfg["id_field"]].strip():
+    if not identity.is_doctrine_card(note.guid, deck_name):
         showInfo(
             "This card is not part of a supported deck, so suggestions "
             "can't be sent for it."
         )
         return
 
-    doctrine_id = note[cfg["id_field"]].strip()
-    deck_name = mw.col.decks.name(card.did)
+    doctrine_id = note.guid
 
     try:
         note_type = note.note_type()
@@ -244,7 +246,7 @@ def open_suggestion_dialog():
             "answer_html": card.answer(),
             "css": note_type.get("css", ""),
             "fields": fields,
-            "content_hash": content_hash(fields, cfg["id_field"]),
+            "content_hash": content_hash(fields, LEGACY_ID_FIELD),
         },
         **dlg.result_data,
     }
@@ -311,11 +313,8 @@ def on_webview_will_set_content(web_content, context):
 
 
 def on_reviewer_did_show_question(card):
-    cfg = get_config()
     note = card.note()
-    supported = (
-        cfg["id_field"] in note.keys() and note[cfg["id_field"]].strip()
-    )
+    supported = identity.is_doctrine_card(note.guid, mw.col.decks.name(card.did))
     mw.reviewer.web.eval(
         "var b = document.getElementById('doctrine-suggest-btn');"
         "if (b) b.style.display = '%s';" % ("block" if supported else "none")
@@ -331,16 +330,22 @@ def on_js_message(handled, message, context):
 
 # ---------------------------------------------------------------- dev: stamp & register
 
-def stamp_and_register_deck():
+def register_deck():
+    """Dev tool: upload a deck's notes as the master state. Read-only.
+
+    Nothing here writes to the collection. Identity is note.guid, which
+    the deck pipeline sets to the card's database id, so no field is
+    added and no note type is modified -- students are never forced into
+    a full sync by anything this add-on does.
+    """
     cfg = get_config()
-    id_field = cfg["id_field"]
 
     deck_names = sorted(d.name for d in mw.col.decks.all_names_and_ids())
     if not deck_names:
         showInfo("No decks found.")
         return
     name, ok = QInputDialog.getItem(
-        mw, ADDON_NAME, "Deck to stamp and register:", deck_names, 0, False
+        mw, ADDON_NAME, "Deck to register as master state:", deck_names, 0, False
     )
     if not ok or not name:
         return
@@ -350,33 +355,13 @@ def stamp_and_register_deck():
         showInfo(f'No notes found in deck "{name}".')
         return
 
-    models = mw.col.models
-    patched_models = set()
     registered = []
-
     for nid in note_ids:
         note = mw.col.get_note(nid)
         try:
             m = note.note_type()
         except AttributeError:
             m = note.model()
-
-        # Ensure the ID field exists on this note type.
-        existing = [f["name"] for f in m["flds"]]
-        if id_field not in existing:
-            if m["id"] not in patched_models:
-                fld = models.new_field(id_field)
-                models.add_field(m, fld)
-                try:
-                    models.update_dict(m)
-                except AttributeError:
-                    models.save(m)
-                patched_models.add(m["id"])
-            note = mw.col.get_note(nid)  # reload with new field
-
-        if not note[id_field].strip():
-            note[id_field] = "doc-" + uuid.uuid4().hex[:12]
-            mw.col.update_note(note)
 
         fields = {fname: note[fname] for fname in note.keys()}
         cards = note.cards()
@@ -388,7 +373,7 @@ def stamp_and_register_deck():
             deck_of_card = mw.col.decks.name(c.did)
 
         registered.append({
-            "doctrine_id": note[id_field].strip(),
+            "doctrine_id": note.guid,
             "anki_note_id": note.id,
             "note_type": m["name"],
             "deck": deck_of_card,
@@ -421,15 +406,13 @@ def stamp_and_register_deck():
         except Exception as e:
             showWarning(
                 f"Registration failed:\n{e}\n\n"
-                "Notes were stamped locally but the upload did not finish. "
-                "Re-run this to retry — already-stamped notes keep their IDs.")
+                "The upload did not finish. Re-run this to retry; it is safe "
+                "to repeat.")
             return
         showInfo(
             f"Registered {result.get('registered', 0)} notes in "
             f"{result.get('batches', 0)} batch(es) "
-            f"({result.get('updated', 0)} updated to a new version).\n\n"
-            "Note: adding the ID field changed the note types, so Anki may "
-            "ask for a full sync — that's expected on a test profile."
+            f"({result.get('updated', 0)} updated to a new version)."
         )
 
     mw.progress.start(label="Registering deck…", immediate=True)
@@ -461,8 +444,8 @@ def setup_menu():
     if DEV_MODE:
         menu.addSeparator()
 
-        a2 = QAction("Stamp && register a deck… (dev)", mw)
-        a2.triggered.connect(stamp_and_register_deck)
+        a2 = QAction("Register a deck as master… (dev)", mw)
+        a2.triggered.connect(register_deck)
         menu.addAction(a2)
 
         a3 = QAction("Open reviewer queue (dev)", mw)

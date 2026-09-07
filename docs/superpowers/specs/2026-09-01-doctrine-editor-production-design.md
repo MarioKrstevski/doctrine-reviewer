@@ -372,3 +372,28 @@ Additional per-phase checks:
   master table untouched.
 - P5: resolving a suggestion with an email creates exactly one pending
   notification; resolving one without an email creates none.
+
+
+---
+
+## Addendum 2026-09-08 — identity is the note guid, not a stamped field
+
+Inspection of `Doctrine 0.1.apkg` (34,704 notes) showed every note guid
+is a MongoDB ObjectId minted by the deck pipeline, and 100% of them
+survived export -> import unchanged. The pipeline therefore already ships
+a database-owned stable id in the guid slot.
+
+Consequences, superseding P0's `DoctrineID` field and the stamp tool:
+
+- The add-on sends `note.guid` as `doctrine_id`. It never writes to the
+  collection: no field, no note-type change, no forced full sync.
+- The stamp tool is removed. Registration (DEV builds only) is read-only
+  and keyed by guid; the deck team changes nothing.
+- Client-side button gate: ObjectId-shaped guid or top-level deck
+  "Doctrine" (`addon/identity.py`). Server registration remains the real
+  gate.
+- `DoctrineID` stays excluded from content hashing on both sides purely
+  so profiles stamped by earlier builds hash like clean imports.
+- Residual risk: guid stability across *releases* is a property of the
+  pipeline keeping database ids stable. Verified for export -> import;
+  release -> release cannot be measured until a second release exists.
