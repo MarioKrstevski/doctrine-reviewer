@@ -130,7 +130,7 @@ def content_hash(fields: dict, id_field: str) -> str:
 # registration uploads every note and needs room to finish.
 SUGGEST_TIMEOUT = 20
 REGISTER_TIMEOUT = 120
-REGISTER_BATCH_SIZE = 100
+REGISTER_BATCH_SIZE = 500
 
 
 def post_json(url: str, payload: dict, bearer: str = "",
@@ -363,14 +363,12 @@ def register_deck():
         except AttributeError:
             m = note.model()
 
+        # Fields and tags only. Rendered card HTML was 47 KB per note of
+        # template boilerplate against ~500 bytes of content; the fields
+        # are what a reviewer edits, and what the server keeps.
         fields = {fname: note[fname] for fname in note.keys()}
         cards = note.cards()
-        q_html, a_html, css = "", "", m.get("css", "")
-        deck_of_card = name
-        if cards:
-            c = cards[0]
-            q_html, a_html = c.question(), c.answer()
-            deck_of_card = mw.col.decks.name(c.did)
+        deck_of_card = mw.col.decks.name(cards[0].did) if cards else name
 
         registered.append({
             "doctrine_id": note.guid,
@@ -378,9 +376,7 @@ def register_deck():
             "note_type": m["name"],
             "deck": deck_of_card,
             "fields": fields,
-            "question_html": q_html,
-            "answer_html": a_html,
-            "css": css,
+            "tags": list(note.tags),
         })
 
     def task():

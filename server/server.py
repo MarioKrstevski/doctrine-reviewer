@@ -25,6 +25,7 @@ import uuid
 from datetime import datetime, timezone
 import hmac
 import os
+import re
 import socketserver
 
 import auth
@@ -110,9 +111,7 @@ def init_db():
             note_type TEXT,
             deck TEXT,
             fields_json TEXT,
-            question_html TEXT,
-            answer_html TEXT,
-            css TEXT,
+            tags_json TEXT,
             content_hash TEXT,
             version INTEGER DEFAULT 1,
             updated_at TEXT
@@ -172,6 +171,27 @@ def init_db():
         if "resolved_by" not in columns:
             conn.execute("ALTER TABLE suggestions ADD COLUMN resolved_by INTEGER")
 
+        # Master copies were once stored as rendered card HTML plus a per-row
+        # copy of the note-type CSS: 47 KB per note against ~500 bytes of
+        # content, 2 GB for the real deck. Drop those columns in place; the
+        # fields are the record now.
+        note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)")}
+        dropped = False
+        for col in ("question_html", "answer_html", "css"):
+            if col in note_cols:
+                conn.execute(f"ALTER TABLE notes DROP COLUMN {col}")
+                dropped = True
+        if "tags_json" not in note_cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN tags_json TEXT")
+
+    if dropped:
+        # Reclaim the space the dropped columns occupied. One-off, at boot.
+        print("Migrating master storage to fields-only; reclaiming space...",
+              flush=True)
+        with db() as conn:
+            conn.execute("VACUUM")
+        print("  done: %.0f MB" % (os.path.getsize(CFG.db_path) / 1e6), flush=True)
+
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -190,6 +210,32 @@ def content_hash(fields: dict, id_field: str = ID_FIELD) -> str:
 
 def esc(s):
     return html.escape(str(s or ""), quote=True)
+
+
+_CLOZE = re.compile(r"\{\{c\d+::.*?\}\}", re.S)
+
+
+def fields_pane(fields_json, label):
+    """The master copy as field source, which is what a reviewer edits.
+
+    Values are escaped and shown verbatim -- HTML tags, cloze markers and
+    all -- so a reviewer sees exactly the text they will change in Anki.
+    Cloze deletions are highlighted; empty fields are omitted.
+    """
+    try:
+        fields = json.loads(fields_json or "{}")
+    except ValueError:
+        fields = {}
+    rows = []
+    for name, value in fields.items():
+        if not (value or "").strip():
+            continue
+        safe = esc(value)
+        safe = _CLOZE.sub(lambda m: f"<mark>{m.group(0)}</mark>", safe)
+        rows.append(f'<dt>{esc(name)}</dt><dd>{safe}</dd>')
+    body = "".join(rows) or "<i>(no content)</i>"
+    return (f'<div class="pane"><div class="pane-label">{esc(label)}</div>'
+            f'<dl class="fields">{body}</dl></div>')
 
 
 def card_iframe(q_html, a_html, css, label):
@@ -293,6 +339,14 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
   border-bottom:1px solid var(--line); background:var(--panel); }
 .pane-label .badge { margin-left:auto; letter-spacing:.04em; }
 .pane.stale .pane-label { background:var(--warn-soft); color:var(--warn); }
+.pane .fields { margin:0; padding:14px 16px; height:270px; overflow:auto;
+  font-size:13px; line-height:1.5; background:#fff; }
+.pane .fields dt { font-weight:600; color:var(--muted); font-size:11px;
+  letter-spacing:.04em; text-transform:uppercase; margin-top:10px; }
+.pane .fields dt:first-child { margin-top:0; }
+.pane .fields dd { margin:2px 0 0; white-space:pre-wrap; word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+.pane .fields mark { background:#fff1a8; padding:0 2px; border-radius:2px; }
 .pane iframe { width:100%; height:270px; border:none; display:block;
   background:#fff; }
 .pane.suggestion { background:#F8FAF7; }
@@ -497,9 +551,8 @@ def render_reviewer(user=None, secret=None, session_token=None):
                 stale_cls = " stale"
             else:
                 state_badge = '<span class="badge ok">Matches current version</span>'
-            master_pane = card_iframe(
-                master["question_html"], master["answer_html"], master["css"],
-                f'Current master (v{master["version"]})')
+            master_pane = fields_pane(
+                master["fields_json"], f'Current master (v{master["version"]})')
             if stale_cls:
                 master_pane = master_pane.replace(
                     '<div class="pane">', f'<div class="pane{stale_cls}">', 1)
@@ -701,27 +754,26 @@ def api_register(data):
                 "SELECT content_hash, version FROM notes WHERE doctrine_id=?",
                 (doc_id,)
             ).fetchone()
+            tags = json.dumps(list(n.get("tags") or []))
             if existing is None:
                 conn.execute(
                     """INSERT INTO notes (doctrine_id, anki_note_id, note_type,
-                       deck, fields_json, question_html, answer_html, css,
-                       content_hash, version, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,1,?)""",
+                       deck, fields_json, tags_json, content_hash, version,
+                       updated_at)
+                       VALUES (?,?,?,?,?,?,?,1,?)""",
                     (doc_id, n.get("anki_note_id"), n.get("note_type"),
-                     n.get("deck"), json.dumps(fields), n.get("question_html"),
-                     n.get("answer_html"), n.get("css"), h, now()))
+                     n.get("deck"), json.dumps(fields), tags, h, now()))
                 registered += 1
             else:
                 bump = existing["content_hash"] != h
                 conn.execute(
                     """UPDATE notes SET anki_note_id=?, note_type=?, deck=?,
-                       fields_json=?, question_html=?, answer_html=?, css=?,
-                       content_hash=?, version=version+?, updated_at=?
+                       fields_json=?, tags_json=?, content_hash=?,
+                       version=version+?, updated_at=?
                        WHERE doctrine_id=?""",
                     (n.get("anki_note_id"), n.get("note_type"), n.get("deck"),
-                     json.dumps(fields), n.get("question_html"),
-                     n.get("answer_html"), n.get("css"), h,
-                     1 if bump else 0, now(), doc_id))
+                     json.dumps(fields), tags, h, 1 if bump else 0, now(),
+                     doc_id))
                 registered += 1
                 if bump:
                     updated += 1
