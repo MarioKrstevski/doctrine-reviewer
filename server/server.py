@@ -447,6 +447,23 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .pane .fields dd { margin:2px 0 0; white-space:pre-wrap; word-break:break-word;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
 .pane .fields mark { background:#fff1a8; padding:0 2px; border-radius:2px; }
+.count { display:inline-block; min-width:18px; padding:0 6px; margin-left:4px;
+  border-radius:9px; background:var(--accent, #2f6f4f); color:#fff;
+  font-size:11px; text-align:center; line-height:18px; }
+.outbox-body { display:grid; grid-template-columns:1fr 1fr; gap:0; }
+.outbox-col { padding:12px 16px; min-width:0; }
+.outbox-col + .outbox-col { border-left:1px solid var(--line); }
+.outbox-col blockquote { margin:8px 0; padding:10px 12px; background:#f7f7f4;
+  border-left:3px solid #cfd6cf; white-space:pre-wrap; }
+.outbox-col label.small { display:block; font-size:11px; color:var(--muted);
+  margin-top:8px; text-transform:uppercase; letter-spacing:.04em; }
+.outbox-col .copyable { width:100%; box-sizing:border-box; font-size:13px;
+  font-family:inherit; padding:6px 8px; border:1px solid #ddd; border-radius:4px;
+  background:#fff; }
+.outbox-col textarea.copyable { resize:vertical; }
+.copy-btn { margin-top:6px; }
+.badge.substantial { background:#e5edf7; color:#2a4a6f; }
+.badge.brief { background:#eee; color:#666; }
 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
 .chip { font-size:11px; padding:2px 8px; border-radius:10px; background:#eef1ee;
   color:#3a4a40; border:1px solid #dfe5df; white-space:nowrap; }
@@ -553,6 +570,12 @@ def page(title, body, active="", user=None, csrf=""):
         return f'<a href="{href}"{cls}>{label}</a>'
     admin_link = (nav_link("/admin/users", "Reviewers", "admin")
                   if user and user.get("role") == "admin" else "")
+    outbox_link = ""
+    if user:
+        n = pending_thank_yous()
+        count = f' <span class="count">{n}</span>' if n else ""
+        cls = ' class="active"' if active == "outbox" else ""
+        outbox_link = f'<a href="/outbox"{cls}>Outbox{count}</a>'
     account_link = nav_link("/account", "Account", "account") if user else ""
     signed_in = ""
     if user:
@@ -580,7 +603,7 @@ header.site .wrap {{ display: flex; align-items: center; gap: 18px; }}
   <nav>
     {nav_link("/updates", "Community updates", "updates")}
     {nav_link("/reviewer", "Reviewer queue", "reviewer")}
-    {admin_link}{account_link}
+    {outbox_link}{admin_link}{account_link}
   </nav>{signed_in}
 </div></header>
 <div class="wrap">{body}</div>
@@ -1071,6 +1094,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/reviewer")
             else:
                 self._send(200, render_login())
+        elif path == "/outbox":
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                self._send(200, render_outbox(
+                    user, auth.csrf_token(self._cookie_token(), session_secret())))
         elif path == "/account":
             user = self._current_user()
             if user is None:
@@ -1157,6 +1187,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_admin_users(
                     user, auth.csrf_token(self._cookie_token(), session_secret()),
                     notice, new_password))
+        elif path == "/outbox":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1>"
+                                     "<p>Invalid form token.</p>"))
+            else:
+                outbox_action(form, user["id"])
+                self._redirect("/outbox")
         elif path == "/account":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -1437,6 +1478,102 @@ def change_own_password(user_id, current, new, confirm):
         return False, "Current password is incorrect."
     set_password(user_id, new)
     return True, "Password changed. Your other sessions were signed out."
+
+
+# ---------------------------------------------------------------- outbox
+
+def pending_thank_yous():
+    with db() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) c FROM notifications WHERE status='pending'"
+        ).fetchone()["c"]
+
+
+def render_outbox(user, csrf):
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT n.*, s.text AS suggestion_text, s.deck, s.token,
+                      s.doctrine_id, s.suggestion_type
+               FROM notifications n JOIN suggestions s ON s.id = n.suggestion_id
+               WHERE n.status='pending' ORDER BY n.id"""
+        ).fetchall()
+
+    if not rows:
+        body = ('<h1>Thank-you outbox</h1><p class="sub">Accepted suggestions '
+                'whose author left an email land here, with a note ready to '
+                'send.</p><div class="empty"><b>Nothing to send</b>Resolve a '
+                'suggestion that came with an email and it will appear here.</div>')
+        return page("Outbox", body, "outbox", user, csrf)
+
+    items = []
+    for r in rows:
+        length = len((r["suggestion_text"] or "").strip())
+        weight = "substantial" if length >= 120 else "brief"
+        items.append(f"""
+<div class="card outbox-item">
+  <div class="card-head">
+    <span class="badge {weight}">{weight}</span>
+    <span class="meta"><b>#{r['suggestion_id']}</b> &middot; {esc(r['deck'])}
+    &middot; {esc(TYPE_LABELS.get(r['suggestion_type'], ''))} &middot;
+    <a href="mailto:{esc(r['email'])}">{esc(r['email'])}</a>
+    &middot; {length} chars</span>
+    <time>{esc(r['created_at'])}</time>
+  </div>
+  <div class="outbox-body">
+    <div class="outbox-col">
+      <div class="pane-label">Their suggestion</div>
+      <blockquote>{esc(r['suggestion_text'])}</blockquote>
+      <p class="small"><a href="/s/{esc(r['token'])}">Tracking page</a></p>
+    </div>
+    <div class="outbox-col">
+      <div class="pane-label">Ready to send</div>
+      <label class="small">Subject</label>
+      <input type="text" readonly value="{esc(r['subject'])}" class="copyable">
+      <label class="small">Body</label>
+      <textarea readonly rows="11" class="copyable">{esc(r['body'])}</textarea>
+      <button type="button" class="ghost copy-btn">Copy body</button>
+    </div>
+  </div>
+  <div class="actions">
+    <form method="post" action="/outbox" class="inline">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <input type="hidden" name="id" value="{r['id']}">
+      <button name="do" value="thanked">Mark as thanked</button>
+      <button name="do" value="skipped" class="ghost">Skip</button>
+    </form>
+  </div>
+</div>""")
+
+    body = (f'<h1>Thank-you outbox</h1><p class="sub">{len(rows)} to send. '
+            'Copy the note into your mail client, send it, then mark it as '
+            'thanked. Skip the ones not worth a personal reply.</p>'
+            + "".join(items) + """
+<script>
+document.querySelectorAll('.copy-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const ta = btn.parentElement.querySelector('textarea');
+    navigator.clipboard.writeText(ta.value).then(() => {
+      btn.textContent = 'Copied'; setTimeout(() => btn.textContent = 'Copy body', 1500);
+    });
+  });
+});
+</script>""")
+    return page("Outbox", body, "outbox", user, csrf)
+
+
+def outbox_action(form, user_id):
+    try:
+        nid = int(form.get("id", [""])[0])
+    except (TypeError, ValueError):
+        return
+    status = {"thanked": "thanked", "skipped": "skipped"}.get(form.get("do", [""])[0])
+    if not status:
+        return
+    with db() as conn:
+        conn.execute(
+            """UPDATE notifications SET status=?, actioned_at=?, actioned_by=?
+               WHERE id=? AND status='pending'""",
+            (status, now(), user_id, nid))
 
 
 # ---------------------------------------------------------------- sessions

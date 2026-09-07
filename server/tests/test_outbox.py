@@ -111,3 +111,102 @@ class ThankYouTextTest(unittest.TestCase):
             published=False)
         self.assertNotIn("x" * 200, body)
         self.assertIn("…", body)
+
+
+def outbox_act(base, cookie, nid, do):
+    csrf = auth.csrf_token(cookie.split("=", 1)[1], server.session_secret())
+    return request(base, "POST", "/outbox", {"id": nid, "do": do, "csrf": csrf},
+                   cookie=cookie)
+
+
+def resolved_with_email(base, cookie, text="The dose is 5 mg, not 50."):
+    sid = open_suggestion(base, text=text)
+    act(base, cookie, sid, "resolve")
+    return notifications()[0]["id"]
+
+
+class OutboxPageTest(unittest.TestCase):
+    def test_requires_login(self):
+        with running_server() as base:
+            status, headers, _ = request(base, "GET", "/outbox")
+        self.assertEqual(303, status)
+        self.assertIn("/login", headers.get("Location", ""))
+
+    def test_lists_pending_with_text_email_and_length(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            resolved_with_email(base, cookie, text="x" * 340)
+            status, _, html = request(base, "GET", "/outbox", cookie=cookie)
+        self.assertEqual(200, status)
+        self.assertIn("student@example.com", html)
+        self.assertIn("340", html, "length hint so substantial ones stand out")
+        self.assertIn("Thank you", html)
+        self.assertIn("Mark as thanked", html)
+
+    def test_body_is_present_verbatim_for_copying(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            resolved_with_email(base, cookie)
+            body = notifications()[0]["body"]
+            _, _, html = request(base, "GET", "/outbox", cookie=cookie)
+        # First line of the body must appear inside a copyable element.
+        self.assertIn("Hi,", html)
+        self.assertIn("<textarea", html)
+
+    def test_thanked_moves_it_out_and_records_who(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            nid = resolved_with_email(base, cookie)
+            status, _, _ = outbox_act(base, cookie, nid, "thanked")
+            self.assertEqual(303, status)
+            row = notifications()[0]
+            _, _, html = request(base, "GET", "/outbox", cookie=cookie)
+            with server.db() as conn:
+                uid = conn.execute("SELECT id FROM users WHERE username=?",
+                                   (user,)).fetchone()["id"]
+        self.assertEqual("thanked", row["status"])
+        self.assertEqual(uid, row["actioned_by"])
+        self.assertIsNotNone(row["actioned_at"])
+        self.assertNotIn("student@example.com", html)
+
+    def test_skip_moves_it_out(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            nid = resolved_with_email(base, cookie)
+            outbox_act(base, cookie, nid, "skipped")
+            status = notifications()[0]["status"]
+        self.assertEqual("skipped", status)
+
+    def test_actions_need_csrf(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            nid = resolved_with_email(base, cookie)
+            status, _, _ = request(base, "POST", "/outbox",
+                                   {"id": nid, "do": "thanked"}, cookie=cookie)
+            row_status = notifications()[0]["status"]
+        self.assertEqual(403, status)
+        self.assertEqual("pending", row_status)
+
+    def test_actions_need_login(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            nid = resolved_with_email(base, cookie)
+            status, _, _ = request(base, "POST", "/outbox", {"id": nid, "do": "thanked"})
+            row_status = notifications()[0]["status"]
+        self.assertEqual(303, status)
+        self.assertEqual("pending", row_status)
+
+    def test_nav_shows_pending_count(self):
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            resolved_with_email(base, cookie)
+            _, _, html = request(base, "GET", "/reviewer", cookie=cookie)
+        self.assertIn("Outbox", html)
+        self.assertRegex(html, r"Outbox[^<]*<[^>]*>\s*1\s*<")
