@@ -43,6 +43,12 @@ a tracking link. No user accounts/login — by design.
     (+ publish checkbox, public one-liner, credit name), decline,
     expire.
   - GET /updates — public errata ledger of published resolutions.
+  - GET/POST /outbox (login) — thank-you outbox. Resolving a suggestion
+    that carries an email queues one `notifications` row with a rendered
+    plain-text subject/body; reviewers copy it into their mail client and
+    mark it thanked or skipped. Declines/expirations queue nothing.
+    Nothing sends mail: `email_out.send()` is a stub, `SEND_EMAIL` is off,
+    and `SEND_EMAIL=true` without `SMTP_URL` refuses to boot.
   - GET /s/<token> — submitter tracking page (open/accepted/declined/
     already-fixed).
 - Hash function is duplicated in both files (`content_hash`) and MUST
@@ -82,8 +88,9 @@ Spoofed ID correctly 404s.
    currently localhost); HTTPS; consider porting server to the existing
    Next.js/Neon stack if it should live with the other products —
    stdlib server is prototype scaffolding, not an architecture choice.
-6. Nice-to-haves: email notification on resolution (email field already
-   captured); keyboard shortcut for the button; payload size caps.
+6. Nice-to-haves: implement `email_out.send()` behind SEND_EMAIL (the
+   outbox and queueing already exist); keyboard shortcut for the button;
+   payload size caps.
 
 ## Decisions already made (don't relitigate)
 

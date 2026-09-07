@@ -29,6 +29,7 @@ import re
 import socketserver
 
 import auth
+import email_out
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -1799,6 +1800,7 @@ if __name__ == "__main__":
         raise SystemExit(_cli_adduser(sys.argv[2:]))
 
     bootstrap_admin(os.environ.get("BOOTSTRAP_ADMIN", ""))
+    email_out.check_config(CFG)   # refuse to boot with a half-configured sender
 
     print(f"Doctrine Editor platform — {CFG.public_base_url}", flush=True)
     print(f"  Reviewer queue:  {CFG.public_base_url}/reviewer", flush=True)

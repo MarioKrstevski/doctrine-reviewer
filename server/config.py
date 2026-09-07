@@ -15,6 +15,8 @@ class Config:
     db_path: str
     public_base_url: str
     pipeline_api_key: str
+    send_email: bool
+    smtp_url: str
 
 
 def _platform_url(env):
@@ -44,4 +46,7 @@ def load(env=None) -> Config:
         db_path=env.get("DB_PATH", "doctrine.db"),
         public_base_url=public.rstrip("/"),
         pipeline_api_key=env.get("PIPELINE_API_KEY", "").strip(),
+        send_email=(env.get("SEND_EMAIL", "") or "").strip().lower()
+                   in ("1", "true", "yes", "on"),
+        smtp_url=(env.get("SMTP_URL", "") or "").strip(),
     )

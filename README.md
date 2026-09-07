@@ -70,6 +70,9 @@ Server (environment variables):
 | `PORT` | `8787` | bind port (`8080` in the container) |
 | `DB_PATH` | `doctrine.db` | SQLite file; mount a volume in production |
 | `PUBLIC_BASE_URL` | `http://HOST:PORT` | the origin used to build tracking links |
+| `PIPELINE_API_KEY` | unset (endpoint disabled) | bearer key for `/api/master/sync` |
+| `SEND_EMAIL` | `false` | leave off; the sender is a stub |
+| `SMTP_URL` | unset | required only if `SEND_EMAIL` is on |
 
 `PUBLIC_BASE_URL` must be set in production. Tracking links are built
 from it, so leaving it unset hands every student a link to their own
