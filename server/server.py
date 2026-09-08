@@ -1557,6 +1557,42 @@ in the next deck update and can appear on the
 <h2>Already have an older version?</h2>
 <p>Tools &rarr; Add-ons &rarr; select <b>Doctrine Editor</b> &rarr; Delete, then
 install the new file. Your settings and pending suggestions are unaffected.</p>
+
+<h2 id="reviewers">Testing the full loop (reviewers)</h2>
+<p class="sub">If you have a reviewer login, this walks the whole path in
+about ten minutes &mdash; first as a student, then as a reviewer.</p>
+<ol class="steps">
+  <li><b>As a student:</b> install the add-on above, review a Doctrine card,
+      click <b>&#9998; Suggest an edit</b>, describe something, add your email,
+      send. Open the tracking link it gives you &mdash; it should say
+      <i>In review</i>.</li>
+  <li><b>As a reviewer:</b> <a href="/login">sign in</a>. Your suggestion is in
+      the queue next to the card exactly as you saw it, the current master
+      copy, and a <i>Trace</i> block with the card and deck identifiers.</li>
+  <li><b>Resolve it.</b> Tick <i>Publish to updates</i>, write a one-line
+      public summary, put a name in <i>Credit as</i>, click <b>Resolve</b>.</li>
+  <li>Open <a href="/updates">Community updates</a> &mdash; your fix is listed
+      with the credit. Reload your tracking link &mdash; it now says
+      <i>Accepted</i>.</li>
+  <li>Because you left an email, <b>Outbox</b> (top nav) has a thank-you
+      note ready to copy. Copy it, then <b>Mark as thanked</b>.</li>
+  <li>Try the other outcomes on a second suggestion: <b>Decline</b> and
+      <b>Mark expired</b>. Neither publishes anything and neither queues a
+      thank-you.</li>
+</ol>
+
+<h2>Known gaps in this test build</h2>
+<ul class="steps">
+  <li>Images and audio inside the card snapshot do not load &mdash; the
+      deck's media is not hosted yet. Text, cloze markers and layout are
+      intact.</li>
+  <li>The web address is temporary. When the final domain is chosen you
+      will install the add-on once more; nothing else changes.</li>
+  <li>Reviewer passwords are handed over directly by an administrator.
+      There is no email reset by design &mdash; ask an admin.</li>
+</ul>
+<p class="sub">Everything else is fair game for feedback: wording, layout,
+what's missing from the queue, what a reviewer would want to see.</p>
 <style>
 .install-box {{ margin:18px 0 26px; padding:18px 20px; border:1px solid var(--line);
   border-radius:8px; background:#fafaf7; }}

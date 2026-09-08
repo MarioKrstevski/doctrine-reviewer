@@ -24,6 +24,8 @@ class InstallPageTest(unittest.TestCase):
                 html = r.read().decode()
         self.assertIn("/download/doctrine_editor.ankiaddon", html)
         self.assertIn("Install from file", html)
+        self.assertIn("Testing the full loop", html)
+        self.assertIn("Known gaps", html)
 
     def test_download_serves_a_valid_addon_package(self):
         with tempfile.TemporaryDirectory() as tmp:
