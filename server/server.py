@@ -603,6 +603,7 @@ header.site .wrap {{ display: flex; align-items: center; gap: 18px; }}
   <span class="brand">Doctrine<small>Card quality</small></span>
   <nav>
     {nav_link("/updates", "Community updates", "updates")}
+    {nav_link("/install", "Install add-on", "install")}
     {nav_link("/reviewer", "Reviewer queue", "reviewer")}
     {outbox_link}{admin_link}{account_link}
   </nav>{signed_in}
@@ -1090,6 +1091,22 @@ class Handler(BaseHTTPRequestHandler):
                 "application/json",
                 {"Cache-Control": "public, max-age=3600"},
             )
+        elif path == "/install":
+            self._send(200, render_install())
+        elif path == f"/download/{ADDON_PACKAGE_NAME}":
+            try:
+                with open(ADDON_PACKAGE_PATH, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                self._send(404, page("Not found", "<h1>Add-on package not "
+                                     "available</h1><p>It is built with the "
+                                     "server image; check the deployment.</p>"))
+            else:
+                self._send(200, data, "application/octet-stream", {
+                    "Content-Disposition":
+                        f'attachment; filename="{ADDON_PACKAGE_NAME}"',
+                    "Cache-Control": "no-cache",
+                })
         elif path == "/login":
             if self._current_user():
                 self._redirect("/reviewer")
@@ -1479,6 +1496,76 @@ def change_own_password(user_id, current, new, confirm):
         return False, "Current password is incorrect."
     set_password(user_id, new)
     return True, "Password changed. Your other sessions were signed out."
+
+
+# ---------------------------------------------------------------- install page
+
+# Built at container build time from addon/ (see Dockerfile). Always the
+# student build: DEV_MODE off, no pipeline key.
+ADDON_PACKAGE_PATH = os.environ.get("ADDON_PACKAGE_PATH",
+                                    "/app/doctrine_editor.ankiaddon")
+ADDON_PACKAGE_NAME = "doctrine_editor.ankiaddon"
+
+
+def build_student_package(src_dir, out_path):
+    """Zip addon/ into an .ankiaddon, refusing to ship a DEV build."""
+    import zipfile
+    src_dir = os.fspath(src_dir)
+    init = open(os.path.join(src_dir, "__init__.py"), encoding="utf-8").read()
+    if re.search(r"^DEV_MODE = True$", init, re.M) or \
+       not re.search(r'^PIPELINE_API_KEY = ""$', init, re.M):
+        raise RuntimeError("refusing to package a DEV build for students")
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for root, dirs, files in os.walk(src_dir):
+            dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__", "user_files")]
+            for name in files:
+                if name.endswith((".pyc", ".DS_Store")):
+                    continue
+                full = os.path.join(root, name)
+                z.write(full, os.path.relpath(full, src_dir))
+
+
+def render_install():
+    body = f"""
+<h1>Install the Doctrine Editor add-on</h1>
+<p class="sub">Adds a <b>&#9998; Suggest an edit</b> button to Anki's reviewer
+on Doctrine cards. Suggestions go straight to the review team; you get a
+link to follow what happens to yours.</p>
+
+<div class="install-box">
+  <a class="btn-primary" href="/download/{ADDON_PACKAGE_NAME}">Download {ADDON_PACKAGE_NAME}</a>
+  <p class="small">Anki 23.10 or newer, desktop only. The add-on never modifies
+  your cards or note types.</p>
+</div>
+
+<h2>Steps</h2>
+<ol class="steps">
+  <li>Download the file above.</li>
+  <li>In Anki: <b>Tools &rarr; Add-ons &rarr; Install from file&hellip;</b> and pick it.</li>
+  <li>Restart Anki when prompted.</li>
+  <li>Review any card in the <b>Doctrine</b> deck. The <b>&#9998; Suggest an edit</b>
+      button appears top-right of the card.</li>
+  <li>Click it, describe the issue, add your email if you'd like to hear back, send.</li>
+</ol>
+
+<h2>What happens next</h2>
+<p>You get a tracking link straight away. A reviewer looks at every
+suggestion next to the current version of the card. Accepted fixes ship
+in the next deck update and can appear on the
+<a href="/updates">community updates</a> page with credit.</p>
+
+<h2>Already have an older version?</h2>
+<p>Tools &rarr; Add-ons &rarr; select <b>Doctrine Editor</b> &rarr; Delete, then
+install the new file. Your settings and pending suggestions are unaffected.</p>
+<style>
+.install-box {{ margin:18px 0 26px; padding:18px 20px; border:1px solid var(--line);
+  border-radius:8px; background:#fafaf7; }}
+.btn-primary {{ display:inline-block; padding:10px 16px; border-radius:6px;
+  background:#2f6f4f; color:#fff !important; text-decoration:none; font-weight:600; }}
+.steps li {{ margin:6px 0; }}
+h2 {{ font-size:16px; margin-top:26px; }}
+</style>"""
+    return page("Install", body, "install")
 
 
 # ---------------------------------------------------------------- outbox

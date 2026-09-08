@@ -1,7 +1,6 @@
 .git
 .gitignore
 docs
-addon
 **/tests
 **/__pycache__
 *.db
