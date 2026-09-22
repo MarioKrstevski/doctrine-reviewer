@@ -53,3 +53,25 @@ class ImportSmokeTest(unittest.TestCase):
             self.assertTrue(callable(getattr(mod, name, None)), name)
         # filter hook contract: returns `handled` untouched when not ours
         self.assertEqual("h", mod.on_js_message("h", "something_else", None))
+
+
+class DiagnosticsSmokeTest(unittest.TestCase):
+    def test_diagnostics_text_never_raises_and_reports_each_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "doctrine_editor").symlink_to(ADDON_DIR)
+            with mock.patch.dict(sys.modules, _stub_anki()):
+                sys.path.insert(0, tmp)
+                try:
+                    for m in [m for m in sys.modules if m.startswith("doctrine_editor")]:
+                        del sys.modules[m]
+                    mod = importlib.import_module("doctrine_editor")
+                    mod.mw.reviewer.card = None
+                    text = mod.diagnostics_text()
+                finally:
+                    sys.path.remove(tmp)
+        self.assertIn("Doctrine Editor", text)
+        self.assertIn("hooks:", text)
+        self.assertIn("current card: none", text)
+        self.assertIn("--- last 20 log lines ---", text)
+        # a probe that fails (server unreachable under stubs) is a line, not an abort
+        self.assertRegex(text, r"server: (reachable|ERROR)")

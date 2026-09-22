@@ -33,7 +33,7 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import addon_log, chunk_util, identity, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.2"
+ADDON_VERSION = "1.2.1"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -520,52 +520,79 @@ def open_updates_page():
 
 # ---------------------------------------------------------------- diagnostics
 
+def _section(lines, title, fn):
+    """Run one diagnostics probe; a failure becomes a line, never an abort."""
+    try:
+        out = fn()
+        lines.extend(out if isinstance(out, list) else [out])
+    except Exception as e:
+        lines.append(f"{title}: ERROR {type(e).__name__}: {e}")
+        addon_log.exception(f"diagnostics/{title}")
+
+
 def diagnostics_text() -> str:
     import platform as _platform
-    try:
-        from anki.buildinfo import version as anki_version
-    except Exception:
-        anki_version = "?"
-    cfg = get_config()
-    lines = [
-        f"Doctrine Editor {ADDON_VERSION}  dev={DEV_MODE} debug={DEBUG_MODE}",
-        f"Anki {anki_version}  {_platform.platform()}",
-        f"install_id: {state.install_id(user_files_dir())}",
-        f"bootstrap: {cfg['bootstrap_url']}",
-        f"api_base (cached): {cached_api_base(cfg)}",
-    ]
-    try:
-        info = get_json(cached_api_base(cfg) + "/where")
-        lines.append(f"server: reachable, api_base={info.get('api_base')}")
-    except Exception as e:
-        lines.append(f"server: UNREACHABLE ({e!r})")
-    hooks = {
-        "webview_will_set_content": on_webview_will_set_content in gui_hooks.webview_will_set_content._hooks,
-        "reviewer_did_show_question": on_reviewer_did_show_question in gui_hooks.reviewer_did_show_question._hooks,
-        "webview_did_receive_js_message": on_js_message in gui_hooks.webview_did_receive_js_message._hooks,
-    }
-    lines.append("hooks: " + ", ".join(f"{k}={'on' if v else 'OFF'}" for k, v in hooks.items()))
+    lines = []
+    cfg = None
 
-    card = mw.reviewer.card if mw.reviewer else None
-    if card is None:
-        lines.append("current card: none (open the reviewer first)")
-    else:
+    def versions():
+        try:
+            from anki.buildinfo import version as anki_version
+        except Exception:
+            anki_version = "?"
+        return [f"Doctrine Editor {ADDON_VERSION}  dev={DEV_MODE} debug={DEBUG_MODE}",
+                f"Anki {anki_version}  {_platform.platform()}"]
+    _section(lines, "versions", versions)
+
+    def config():
+        nonlocal cfg
+        cfg = get_config()
+        return [f"install_id: {state.install_id(user_files_dir())}",
+                f"bootstrap: {cfg['bootstrap_url']}",
+                f"api_base (cached): {cached_api_base(cfg)}"]
+    _section(lines, "config", config)
+
+    def server():
+        base = cached_api_base(cfg or get_config())
+        info = get_json(base + "/where")
+        return f"server: reachable, api_base={info.get('api_base')}"
+    _section(lines, "server", server)
+
+    def hooks():
+        def has(hook, fn):
+            for attr in ("_hooks", "hooks"):
+                lst = getattr(hook, attr, None)
+                if lst is not None:
+                    return "on" if fn in lst else "OFF"
+            return "?"
+        return "hooks: " + ", ".join([
+            f"webview_will_set_content={has(gui_hooks.webview_will_set_content, on_webview_will_set_content)}",
+            f"reviewer_did_show_question={has(gui_hooks.reviewer_did_show_question, on_reviewer_did_show_question)}",
+            f"js_message={has(gui_hooks.webview_did_receive_js_message, on_js_message)}",
+        ])
+    _section(lines, "hooks", hooks)
+
+    def card():
+        card = mw.reviewer.card if mw.reviewer else None
+        if card is None:
+            return "current card: none (open the reviewer first)"
         note = card.note()
         names = list(note.keys())
         fields = {n: note[n] for n in names}
         doc, guid = identity.identity_of(fields, note.guid)
-        lines += [
-            "current card:",
-            f"  deck: {mw.col.decks.name(card.did)!r} (did={card.did})",
-            f"  nid={note.id} cid={card.id} ord={card.ord} guid={note.guid!r}",
-            f"  note type: {note.note_type()['name']!r}",
-            f"  fields: {names}",
-            f"  {identity.ID_FIELD!r} value: {doc!r}",
-            f"  supported: {identity.is_doctrine_card(names, mw.col.decks.name(card.did))}",
-        ]
+        deck = mw.col.decks.name(card.did)
+        return ["current card:",
+                f"  deck: {deck!r} (did={card.did})",
+                f"  nid={note.id} cid={card.id} ord={card.ord} guid={note.guid!r}",
+                f"  note type: {note.note_type()['name']!r}",
+                f"  fields: {names}",
+                f"  {identity.ID_FIELD!r} value: {doc!r}",
+                f"  supported: {identity.is_doctrine_card(names, deck)}"]
+    _section(lines, "card", card)
+
     lines.append("")
     lines.append("--- last 20 log lines ---")
-    lines += [l.rstrip() for l in addon_log.tail(user_files_dir(), 20)]
+    _section(lines, "log", lambda: [l.rstrip() for l in addon_log.tail(user_files_dir(), 20)])
     return "\n".join(lines)
 
 
@@ -594,9 +621,19 @@ class DiagnosticsDialog(QDialog):
         tooltip("Diagnostics copied", period=1500)
 
 
-@addon_log.guarded("diagnostics")
 def open_diagnostics():
-    DiagnosticsDialog(mw, diagnostics_text()).exec()
+    # User-triggered: a failure must be visible, not swallowed.
+    try:
+        text = diagnostics_text()
+    except Exception:
+        import traceback
+        addon_log.exception("diagnostics")
+        text = "Diagnostics itself failed:\n\n" + traceback.format_exc()
+    try:
+        DiagnosticsDialog(mw, text).exec()
+    except Exception:
+        addon_log.exception("diagnostics dialog")
+        showWarning(text)
 
 
 # ---------------------------------------------------------------- menu & hooks
