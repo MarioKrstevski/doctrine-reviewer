@@ -1,6 +1,48 @@
-2026-09-22 23:42:33,986 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
-2026-09-22 23:42:34,455 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
-2026-09-22 23:42:34,455 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
-2026-09-22 23:42:34,599 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
-2026-09-22 23:42:35,067 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
-2026-09-22 23:42:35,067 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
+2026-09-22 23:45:08,951 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
+2026-09-22 23:45:13,283 ERROR diagnostics/server
+Traceback (most recent call last):
+  File "/var/folders/v0/lsptb9td4ds245rxgt7m9vsm0000gn/T/tmpz126m4l7/doctrine_editor/__init__.py", line 526, in _section
+    out = fn()
+          ^^^^
+  File "/var/folders/v0/lsptb9td4ds245rxgt7m9vsm0000gn/T/tmpz126m4l7/doctrine_editor/__init__.py", line 559, in server
+    with urllib.request.urlopen(req, timeout=4) as resp:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 215, in urlopen
+    return opener.open(url, data, timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 515, in open
+    response = self._open(req, data)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 532, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 492, in _call_chain
+    result = func(*args)
+             ^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 1392, in https_open
+    return self.do_open(http.client.HTTPSConnection, req,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/urllib/request.py", line 1348, in do_open
+    r = h.getresponse()
+        ^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/http/client.py", line 1450, in getresponse
+    response.begin()
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/http/client.py", line 336, in begin
+    version, status, reason = self._read_status()
+                              ^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/http/client.py", line 297, in _read_status
+    line = str(self.fp.readline(_MAXLINE + 1), "iso-8859-1")
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/socket.py", line 720, in readinto
+    return self._sock.recv_into(b)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ssl.py", line 1251, in recv_into
+    return self.read(nbytes, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/lib/python3.12/ssl.py", line 1103, in read
+    return self._sslobj.read(len, buffer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TimeoutError: The read operation timed out
+
+2026-09-22 23:45:13,299 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)
+2026-09-22 23:45:13,299 INFO loaded Doctrine Editor 1.2.1 (dev=False debug=False)

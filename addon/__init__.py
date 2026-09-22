@@ -553,8 +553,11 @@ def diagnostics_text() -> str:
     _section(lines, "config", config)
 
     def server():
+        # Short timeout: this runs on the UI thread while the dialog opens.
         base = cached_api_base(cfg or get_config())
-        info = get_json(base + "/where")
+        req = urllib.request.Request(base + "/where", headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
         return f"server: reachable, api_base={info.get('api_base')}"
     _section(lines, "server", server)
 
