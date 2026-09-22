@@ -40,12 +40,24 @@ class TrackingUrlTest(unittest.TestCase):
 
 
 class UnknownIdTest(unittest.TestCase):
-    def test_unregistered_id_is_rejected(self):
+    """The 'is this our deck?' gate no longer lives at submit time.
+
+    The client's deck is not registered with us, so an unknown id is
+    accepted on the student snapshot alone. The gate returns when
+    fetch_master() can ask the client's API (404 there = reject).
+    """
+
+    def test_unregistered_id_is_accepted_without_a_master(self):
+        with running_server() as base:
+            status, body = post(base, "/api/suggestions", {
+                "doctrine_id": "P]%rwtghL]", "guid": "P]%rwtghL]",
+                "text": "hello", "snapshot": {},
+            })
+        self.assertEqual(200, status)
+        self.assertIn("/s/", body["tracking_url"])
+
+    def test_no_identity_at_all_is_rejected(self):
         with running_server() as base:
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                post(base, "/api/suggestions", {
-                    "doctrine_id": "doc-spoofed0001",
-                    "text": "hello",
-                    "snapshot": {},
-                })
-            self.assertEqual(404, ctx.exception.code)
+                post(base, "/api/suggestions", {"text": "hello", "snapshot": {}})
+            self.assertEqual(400, ctx.exception.code)

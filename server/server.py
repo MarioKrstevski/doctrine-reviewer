@@ -188,8 +188,12 @@ def init_db():
 
         # suggestions predates several features in production, so columns
         # are added in place when missing rather than recreating the table.
+        _ensure_columns(conn, "notes", {"doctorine_id": "TEXT", "guid": "TEXT"})
         _ensure_columns(conn, "suggestions", {
             "resolved_by": "INTEGER",
+            # identity, both halves: their id (may be empty) and Anki's guid
+            "doctorine_id": "TEXT",
+            "guid": "TEXT",
             # P3 trace data
             "tags_json": "TEXT",
             "note_mod": "INTEGER",
@@ -672,10 +676,12 @@ def render_reviewer(user=None, secret=None, session_token=None):
         master = masters.get(r["doctrine_id"])
         stale_cls = ""
         if master is None:
-            state_badge = '<span class="badge bad">Unknown card</span>'
+            state_badge = '<span class="badge">No master on file</span>'
             master_pane = ('<div class="pane"><div class="pane-label">Current '
                            'master</div><div class="sugg-body sugg-empty">No '
-                           'master record for this ID.</div></div>')
+                           'master copy on file for this card, so the '
+                           'snapshot on the left is the only version we have. '
+                           'Compare it against the deck yourself.</div></div>')
             stale = False
         else:
             stale = master["content_hash"] != r["snap_hash"]
@@ -840,22 +846,37 @@ def render_status(token):
 
 # ---------------------------------------------------------------- api
 
+def fetch_master(doctorine_id, guid):
+    """The client's current copy of a card, or None.
+
+    Stub. When the client exposes a GET endpoint this calls it (server-side
+    only; their key never ships in the add-on) and returns
+    {"fields": {...}, "content_hash": ...}. Until then None: suggestions
+    are accepted on the student snapshot alone and the reviewer sees
+    "No master on file" rather than a comparison.
+    """
+    return None
+
+
 def api_suggestion(data):
     doc_id = (data.get("doctrine_id") or "").strip()
+    doctorine_id = (data.get("doctorine_id") or "").strip()
+    guid = (data.get("guid") or "").strip()
     if not doc_id:
-        return 400, {"error": "Missing doctrine_id."}
+        doc_id = doctorine_id or guid
+    if not doc_id:
+        return 400, {"error": "Missing card identity."}
+
+    text = (data.get("text") or "").strip()
+    if not text:
+        return 400, {"error": "Suggestion text is required."}
+    snap = data.get("snapshot") or {}
+
+    # A master is nice to have, not required: the client's deck is not
+    # registered with us, and their API is not exposed yet.
+    fetch_master(doctorine_id or doc_id, guid)
 
     with db() as conn:
-        master = conn.execute(
-            "SELECT doctrine_id FROM notes WHERE doctrine_id=?", (doc_id,)
-        ).fetchone()
-        if master is None:
-            return 404, {"error": "This card is not part of a registered deck."}
-
-        snap = data.get("snapshot") or {}
-        text = (data.get("text") or "").strip()
-        if not text:
-            return 400, {"error": "Suggestion text is required."}
 
         token = uuid.uuid4().hex[:16]
         tags = data.get("tags")
@@ -867,8 +888,8 @@ def api_suggestion(data):
                 snap_hash, created_at,
                 tags_json, note_mod, card_id, card_ord, template_name,
                 deck_id, original_deck_id, install_id, addon_version,
-                anki_version)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?)""",
+                anki_version, doctorine_id, guid)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?)""",
             (token, doc_id, data.get("anki_note_id"),
              data.get("note_type"), data.get("deck"),
              data.get("suggestion_type", "other"), text, data.get("email"),
@@ -879,7 +900,8 @@ def api_suggestion(data):
              data.get("note_mod"), data.get("card_id"), data.get("card_ord"),
              data.get("template_name"), data.get("deck_id"),
              data.get("original_deck_id") or None, data.get("install_id"),
-             data.get("addon_version"), data.get("anki_version")),
+             data.get("addon_version"), data.get("anki_version"),
+             doctorine_id, guid),
         )
     return 200, {"ok": True,
                  "tracking_url": f"{CFG.public_base_url}/s/{token}"}

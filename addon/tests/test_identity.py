@@ -1,57 +1,46 @@
-"""Decide, client-side, whether a note is a Doctrine card.
-
-Identity is the note guid. The pipeline sets guid = database ObjectId
-(24 lowercase hex), while Anki-native notes -- a student's own cards, or
-public decks -- carry 10-char base91 guids like 'f{Q8k)Zx@3'. That shape
-difference is the courtesy gate for showing the button; the server's
-"is this guid registered?" check remains the real gate.
-"""
-
 import unittest
 
-from identity import is_doctrine_card
+from identity import ID_FIELD, identity_of, is_doctrine_card, primary_id
+
+V2 = ["Text", "Extra", "Personal Notes", "Review", "Brief Vignette",
+      "Full Vignette", ID_FIELD]
+ANKING = ["Text", "Extra", "Lecture Notes", "Missed Questions", "Pathoma"]
 
 
-class GuidShapeTest(unittest.TestCase):
-    def test_a_pipeline_objectid_guid_is_accepted(self):
-        self.assertTrue(is_doctrine_card("69444ce12cf1b3ba0261a175", "Other"))
+class GateTest(unittest.TestCase):
+    def test_note_type_with_the_field_is_ours_even_when_empty(self):
+        self.assertTrue(is_doctrine_card(V2, "Anything"))
 
-    def test_an_anki_native_guid_is_rejected(self):
-        for guid in ["f{Q8k)Zx@3", "Ab3$xY9!qZ", "abcdefghij"]:
-            with self.subTest(guid=guid):
-                self.assertFalse(is_doctrine_card(guid, "Other"))
+    def test_note_type_without_the_field_is_not_ours(self):
+        self.assertFalse(is_doctrine_card(ANKING, "AnKing"))
 
-    def test_uppercase_hex_is_rejected(self):
-        # ObjectIds are always lowercase; be strict so the gate stays narrow.
-        self.assertFalse(is_doctrine_card("69444CE12CF1B3BA0261A175", "Other"))
+    def test_field_name_must_match_exactly_including_the_space(self):
+        self.assertFalse(is_doctrine_card(["DoctorineID"], "x"))
+        self.assertFalse(is_doctrine_card(["doctorine id"], "x"))
 
-    def test_wrong_length_hex_is_rejected(self):
-        self.assertFalse(is_doctrine_card("69444ce12cf1b3ba0261a17", "Other"))
-        self.assertFalse(is_doctrine_card("69444ce12cf1b3ba0261a1755", "Other"))
+    def test_deck_named_doctrine_is_a_fallback(self):
+        self.assertTrue(is_doctrine_card(ANKING, "Doctrine"))
+        self.assertTrue(is_doctrine_card(ANKING, "Doctorine::Cardio"))
+        self.assertFalse(is_doctrine_card(ANKING, "My Doctrine Notes"))
 
-    def test_missing_guid_is_rejected(self):
-        for guid in [None, "", 123]:
-            with self.subTest(guid=guid):
-                self.assertFalse(is_doctrine_card(guid, "Doctrine"))
+    def test_missing_inputs_are_handled(self):
+        self.assertFalse(is_doctrine_card(None, None))
+        self.assertFalse(is_doctrine_card([], ""))
 
 
-class DeckNameTest(unittest.TestCase):
-    """A deck named Doctrine is also accepted, so a future change of id
-    format does not silently hide the button on every card."""
+class IdentityTest(unittest.TestCase):
+    def test_filled_field_wins(self):
+        self.assertEqual(("abc123", "P]%rwtghL]"),
+                         identity_of({ID_FIELD: " abc123 "}, "P]%rwtghL]"))
+        self.assertEqual("abc123", primary_id({ID_FIELD: "abc123"}, "P]%rwtghL]"))
 
-    def test_the_doctrine_deck_is_accepted_even_with_a_native_guid(self):
-        self.assertTrue(is_doctrine_card("f{Q8k)Zx@3", "Doctrine"))
+    def test_empty_field_falls_back_to_guid(self):
+        self.assertEqual(("", "P]%rwtghL]"), identity_of({ID_FIELD: ""}, "P]%rwtghL]"))
+        self.assertEqual("P]%rwtghL]", primary_id({ID_FIELD: ""}, "P]%rwtghL]"))
 
-    def test_subdecks_count(self):
-        self.assertTrue(is_doctrine_card("f{Q8k)Zx@3", "Doctrine::Cardio"))
+    def test_no_field_at_all_falls_back_to_guid(self):
+        self.assertEqual("s.MBeTB!D.", primary_id({"Text": "x"}, "s.MBeTB!D."))
 
-    def test_case_and_whitespace_are_forgiven(self):
-        self.assertTrue(is_doctrine_card("f{Q8k)Zx@3", "  doctrine "))
-
-    def test_a_deck_merely_containing_the_word_is_not_enough(self):
-        self.assertFalse(is_doctrine_card("f{Q8k)Zx@3", "My Doctrine Notes"))
-        self.assertFalse(is_doctrine_card("f{Q8k)Zx@3", "Doctrinez"))
-
-    def test_missing_deck_name_is_handled(self):
-        self.assertFalse(is_doctrine_card("f{Q8k)Zx@3", None))
-        self.assertTrue(is_doctrine_card("69444ce12cf1b3ba0261a175", None))
+    def test_never_returns_none(self):
+        self.assertEqual(("", ""), identity_of(None, None))
+        self.assertEqual("", primary_id(None, None))

@@ -101,15 +101,28 @@ Spoofed ID correctly 404s.
 - No login/CAPTCHA/email-verification for students. Identity =
   install_id (+ optional purchase-time submission key later).
 - Reviewers apply edits manually; suggestions are input, never merged.
-- Identity = the Anki note **guid**. The deck pipeline already sets it to
-  the card's MongoDB ObjectId (24 lowercase hex), verified 100% preserved
-  across export -> import on Doctrine 0.1 (34,704/34,704). Nothing is
-  stamped, no field is added, the add-on never writes to the collection,
-  so students are never forced into a full sync. The server column is
-  still called `doctrine_id`; its value is the guid. Client-side button
-  gate = ObjectId-shaped guid OR top-level deck named "Doctrine"
-  (`addon/identity.py`); the server's "is this guid registered?" check is
-  the real gate.
+- Identity (2026-09-22, supersedes the guid-only note): the client's
+  note type carries a field named exactly `Doctorine ID` (their spelling,
+  with the space). Its *presence* is the add-on's gate -- other decks do
+  not have it -- and its value is often empty by their design. Filing key
+  = `Doctorine ID` if filled, else `note.guid`. Both are sent on every
+  suggestion (`doctorine_id`, `guid`) and stored. Native Anki guids
+  contain `] % ! :` -- never put one in a URL unencoded; today they only
+  travel in JSON bodies. Nothing is stamped; the add-on never writes to
+  the collection.
+- The "only our deck" gate no longer lives at submit time: unknown ids
+  are accepted on the student snapshot alone and the reviewer sees
+  "No master on file". `fetch_master(doctorine_id, guid)` is a stub;
+  when the client exposes a GET endpoint it is called server-side at
+  submit (snapshot + hash "our" version) and at review (flag outdated),
+  and a 404 from it becomes the rejection. `Register a deck as master…`
+  and the notes table remain as a fallback until then.
+- DEBUG_MODE (on in DEV builds): the button never hides; on unsupported
+  cards it renders disabled with the reason in its tooltip. Tools →
+  Doctrine Editor → Diagnostics… shows versions, install id, server
+  reachability, hook status, the current card's identity, and the log
+  tail, with a copy button. Every hook is wrapped and logged to
+  `user_files/doctrine.log`.
 
 ## Test loop
 

@@ -1,32 +1,44 @@
-"""Client-side check: does this note look like one of ours?
+"""Client-side check: is this note one of ours, and what identifies it?
 
-Identity is the Anki note guid. The Doctrine pipeline sets guid to the
-card's database ObjectId -- 24 lowercase hex characters -- whereas notes
-created inside Anki get 10-character base91 guids. That shape is a
-reliable, zero-configuration signal for showing the Suggest button.
+The gate is the note type: Doctrine notes carry a field named exactly
+"Doctorine ID" (their spelling, with the space). Other decks do not have
+that field, so its *presence* is the signal -- the value is often empty
+today and may stay empty for a while.
 
-The deck name is accepted as a second signal so that a future change to
-the id format degrades to "button shows, server explains" rather than
-"button silently vanishes everywhere".
+Identity, in order of preference:
+  1. the "Doctorine ID" value, if filled -- their database id
+  2. the note guid -- Anki's own, unique, survives export/import
 
-This is a courtesy gate only. The server's check that the guid is
-registered is what actually decides whether a suggestion is accepted.
+Both are opaque strings. Native Anki guids contain characters such as
+] % ! : so anything that puts one in a URL must encode it. The add-on
+only ever sends them in JSON bodies.
+
+This is a courtesy gate only. The server decides what it accepts.
 """
 
-import re
-
-_OBJECTID = re.compile(r"[0-9a-f]{24}")
+ID_FIELD = "Doctorine ID"
 DECK_NAME = "doctrine"
 
 
-def is_doctrine_card(guid, deck_name) -> bool:
-    # No guid means nothing to submit, whatever deck it sits in.
-    if not isinstance(guid, str) or not guid:
-        return False
-    if _OBJECTID.fullmatch(guid):
+def is_doctrine_card(field_names, deck_name=None) -> bool:
+    if field_names and ID_FIELD in field_names:
         return True
     if isinstance(deck_name, str):
         top = deck_name.strip().split("::", 1)[0].strip().lower()
-        if top == DECK_NAME:
+        if top in (DECK_NAME, "doctorine"):
             return True
     return False
+
+
+def identity_of(fields, guid):
+    """(doctorine_id or '', guid or '') -- always both, never None."""
+    doc = ""
+    if isinstance(fields, dict):
+        doc = (fields.get(ID_FIELD) or "").strip()
+    return doc, (guid or "")
+
+
+def primary_id(fields, guid) -> str:
+    """The key a suggestion is filed under: Doctorine ID if set, else guid."""
+    doc, g = identity_of(fields, guid)
+    return doc or g

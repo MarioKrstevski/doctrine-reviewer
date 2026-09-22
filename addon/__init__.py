@@ -30,10 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import chunk_util, identity, payload, resolver, state
+from . import addon_log, chunk_util, identity, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.1"
+ADDON_VERSION = "1.2"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -53,6 +53,10 @@ def user_files_dir():
     return os.path.join(os.path.dirname(__file__), "user_files")
 
 
+_log = addon_log.setup(user_files_dir())
+_log.info("loaded Doctrine Editor %s (dev=%s debug=%s)", ADDON_VERSION, DEV_MODE, DEBUG_MODE)
+
+
 # Everything below is ours, not the student's. The add-on deliberately
 # ships no config.json, so Anki shows no Config panel at all: the endpoint,
 # the button position and the ID field are decisions we make and change by
@@ -66,6 +70,10 @@ def user_files_dir():
 # the server rejects the register call without it regardless.
 DEV_MODE = False
 PIPELINE_API_KEY = ""
+# DEBUG_MODE: the button never hides. On unsupported cards it renders
+# disabled with the reason, so "no button" can be told apart from
+# "button hidden on purpose". On in DEV builds.
+DEBUG_MODE = False
 
 API_BASE_OVERRIDE = ""
 # Identity is the note guid; nothing is stamped. LEGACY_ID_FIELD is only
@@ -252,6 +260,7 @@ class SentDialog(QDialog):
 
 # ---------------------------------------------------------------- suggest flow
 
+@addon_log.guarded("open_suggestion_dialog")
 def open_suggestion_dialog():
     card = mw.reviewer.card if mw.reviewer else None
     if card is None:
@@ -263,14 +272,16 @@ def open_suggestion_dialog():
     field_names = list(note.keys())
     deck_name = mw.col.decks.name(card.did)
 
-    if not identity.is_doctrine_card(note.guid, deck_name):
+    if not identity.is_doctrine_card(field_names, deck_name):
         showInfo(
             "This card is not part of a supported deck, so suggestions "
             "can't be sent for it."
         )
         return
 
-    doctrine_id = note.guid
+    fields_now = {name: note[name] for name in field_names}
+    doctorine_id, guid = identity.identity_of(fields_now, note.guid)
+    doctrine_id = doctorine_id or guid
 
     try:
         note_type = note.note_type()
@@ -287,7 +298,9 @@ def open_suggestion_dialog():
     except Exception:
         anki_version = None
     body = {
-        "doctrine_id": doctrine_id,
+        "doctrine_id": doctrine_id,       # filing key: Doctorine ID if set, else guid
+        "doctorine_id": doctorine_id,     # their id, may be empty
+        "guid": guid,                     # Anki's, always present
         "anki_note_id": note.id,
         "note_type": note_type["name"],
         "deck": deck_name,
@@ -324,15 +337,18 @@ def open_suggestion_dialog():
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
+            _log.warning("suggestion rejected: %s %s", e.code, msg)
             showWarning(f"The platform rejected the suggestion:\n{msg}")
             return
         except Exception as e:
+            _log.error("suggestion send failed: %r", e)
             showWarning(
                 "Could not reach the suggestion server.\n"
                 f"Is it running at {cached_api_base(cfg)}?\n\n{e}"
             )
             return
         tracking = result.get("tracking_url")
+        _log.info("suggestion sent id=%s tracking=%s", doctrine_id, tracking)
         if tracking:
             SentDialog(mw, tracking).exec()
         else:
@@ -343,6 +359,7 @@ def open_suggestion_dialog():
 
 # ---------------------------------------------------------------- bottom bar button
 
+@addon_log.guarded("webview_will_set_content")
 def on_webview_will_set_content(web_content, context):
     try:
         from aqt.reviewer import Reviewer
@@ -366,22 +383,41 @@ def on_webview_will_set_content(web_content, context):
 </style>
 <button id="doctrine-suggest-btn" onclick="pycmd('doctrine_editor')"
         title="Suggest an edit to this card">&#9998; Suggest an edit</button>
+<style>#doctrine-suggest-btn:disabled { opacity:.45; cursor:not-allowed; }</style>
 """ % (cfg["button_right_offset"], cfg["button_top_offset"])
 
 
+@addon_log.guarded("reviewer_did_show_question")
 def on_reviewer_did_show_question(card):
     note = card.note()
-    supported = identity.is_doctrine_card(note.guid, mw.col.decks.name(card.did))
-    mw.reviewer.web.eval(
-        "var b = document.getElementById('doctrine-suggest-btn');"
-        "if (b) b.style.display = '%s';" % ("block" if supported else "none")
-    )
+    field_names = list(note.keys())
+    deck_name = mw.col.decks.name(card.did)
+    supported = identity.is_doctrine_card(field_names, deck_name)
+    if supported or not DEBUG_MODE:
+        js = ("var b = document.getElementById('doctrine-suggest-btn');"
+              "if (b) { b.style.display = '%s'; b.disabled = false; "
+              "b.title = 'Suggest an edit to this card'; }"
+              % ("block" if supported else "none"))
+    else:
+        reason = ("no '%s' field on note type %s" %
+                  (identity.ID_FIELD, note.note_type()["name"]))
+        js = ("var b = document.getElementById('doctrine-suggest-btn');"
+              "if (b) { b.style.display = 'block'; b.disabled = true; "
+              "b.title = %s; }" % json.dumps("Not a Doctrine card: " + reason))
+    mw.reviewer.web.eval(js)
+    _log.debug("card %s deck=%r type=%r supported=%s", card.id, deck_name,
+               note.note_type()["name"], supported)
 
 
 def on_js_message(handled, message, context):
-    if message == "doctrine_editor":
-        open_suggestion_dialog()
-        return (True, None)
+    # Filter hook: must return a (handled, value) tuple even on failure,
+    # or every other add-on's handler downstream breaks.
+    try:
+        if message == "doctrine_editor":
+            open_suggestion_dialog()
+            return (True, None)
+    except Exception:
+        addon_log.exception("js_message")
     return handled
 
 
@@ -428,7 +464,9 @@ def register_deck():
         deck_of_card = mw.col.decks.name(cards[0].did) if cards else name
 
         registered.append({
-            "doctrine_id": note.guid,
+            "doctrine_id": identity.primary_id(fields, note.guid),
+            "doctorine_id": identity.identity_of(fields, note.guid)[0],
+            "guid": note.guid,
             "anki_note_id": note.id,
             "note_type": m["name"],
             "deck": deck_of_card,
@@ -480,6 +518,87 @@ def open_updates_page():
     openLink(cached_api_base(get_config()) + "/updates")
 
 
+# ---------------------------------------------------------------- diagnostics
+
+def diagnostics_text() -> str:
+    import platform as _platform
+    try:
+        from anki.buildinfo import version as anki_version
+    except Exception:
+        anki_version = "?"
+    cfg = get_config()
+    lines = [
+        f"Doctrine Editor {ADDON_VERSION}  dev={DEV_MODE} debug={DEBUG_MODE}",
+        f"Anki {anki_version}  {_platform.platform()}",
+        f"install_id: {state.install_id(user_files_dir())}",
+        f"bootstrap: {cfg['bootstrap_url']}",
+        f"api_base (cached): {cached_api_base(cfg)}",
+    ]
+    try:
+        info = get_json(cached_api_base(cfg) + "/where")
+        lines.append(f"server: reachable, api_base={info.get('api_base')}")
+    except Exception as e:
+        lines.append(f"server: UNREACHABLE ({e!r})")
+    hooks = {
+        "webview_will_set_content": on_webview_will_set_content in gui_hooks.webview_will_set_content._hooks,
+        "reviewer_did_show_question": on_reviewer_did_show_question in gui_hooks.reviewer_did_show_question._hooks,
+        "webview_did_receive_js_message": on_js_message in gui_hooks.webview_did_receive_js_message._hooks,
+    }
+    lines.append("hooks: " + ", ".join(f"{k}={'on' if v else 'OFF'}" for k, v in hooks.items()))
+
+    card = mw.reviewer.card if mw.reviewer else None
+    if card is None:
+        lines.append("current card: none (open the reviewer first)")
+    else:
+        note = card.note()
+        names = list(note.keys())
+        fields = {n: note[n] for n in names}
+        doc, guid = identity.identity_of(fields, note.guid)
+        lines += [
+            "current card:",
+            f"  deck: {mw.col.decks.name(card.did)!r} (did={card.did})",
+            f"  nid={note.id} cid={card.id} ord={card.ord} guid={note.guid!r}",
+            f"  note type: {note.note_type()['name']!r}",
+            f"  fields: {names}",
+            f"  {identity.ID_FIELD!r} value: {doc!r}",
+            f"  supported: {identity.is_doctrine_card(names, mw.col.decks.name(card.did))}",
+        ]
+    lines.append("")
+    lines.append("--- last 20 log lines ---")
+    lines += [l.rstrip() for l in addon_log.tail(user_files_dir(), 20)]
+    return "\n".join(lines)
+
+
+class DiagnosticsDialog(QDialog):
+    def __init__(self, parent, text):
+        super().__init__(parent)
+        self.setWindowTitle("Doctrine Editor — Diagnostics")
+        self.setMinimumSize(640, 480)
+        layout = QVBoxLayout(self)
+        self.box = QTextEdit()
+        self.box.setReadOnly(True)
+        self.box.setPlainText(text)
+        self.box.setStyleSheet("font-family: Menlo, monospace; font-size: 12px;")
+        layout.addWidget(self.box)
+        row = QHBoxLayout()
+        copy = QPushButton("Copy to clipboard")
+        copy.clicked.connect(self._copy)
+        close = QPushButton("Close")
+        close.setDefault(True)
+        close.clicked.connect(self.accept)
+        row.addWidget(copy); row.addStretch(); row.addWidget(close)
+        layout.addLayout(row)
+
+    def _copy(self):
+        QApplication.clipboard().setText(self.box.toPlainText())
+        tooltip("Diagnostics copied", period=1500)
+
+
+@addon_log.guarded("diagnostics")
+def open_diagnostics():
+    DiagnosticsDialog(mw, diagnostics_text()).exec()
+
+
 # ---------------------------------------------------------------- menu & hooks
 
 def setup_menu():
@@ -493,6 +612,10 @@ def setup_menu():
     a4 = QAction("Open public updates page", mw)
     a4.triggered.connect(open_updates_page)
     menu.addAction(a4)
+
+    a5 = QAction("Diagnostics…", mw)
+    a5.triggered.connect(open_diagnostics)
+    menu.addAction(a5)
 
     if DEV_MODE:
         menu.addSeparator()

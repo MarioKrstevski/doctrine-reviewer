@@ -71,11 +71,12 @@ class RegisterAuthTest(unittest.TestCase):
             self.assertEqual(401, register(base, "wrong-key"))
 
     def test_a_rejected_call_writes_nothing(self):
+        import server
         with running_server(PIPELINE_API_KEY=KEY) as base:
             register(base, "wrong-key")
-            # The id must still be unknown, so suggestions for it 404.
-            self.assertEqual(404, note_count(base),
-                             "an unauthorised register created master state")
+            with server.db() as conn:
+                n = conn.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+        self.assertEqual(0, n, "an unauthorised register created master state")
 
     def test_the_new_path_works_too(self):
         with running_server(PIPELINE_API_KEY=KEY) as base:
