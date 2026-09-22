@@ -54,7 +54,6 @@ def user_files_dir():
 
 
 _log = addon_log.setup(user_files_dir())
-_log.info("loaded Doctrine Editor %s (dev=%s debug=%s)", ADDON_VERSION, DEV_MODE, DEBUG_MODE)
 
 
 # Everything below is ours, not the student's. The add-on deliberately
@@ -74,6 +73,7 @@ PIPELINE_API_KEY = ""
 # disabled with the reason, so "no button" can be told apart from
 # "button hidden on purpose". On in DEV builds.
 DEBUG_MODE = False
+_log.info("loaded Doctrine Editor %s (dev=%s debug=%s)", ADDON_VERSION, DEV_MODE, DEBUG_MODE)
 
 API_BASE_OVERRIDE = ""
 # Identity is the note guid; nothing is stamped. LEGACY_ID_FIELD is only
