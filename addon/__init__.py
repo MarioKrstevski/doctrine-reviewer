@@ -33,12 +33,13 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import addon_log, chunk_util, identity, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.2.1"
+ADDON_VERSION = "1.3"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
     ("incorrect", "Incorrect information"),
     ("confusing", "Confusing / unclear"),
+    ("media", "Image or audio problem"),
     ("other", "Other"),
 ]
 

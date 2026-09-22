@@ -61,3 +61,16 @@ class UnknownIdTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 post(base, "/api/suggestions", {"text": "hello", "snapshot": {}})
             self.assertEqual(400, ctx.exception.code)
+
+
+class MediaTypeTest(unittest.TestCase):
+    def test_media_suggestion_type_is_labelled_in_the_queue(self):
+        import server
+        with running_server() as base:
+            register_one(base)
+            post(base, "/api/suggestions", {
+                "doctrine_id": "doc-test000001", "text": "the image is missing",
+                "suggestion_type": "media", "snapshot": {"fields": {"Front": "Q", "Back": "A"}},
+            })
+            html = server.render_reviewer({"id": 1, "username": "r", "role": "reviewer"}, "s", "t")
+        self.assertIn("Image / audio", html)

@@ -24,6 +24,16 @@ class InstallPageTest(unittest.TestCase):
                 html = r.read().decode()
         self.assertIn("/download/doctrine_editor.ankiaddon", html)
         self.assertIn("Install from file", html)
+        # reviewer-only material must not confuse students
+        self.assertNotIn("Testing the full loop", html)
+        self.assertNotIn("Known gaps", html)
+
+    def test_reviewer_sections_appear_when_signed_in(self):
+        from tests.test_auth_routes import login, make_user, request
+        with running_server() as base:
+            user, pw = make_user()
+            _, cookie = login(base, user, pw)
+            _, _, html = request(base, "GET", "/install", cookie=cookie)
         self.assertIn("Testing the full loop", html)
         self.assertIn("Known gaps", html)
 

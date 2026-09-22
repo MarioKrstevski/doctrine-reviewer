@@ -47,6 +47,7 @@ TYPE_LABELS = {
     "typo": "Typo",
     "incorrect": "Incorrect",
     "confusing": "Confusing",
+    "media": "Image / audio",
     "other": "Other",
 }
 
@@ -1122,7 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"Cache-Control": "public, max-age=3600"},
             )
         elif path == "/install":
-            self._send(200, render_install())
+            self._send(200, render_install(self._current_user(), self._cookie_token()))
         elif path == f"/download/{ADDON_PACKAGE_NAME}":
             try:
                 with open(ADDON_PACKAGE_PATH, "rb") as fh:
@@ -1555,40 +1556,7 @@ def build_student_package(src_dir, out_path):
                 z.write(full, os.path.relpath(full, src_dir))
 
 
-def render_install():
-    body = f"""
-<h1>Install the Doctrine Editor add-on</h1>
-<p class="sub">Adds a <b>&#9998; Suggest an edit</b> button to Anki's reviewer
-on Doctrine cards. Suggestions go straight to the review team; you get a
-link to follow what happens to yours.</p>
-
-<div class="install-box">
-  <a class="btn-primary" href="/download/{ADDON_PACKAGE_NAME}">Download {ADDON_PACKAGE_NAME}</a>
-  <p class="small">Anki 23.10 or newer, desktop only. The add-on never modifies
-  your cards or note types.</p>
-</div>
-
-<h2>Steps</h2>
-<ol class="steps">
-  <li>Download the file above.</li>
-  <li>In Anki: <b>Tools &rarr; Add-ons &rarr; Install from file&hellip;</b> and pick it.</li>
-  <li>Restart Anki when prompted.</li>
-  <li>Review any card in the <b>Doctrine</b> deck. The <b>&#9998; Suggest an edit</b>
-      button appears top-right of the card.</li>
-  <li>Click it, describe the issue, add your email if you'd like to hear back, send.</li>
-</ol>
-
-<h2>What happens next</h2>
-<p>You get a tracking link straight away. A reviewer looks at every
-suggestion next to the current version of the card. Accepted fixes ship
-in the next deck update and can appear on the
-<a href="/updates">community updates</a> page with credit.</p>
-
-<h2>Already have an older version?</h2>
-<p>Tools &rarr; Add-ons &rarr; select <b>Doctrine Editor</b> &rarr; Delete, then
-install the new file. Your settings and pending suggestions are unaffected.</p>
-
-<h2 id="reviewers">Testing the full loop (reviewers)</h2>
+REVIEWER_INSTALL_HTML = """<h2 id="reviewers">Testing the full loop (reviewers)</h2>
 <p class="sub">If you have a reviewer login, this walks the whole path in
 about ten minutes &mdash; first as a student, then as a reviewer.</p>
 <ol class="steps">
@@ -1623,6 +1591,46 @@ about ten minutes &mdash; first as a student, then as a reviewer.</p>
 </ul>
 <p class="sub">Everything else is fair game for feedback: wording, layout,
 what's missing from the queue, what a reviewer would want to see.</p>
+"""
+
+
+def render_install(user=None, session_token=None):
+    # Reviewer walkthrough and known-gaps list only for signed-in staff;
+    # the page is public and must not confuse students.
+    reviewer_block = REVIEWER_INSTALL_HTML if user else ""
+    body = f"""
+<h1>Install the Doctrine Editor add-on</h1>
+<p class="sub">Adds a <b>&#9998; Suggest an edit</b> button to Anki's reviewer
+on Doctrine cards. Suggestions go straight to the review team; you get a
+link to follow what happens to yours.</p>
+
+<div class="install-box">
+  <a class="btn-primary" href="/download/{ADDON_PACKAGE_NAME}">Download {ADDON_PACKAGE_NAME}</a>
+  <p class="small">Anki 23.10 or newer, desktop only. The add-on never modifies
+  your cards or note types.</p>
+</div>
+
+<h2>Steps</h2>
+<ol class="steps">
+  <li>Download the file above.</li>
+  <li>In Anki: <b>Tools &rarr; Add-ons &rarr; Install from file&hellip;</b> and pick it.</li>
+  <li>Restart Anki when prompted.</li>
+  <li>Review any card in the <b>Doctrine</b> deck. The <b>&#9998; Suggest an edit</b>
+      button appears top-right of the card.</li>
+  <li>Click it, describe the issue, add your email if you'd like to hear back, send.</li>
+</ol>
+
+<h2>What happens next</h2>
+<p>You get a tracking link straight away. A reviewer looks at every
+suggestion next to the current version of the card. Accepted fixes ship
+in the next deck update and can appear on the
+<a href="/updates">community updates</a> page with credit.</p>
+
+<h2>Already have an older version?</h2>
+<p>Tools &rarr; Add-ons &rarr; select <b>Doctrine Editor</b> &rarr; Delete, then
+install the new file. Your settings and pending suggestions are unaffected.</p>
+
+{reviewer_block}
 <style>
 .install-box {{ margin:18px 0 26px; padding:18px 20px; border:1px solid var(--line);
   border-radius:8px; background:#fafaf7; }}
@@ -1631,7 +1639,8 @@ what's missing from the queue, what a reviewer would want to see.</p>
 .steps li {{ margin:6px 0; }}
 h2 {{ font-size:16px; margin-top:26px; }}
 </style>"""
-    return page("Install", body, "install")
+    return page("Install", body, "install", user,
+                auth.csrf_token(session_token, session_secret()) if session_token else "")
 
 
 # ---------------------------------------------------------------- outbox
