@@ -24,8 +24,12 @@ def is_doctrine_card(field_names, deck_name=None) -> bool:
     if field_names and ID_FIELD in field_names:
         return True
     if isinstance(deck_name, str):
+        # Their deck is "Doctorine v2"; the AnKing-typed notes inside it
+        # have no ID field, so the deck name is the gate for those. Match
+        # the top-level deck by prefix so a version suffix does not hide
+        # the button on 32,000 notes.
         top = deck_name.strip().split("::", 1)[0].strip().lower()
-        if top in (DECK_NAME, "doctorine"):
+        if top.startswith((DECK_NAME, "doctorine")):
             return True
     return False
 

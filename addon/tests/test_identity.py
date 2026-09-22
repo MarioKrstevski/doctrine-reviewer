@@ -23,6 +23,12 @@ class GateTest(unittest.TestCase):
         self.assertTrue(is_doctrine_card(ANKING, "Doctorine::Cardio"))
         self.assertFalse(is_doctrine_card(ANKING, "My Doctrine Notes"))
 
+    def test_the_real_deck_name_with_version_suffix_passes(self):
+        # 32,276 AnKing-typed notes live in a deck called "Doctorine v2".
+        self.assertTrue(is_doctrine_card(ANKING, "Doctorine v2"))
+        self.assertTrue(is_doctrine_card(ANKING, "Doctorine v2::Cardio"))
+        self.assertTrue(is_doctrine_card(ANKING, "doctrine 3"))
+
     def test_missing_inputs_are_handled(self):
         self.assertFalse(is_doctrine_card(None, None))
         self.assertFalse(is_doctrine_card([], ""))
