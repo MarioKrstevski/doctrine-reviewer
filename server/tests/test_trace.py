@@ -157,3 +157,22 @@ class TraceFormattingTest(unittest.TestCase):
             html = self._html(base, dict(TRACE, note_mod=1766286959))
         self.assertIn("2025-12-21", html)
         self.assertNotIn("1766286959", html)
+
+
+class TagChipLabelTest(unittest.TestCase):
+    def test_hierarchical_tags_keep_the_two_trailing_segments(self):
+        html = server.tag_chips(json.dumps([
+            "Doctorine::Yield::Step1::Gold",
+            "Doctorine::Shelf::Internal_Medicine::Silver",
+            "plain",
+        ]))
+        self.assertIn("Step1 · Gold", html)
+        self.assertIn("Internal_Medicine · Silver", html)
+        self.assertIn(">plain<", html)
+        # full path survives as the tooltip
+        self.assertIn('title="Doctorine::Yield::Step1::Gold"', html)
+
+    def test_the_brand_prefix_alone_is_not_a_useful_label(self):
+        html = server.tag_chips(json.dumps(["Doctorine::Gold"]))
+        self.assertIn(">Gold<", html)
+        self.assertNotIn("Doctorine · Gold", html)

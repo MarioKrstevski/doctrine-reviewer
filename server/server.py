@@ -280,7 +280,15 @@ def tag_chips(tags_json):
         tags = []
     if not tags:
         return ""
-    chips = "".join(f'<span class="chip" title="{esc(t)}">{esc(t.split("::")[-1])}</span>'
+    def label(t):
+        # "Doctorine::Yield::Step1::Gold" -> "Step1 · Gold". The last
+        # segment alone (Gold, Silver, Screening) loses the meaning of the
+        # deck's hierarchical tags; the brand prefix adds nothing.
+        parts = [x for x in t.split("::") if x]
+        if parts and parts[0].lower() in ("doctorine", "doctrine"):
+            parts = parts[1:]
+        return " · ".join(parts[-2:]) if parts else t
+    chips = "".join(f'<span class="chip" title="{esc(t)}">{esc(label(t))}</span>'
                     for t in tags)
     return f'<div class="chips">{chips}</div>'
 
