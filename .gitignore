@@ -19,3 +19,6 @@ __pycache__/
 .DS_Store
 .localdata/
 *_DEV.ankiaddon
+
+# add-on runtime state and logs (written by Anki at run time)
+addon/user_files/
