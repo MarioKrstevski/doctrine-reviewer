@@ -60,7 +60,7 @@ def deck_for_adds(col, preferred="Doctorine v2"):
     """Where new notes go: the student's Doctorine deck, else `preferred`."""
     for d in col.decks.all_names_and_ids():
         top = d.name.split("::", 1)[0].strip().lower()
-        if top.startswith(("doctorine", "doctrine")):
+        if top.startswith(("doctrin", "doctorin")):
             return d.id
     return col.decks.id(preferred)
 

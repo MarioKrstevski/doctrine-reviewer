@@ -33,7 +33,7 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.6.1"
+ADDON_VERSION = "1.6.2"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),

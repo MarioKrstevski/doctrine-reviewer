@@ -29,7 +29,8 @@ def is_doctrine_card(field_names, deck_name=None) -> bool:
         # the top-level deck by prefix so a version suffix does not hide
         # the button on 32,000 notes.
         top = deck_name.strip().split("::", 1)[0].strip().lower()
-        if top.startswith((DECK_NAME, "doctorine")):
+        # "Doctrine", "Doctorine" and "Doctrin" all appear in the wild.
+        if top.startswith(("doctrin", "doctorin")):
             return True
     return False
 

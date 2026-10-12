@@ -427,18 +427,9 @@ def proposal_block(r, master, csrf):
         return ('<div class="proposal"><div class="pane-label">Proposed change</div>'
                 '<p class="small">Identical to the current card.</p></div>')
     rows = "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
-    accept = ""
-    if r["status"] == "open" and master is not None:
-        accept = f"""
-<form method="post" action="/reviewer/action" class="inline">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="hidden" name="id" value="{r['id']}">
-  <button name="do" value="accept_proposal">Accept proposal</button>
-  <a class="btn-link" href="/edit/{r['id']}?from=proposal">Edit before accepting</a>
-</form>"""
     return (f'<div class="proposal"><div class="pane-label">Proposed change '
             f'<span class="small">(against current master)</span></div>'
-            f'<dl class="fields">{rows}</dl>{accept}</div>')
+            f'<dl class="fields">{rows}</dl></div>')
 
 
 def fields_pane(fields_json, label):
@@ -607,6 +598,11 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .diff del { background:#fde2e2; color:#8a1f1f; text-decoration:line-through; padding:0 2px; }
 .diff ins { background:#dcf5e4; color:#145a32; text-decoration:none; padding:0 2px; }
 .btn-link { margin-left:10px; font-size:13px; }
+.btn-link-primary { display:inline-block; padding:7px 14px; border-radius:6px; font-size:13px;
+  font-weight:500; text-decoration:none; color:var(--accent-ink); border:1px solid var(--accent-ink);
+  background:transparent; }
+.btn-link-primary:hover { background:var(--accent-soft); }
+.actions .hint { color:var(--faint); font-size:12.5px; flex:1 1 260px; }
 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
 .chip { font-size:11px; padding:2px 8px; border-radius:10px; background:#eef1ee;
   color:#3a4a40; border:1px solid #dfe5df; white-space:nowrap; }
@@ -868,19 +864,19 @@ def render_reviewer(user=None, secret=None, session_token=None):
                 expire_hint = ('<p class="stale-hint">The card already '
                                'changed — if the issue is gone, mark it '
                                'expired.</p>')
+            has_proposal = bool(r["proposed_fields_json"]) and master is not None
+            accept = (f'<button name="do" value="accept_proposal">Accept proposal</button>'
+                      if has_proposal else "")
+            edit_label = "Edit and accept" if not has_proposal else "Edit proposal, then accept"
             actions = f"""
 <div class="actions">{expire_hint}
 <form method="post" action="/reviewer/action">
   <input type="hidden" name="csrf" value="{csrf}">
   <input type="hidden" name="id" value="{r['id']}">
-  <input type="text" name="resolution_note" class="grow" placeholder="Internal note (optional)">
-  <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to updates</label>
-  <span class="pub-fields">
-    <input type="text" name="publish_summary" style="min-width:250px" placeholder="Public one-liner, e.g. 'Fixed dose on beta-blocker card'">
-    <input type="text" name="credit_name" placeholder="Credit as (e.g. Marko S.)">
-  </span>
+  <span class="hint">Accepting changes the card in the online deck and queues it for the next release.</span>
   <span class="btns">
-    <button name="do" value="resolve">Resolve</button>
+    {accept}
+    <a class="btn-link-primary" href="/edit/{r['id']}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
     <button name="do" value="decline" class="secondary">Decline</button>
     <button name="do" value="expire" class="ghost">Mark expired</button>
   </span>

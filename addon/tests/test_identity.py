@@ -28,6 +28,7 @@ class GateTest(unittest.TestCase):
         self.assertTrue(is_doctrine_card(ANKING, "Doctorine v2"))
         self.assertTrue(is_doctrine_card(ANKING, "Doctorine v2::Cardio"))
         self.assertTrue(is_doctrine_card(ANKING, "doctrine 3"))
+        self.assertTrue(is_doctrine_card(ANKING, "Doctrin v2"))
 
     def test_missing_inputs_are_handled(self):
         self.assertFalse(is_doctrine_card(None, None))
