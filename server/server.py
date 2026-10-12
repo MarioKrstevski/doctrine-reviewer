@@ -31,6 +31,7 @@ import socketserver
 import auth
 import email_out
 import releases
+import revisions
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
 
@@ -192,6 +193,18 @@ def init_db():
             changelog TEXT,
             created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS revisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guid TEXT NOT NULL,
+            field TEXT NOT NULL,          -- Text | Extra | added
+            before TEXT,
+            after TEXT,
+            user_id INTEGER,
+            source TEXT,                  -- suggestion:<id> | upload:<id> | staff
+            release TEXT,                 -- NULL while pending
+            created_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_revisions_release ON revisions(release);
         CREATE TABLE IF NOT EXISTS media (
             filename TEXT PRIMARY KEY,
             sha256 TEXT NOT NULL,
