@@ -198,3 +198,39 @@ class DownloadTest(unittest.TestCase):
             cookie, _ = self._published(base)
             status, _, _ = request(base, "POST", "/releases/token", {"days": "7", "csrf": csrf_for(cookie)}, cookie=cookie)
         self.assertEqual(403, status)
+
+
+class TokenPageTest(unittest.TestCase):
+    def test_links_are_shown_in_full_with_copy_and_revoke(self):
+        with running_server() as base:
+            cookie, rel = DownloadTest._published(self, base)
+            admin_cookie = staff(base, "admin")
+            _, _, html = request(base, "POST", "/releases/token", {"days": "7", "note": "buyer A", "csrf": csrf_for(admin_cookie)}, cookie=admin_cookie)
+            import re
+            tok = re.search(r"/dl/([A-Za-z0-9_-]{20,})", html).group(1)
+            self.assertIn(f"/dl/{tok}", html)
+            self.assertGreaterEqual(html.count("Copy"), 2, "copy on the new link and in the table")
+            status, _, _ = request(base, "POST", "/releases/token/revoke", {"token": tok, "csrf": csrf_for(admin_cookie)}, cookie=admin_cookie)
+            self.assertEqual(303, status)
+            self.assertEqual(404, request(base, "GET", f"/dl/{tok}")[0])
+
+
+class RebuildTest(unittest.TestCase):
+    def test_a_published_release_without_a_package_can_be_rebuilt(self):
+        with running_server() as base:
+            cookie, rel = DownloadTest._published(self, base)
+            os.remove(rel["package_path"])
+            with server.db() as conn:
+                conn.execute("UPDATE releases SET package_path=NULL WHERE version='1.1'")
+            _, _, html = request(base, "GET", "/releases", cookie=cookie)
+            self.assertIn("Rebuild package", html)
+            status, _, _ = request(base, "POST", "/releases/1.1/rebuild", {"csrf": csrf_for(cookie)}, cookie=cookie)
+            self.assertEqual(303, status)
+            for _ in range(100):
+                with server.db() as conn:
+                    r = dict(conn.execute("SELECT * FROM releases WHERE version='1.1'").fetchone())
+                if r["package_path"] and os.path.exists(r["package_path"]): break
+                time.sleep(0.1)
+            rebuilt = bool(r["package_path"]) and os.path.exists(r["package_path"])
+        self.assertTrue(rebuilt)
+        self.assertEqual("published", r["status"])

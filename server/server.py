@@ -591,6 +591,9 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
   background:#fff; }
 .outbox-col textarea.copyable { resize:vertical; }
 .copy-btn { margin-top:6px; }
+.copyrow { display:flex; gap:8px; align-items:center; }
+.copyrow input, .linkcell input { flex:1; min-width:0; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+.linkcell { display:flex; gap:6px; align-items:center; min-width:420px; }
 .badge.substantial { background:#e5edf7; color:#2a4a6f; }
 .badge.brief { background:#eee; color:#666; }
 .proposal { padding:10px 16px 12px; border-top:1px solid var(--line); background:#fbfbf8; }
@@ -1544,8 +1547,8 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
-        elif path in ("/releases/cut", "/releases/token", "/releases/confirm") or \
-                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard"))):
+        elif path in ("/releases/cut", "/releases/token", "/releases/token/revoke", "/releases/confirm") or \
+                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard") or path.endswith("/rebuild"))):
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
             if user is None:
@@ -1566,6 +1569,16 @@ class Handler(BaseHTTPRequestHandler):
             elif path.endswith("/discard"):
                 discard_release(path[len("/releases/"):-len("/discard")])
                 self._redirect("/releases/next")
+            elif path.endswith("/rebuild"):
+                start_rebuild(path[len("/releases/"):-len("/rebuild")], user["id"])
+                self._redirect("/releases")
+            elif path == "/releases/token/revoke":
+                if user["role"] != "admin":
+                    self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+                else:
+                    with db() as conn:
+                        conn.execute("DELETE FROM download_tokens WHERE token=?", (form.get("token", [""])[0],))
+                    self._redirect("/releases")
             elif path == "/releases/token":
                 if user["role"] != "admin":
                     self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
@@ -2605,6 +2618,31 @@ def _build_release(version):
                          (f"{e}\n{traceback.format_exc()}", version))
 
 
+def start_rebuild(version, user_id):
+    """Produce the package for an already-published release from its own
+    collection file. Does not change what is current."""
+    with db() as conn:
+        rel = conn.execute("SELECT status, collection_path FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None or rel["status"] != "published" or not rel["collection_path"]:
+            return False
+
+    def run():
+        try:
+            with db() as conn:
+                col_path = conn.execute("SELECT collection_path FROM releases WHERE version=?", (version,)).fetchone()["collection_path"]
+                media = [(r["filename"], releases.sha_path(r["sha256"]))
+                         for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")]
+            pkg_path = os.path.join(releases.release_dir(version), f"Doctorine-{version}.apkg")
+            release_build.write_apkg(pkg_path, col_path, [m for m in media if os.path.exists(m[1])])
+            with db() as conn:
+                conn.execute("UPDATE releases SET package_path=? WHERE version=?", (pkg_path, version))
+        except Exception as e:
+            with db() as conn:
+                conn.execute("UPDATE releases SET build_log=? WHERE version=?", (f"rebuild failed: {e!r}", version))
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
 def start_build(version, user_id):
     with db() as conn:
         rel = conn.execute("SELECT status FROM releases WHERE version=?", (version,)).fetchone()
@@ -2632,8 +2670,12 @@ def render_releases(user, csrf, notice=None, token_link=None):
         elif r["status"] == "building":
             act = '<span class="badge warn">Building…</span>'
         elif r["status"] == "published":
-            act = ('<span class="badge ok">Published</span>' +
-                   (f' <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>' if r.get("package_path") else ''))
+            if r.get("package_path") and os.path.exists(r["package_path"]):
+                act = f'<span class="badge ok">Published</span> <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>'
+            else:
+                act = (f'<span class="badge ok">Published</span> '
+                       f'<form method="post" action="/releases/{esc(r["version"])}/rebuild" class="inline">'
+                       f'<input type="hidden" name="csrf" value="{csrf}"><button class="ghost">Rebuild package</button></form>')
         log = f'<details class="trace"><summary>Build log</summary><pre>{esc(r["build_log"] or "")}</pre></details>' if r.get("build_log") else ""
         items.append(f"""
 <div class="card"><div class="card-head">
@@ -2642,17 +2684,24 @@ def render_releases(user, csrf, notice=None, token_link=None):
   <span class="row-actions">{act}</span>
   <time>{esc(r.get('published_at') or r['created_at'] or '')}</time>
 </div>
-<div class="proposal"><pre class="small" style="white-space:pre-wrap;margin:0">{esc(r['changelog'] or '')}</pre>{log}</div></div>""")
+{('<div class="proposal"><pre class="small" style="white-space:pre-wrap;margin:0">' + esc(r['changelog']) + '</pre>' + log + '</div>') if (r['changelog'] or log) else ''}</div>""")
     msg = f'<p class="notice">{esc(notice)}</p>' if notice else ""
     if token_link:
-        msg += (f'<div class="pw-reveal"><p><strong>Download link</strong></p><code>{esc(token_link)}</code>'
+        msg += (f'<div class="pw-reveal"><p><strong>New download link</strong></p>'
+                f'<div class="copyrow"><input type="text" readonly value="{esc(token_link)}" class="copyable">'
+                f'<button type="button" class="copy-btn ghost" data-copy="{esc(token_link)}">Copy</button></div>'
                 f'<p class="pw-note">Give this to the buyer. It serves the latest published release until it expires.</p></div>')
     cut = (f'<p><a class="btn-link-primary" href="/releases/next">Next release: {pending_n} note(s) waiting</a></p>'
            if pending_n else '<p class="small">Nothing is waiting for the next release.</p>')
     tok = ""
     if user["role"] == "admin":
-        rows_t = "".join(f'<tr><td><code>/dl/{esc(t["token"][:8])}…</code></td><td>{esc(t["note"] or "")}</td>'
-                         f'<td>{esc(t["expires_at"])}</td><td>{t["downloads"]}</td></tr>' for t in tokens)
+        rows_t = "".join(
+            f'<tr><td class="linkcell"><input type="text" readonly value="{esc(CFG.public_base_url)}/dl/{esc(t["token"])}" class="copyable">'
+            f'<button type="button" class="copy-btn ghost" data-copy="{esc(CFG.public_base_url)}/dl/{esc(t["token"])}">Copy</button></td>'
+            f'<td>{esc(t["note"] or "")}</td><td>{esc(t["expires_at"])}</td><td>{t["downloads"]}</td>'
+            f'<td><form method="post" action="/releases/token/revoke" class="inline"><input type="hidden" name="csrf" value="{csrf}">'
+            f'<input type="hidden" name="token" value="{esc(t["token"])}"><button class="ghost">Revoke</button></form></td></tr>'
+            for t in tokens)
         tok = f"""
 <h2>Download links for buyers</h2>
 <form method="post" action="/releases/token" class="create-form">
@@ -2661,11 +2710,19 @@ def render_releases(user, csrf, notice=None, token_link=None):
   <input type="text" name="days" value="7" style="width:70px"> days
   <button type="submit">Create link</button>
 </form>
-<table class="users"><thead><tr><th>Link</th><th>For</th><th>Expires</th><th>Downloads</th></tr></thead><tbody>{rows_t}</tbody></table>
-<p class="admin-note">Stripe can mint these automatically once a webhook secret is configured (route reserved: /api/purchases/stripe).</p>"""
-    body = (f'<h1>Releases</h1><p class="sub">Current release: <b>{esc(cur or "—")}</b>. Cutting a release stamps every '
-            f'pending change with the version; building patches the previous collection and writes the .apkg.</p>'
-            + msg + cut + "".join(items) + tok)
+<table class="users"><thead><tr><th>Link</th><th>For</th><th>Expires</th><th>Downloads</th><th></th></tr></thead><tbody>{rows_t}</tbody></table>
+<p class="admin-note">A link always serves the <em>current</em> published release. Stripe can mint these automatically once a webhook secret is configured.</p>
+<script>
+document.querySelectorAll('.copy-btn[data-copy]').forEach(function (b) {{
+  b.addEventListener('click', function () {{
+    navigator.clipboard.writeText(b.dataset.copy).then(function () {{ b.textContent = 'Copied'; setTimeout(function () {{ b.textContent = 'Copy'; }}, 1500); }});
+  }});
+}});
+</script>"""
+    body = (f'<h1>Releases</h1><p class="sub">Current release: <b>{esc(cur or "—")}</b>. A release is cut from '
+            f'<a href="/releases/next">Next release</a>, then built and published here in a separate, confirmed step.</p>'
+            + msg + cut + '<h2 style="margin-top:28px">All releases</h2>' + "".join(items)
+            + ('<hr style="border:0;border-top:1px solid var(--line);margin:34px 0 10px">' + tok if tok else ''))
     return page("Releases", body, "releases", user, csrf)
 
 
