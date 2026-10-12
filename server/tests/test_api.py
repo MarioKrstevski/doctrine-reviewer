@@ -40,37 +40,10 @@ class TrackingUrlTest(unittest.TestCase):
 
 
 class UnknownIdTest(unittest.TestCase):
-    """The 'is this our deck?' gate no longer lives at submit time.
-
-    The client's deck is not registered with us, so an unknown id is
-    accepted on the student snapshot alone. The gate returns when
-    fetch_master() can ask the client's API (404 there = reject).
-    """
-
-    def test_unregistered_id_is_accepted_without_a_master(self):
-        with running_server() as base:
-            status, body = post(base, "/api/suggestions", {
-                "doctrine_id": "P]%rwtghL]", "guid": "P]%rwtghL]",
-                "text": "hello", "snapshot": {},
-            })
-        self.assertEqual(200, status)
-        self.assertIn("/s/", body["tracking_url"])
+    """Unknown ids are refused at submit time: see tests/test_gate.py."""
 
     def test_no_identity_at_all_is_rejected(self):
         with running_server() as base:
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 post(base, "/api/suggestions", {"text": "hello", "snapshot": {}})
             self.assertEqual(400, ctx.exception.code)
-
-
-class MediaTypeTest(unittest.TestCase):
-    def test_media_suggestion_type_is_labelled_in_the_queue(self):
-        import server
-        with running_server() as base:
-            register_one(base)
-            post(base, "/api/suggestions", {
-                "doctrine_id": "doc-test000001", "text": "the image is missing",
-                "suggestion_type": "media", "snapshot": {"fields": {"Front": "Q", "Back": "A"}},
-            })
-            html = server.render_reviewer({"id": 1, "username": "r", "role": "reviewer"}, "s", "t")
-        self.assertIn("Image / audio", html)

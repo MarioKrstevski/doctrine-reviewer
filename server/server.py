@@ -182,6 +182,7 @@ def init_db():
             actioned_at TEXT,
             actioned_by INTEGER
         );
+        CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         CREATE INDEX IF NOT EXISTS idx_attempts_username
             ON login_attempts(username, attempted_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -189,7 +190,8 @@ def init_db():
 
         # suggestions predates several features in production, so columns
         # are added in place when missing rather than recreating the table.
-        _ensure_columns(conn, "notes", {"doctorine_id": "TEXT", "guid": "TEXT"})
+        _ensure_columns(conn, "notes", {"doctorine_id": "TEXT", "guid": "TEXT",
+                                        "retired": "INTEGER DEFAULT 0"})
         _ensure_columns(conn, "suggestions", {
             "resolved_by": "INTEGER",
             # identity, both halves: their id (may be empty) and Anki's guid
@@ -855,6 +857,39 @@ def render_status(token):
 
 # ---------------------------------------------------------------- api
 
+def is_official(guid) -> bool:
+    with db() as conn:
+        return conn.execute(
+            "SELECT 1 FROM notes WHERE doctrine_id=? AND retired=0", (guid,)
+        ).fetchone() is not None
+
+
+_official_cache = {"key": None, "body": b"", "etag": ""}
+
+
+def official_list():
+    """(etag, json bytes) for the current official guid set, cached in memory.
+
+    Rebuilt only when the set changes: the cache key is (row count, newest
+    updated_at, retired count), all cheap aggregates.
+    """
+    import hashlib as _h
+    with db() as conn:
+        key = tuple(conn.execute(
+            "SELECT COUNT(*), MAX(updated_at), SUM(retired) FROM notes").fetchone())
+        if key == _official_cache["key"]:
+            return _official_cache["etag"], _official_cache["body"]
+        guids = [r["doctrine_id"] for r in conn.execute(
+            "SELECT doctrine_id FROM notes WHERE retired=0 ORDER BY doctrine_id")]
+        release = conn.execute(
+            "SELECT value FROM settings WHERE key='current_release'").fetchone()
+    body = json.dumps({"release": release["value"] if release else "unreleased",
+                       "count": len(guids), "guids": guids}).encode("utf-8")
+    etag = '"' + _h.sha256(body).hexdigest()[:24] + '"'
+    _official_cache.update(key=key, body=body, etag=etag)
+    return etag, body
+
+
 def fetch_master(doctorine_id, guid):
     """The client's current copy of a card, or None.
 
@@ -881,8 +916,11 @@ def api_suggestion(data):
         return 400, {"error": "Suggestion text is required."}
     snap = data.get("snapshot") or {}
 
-    # A master is nice to have, not required: the client's deck is not
-    # registered with us, and their API is not exposed yet.
+    # Only official notes: a guid in the current release and not retired.
+    # Students' own notes, local copies (new guid) and other decks stop here.
+    if not is_official(doc_id):
+        return 404, {"error": "This card is not part of the Doctorine deck, "
+                              "so suggestions can't be sent for it."}
     fetch_master(doctorine_id or doc_id, guid)
 
     with db() as conn:
@@ -1112,7 +1150,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET(self):
         path = urlparse(self.path).path
-        if path == "/where":
+        if path == "/api/official":
+            etag, body = official_list()
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send(200, body, "application/json",
+                           {"ETag": etag, "Cache-Control": "public, max-age=300"})
+        elif path == "/where":
             self._send(
                 200,
                 json.dumps({

@@ -1,9 +1,8 @@
-"""Suggestions are accepted without a master on file.
+"""Identity halves are stored, and the reviewer copes with a vanished master.
 
-The client's deck is not registered with us and may never be; master
-copies will come from their API once it exists (fetch_master stub). Until
-then the student snapshot is the record, and the reviewer sees that
-explicitly instead of a 404 at submit time.
+Submission requires an official guid (tests/test_gate.py). The 'No master
+on file' state is defensive: it appears only if a note row disappears after
+a suggestion was filed, and must never crash the queue.
 """
 
 import json
@@ -33,9 +32,10 @@ def last():
         return dict(conn.execute("SELECT * FROM suggestions ORDER BY id DESC LIMIT 1").fetchone())
 
 
-class AcceptWithoutMasterTest(unittest.TestCase):
-    def test_unknown_id_is_accepted_and_tracked(self):
+class IdentityStorageTest(unittest.TestCase):
+    def test_official_guid_is_accepted_and_both_ids_stored(self):
         with running_server() as base:
+            register_note(base, GUID)
             status, body = suggest(base)
             row = last()
         self.assertEqual(200, status)
@@ -46,6 +46,7 @@ class AcceptWithoutMasterTest(unittest.TestCase):
 
     def test_filled_doctorine_id_is_the_filing_key(self):
         with running_server() as base:
+            register_note(base, "db-77")
             suggest(base, doctrine_id="db-77", doctorine_id="db-77")
             row = last()
         self.assertEqual("db-77", row["doctrine_id"])
@@ -70,6 +71,7 @@ class AcceptWithoutMasterTest(unittest.TestCase):
         server.fetch_master = lambda d, g: calls.append((d, g)) or None
         try:
             with running_server() as base:
+                register_note(base, "db-1")
                 suggest(base, doctrine_id="db-1", doctorine_id="db-1")
         finally:
             server.fetch_master = real
@@ -83,7 +85,10 @@ class ReviewerWithoutMasterTest(unittest.TestCase):
 
     def test_queue_says_no_master_on_file(self):
         with running_server() as base:
+            register_note(base, GUID)
             suggest(base)
+            with server.db() as conn:          # master vanishes after filing
+                conn.execute("DELETE FROM notes WHERE doctrine_id=?", (GUID,))
             html = self._html(base)
         self.assertIn("No master on file", html)
         self.assertNotIn("Card changed since", html)
@@ -99,7 +104,8 @@ class ReviewerWithoutMasterTest(unittest.TestCase):
 
     def test_guid_with_url_characters_is_escaped_in_html(self):
         with running_server() as base:
-            suggest(base, guid="a<b>&\"c", doctrine_id="a<b>&\"c")
+            register_note(base, 'a<b>&"c')
+            suggest(base, guid='a<b>&"c', doctrine_id='a<b>&"c')
             html = self._html(base)
         self.assertNotIn('a<b>&"c', html)
         self.assertIn("a&lt;b&gt;&amp;", html)
