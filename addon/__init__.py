@@ -30,10 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import addon_log, chunk_util, identity, payload, resolver, state
+from . import addon_log, chunk_util, identity, official, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.3"
+ADDON_VERSION = "1.4"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -259,6 +259,56 @@ class SentDialog(QDialog):
         tooltip("Link copied", period=1500)
 
 
+# ---------------------------------------------------------------- official set
+
+_official = {"value": None}
+
+
+def official_set():
+    """The cached official guid set, or None if never fetched."""
+    if _official["value"] is None:
+        _official["value"] = official.load(user_files_dir())
+    return _official["value"]
+
+
+def card_is_official(note, deck_name) -> bool:
+    """Button rule. With a cached list: guid must be in it. Without one
+    (first run, offline): fall back to the deck-name heuristic so the button
+    is not shown on every deck; the server still decides."""
+    cached = official_set()
+    if cached is not None:
+        return official.is_official(note.guid, cached.guids)
+    return identity.is_doctrine_card(list(note.keys()), deck_name)
+
+
+def fetch_official(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), b""
+
+
+def refresh_official_in_background(force=False):
+    def task():
+        cfg = get_config()
+        return official.refresh(user_files_dir(), api_base(cfg), fetch_official,
+                                now=time.time, force=force)
+
+    def done(fut):
+        try:
+            result = fut.result()
+        except Exception:
+            addon_log.exception("official refresh")
+            return
+        _official["value"] = result
+        if result:
+            _log.info("official set: release=%s guids=%d", result.release, len(result.guids))
+
+    mw.taskman.run_in_background(task, done)
+
+
 # ---------------------------------------------------------------- suggest flow
 
 @addon_log.guarded("open_suggestion_dialog")
@@ -273,9 +323,9 @@ def open_suggestion_dialog():
     field_names = list(note.keys())
     deck_name = mw.col.decks.name(card.did)
 
-    if not identity.is_doctrine_card(field_names, deck_name):
+    if not card_is_official(note, deck_name):
         showInfo(
-            "This card is not part of a supported deck, so suggestions "
+            "This card is not part of the Doctorine deck, so suggestions "
             "can't be sent for it."
         )
         return
@@ -393,15 +443,16 @@ def on_reviewer_did_show_question(card):
     note = card.note()
     field_names = list(note.keys())
     deck_name = mw.col.decks.name(card.did)
-    supported = identity.is_doctrine_card(field_names, deck_name)
+    supported = card_is_official(note, deck_name)
     if supported or not DEBUG_MODE:
         js = ("var b = document.getElementById('doctrine-suggest-btn');"
               "if (b) { b.style.display = '%s'; b.disabled = false; "
               "b.title = 'Suggest an edit to this card'; }"
               % ("block" if supported else "none"))
     else:
-        reason = ("no '%s' field on note type %s" %
-                  (identity.ID_FIELD, note.note_type()["name"]))
+        cached = official_set()
+        reason = ("guid not in official release %s" % cached.release if cached
+                  else "no official list cached; deck %r is not Doctorine" % deck_name)
         js = ("var b = document.getElementById('doctrine-suggest-btn');"
               "if (b) { b.style.display = 'block'; b.disabled = true; "
               "b.title = %s; }" % json.dumps("Not a Doctrine card: " + reason))
@@ -576,6 +627,14 @@ def diagnostics_text() -> str:
         ])
     _section(lines, "hooks", hooks)
 
+    def off():
+        cached = official_set()
+        if cached is None:
+            return "official set: not cached (button falls back to deck-name rule)"
+        return (f"official set: release={cached.release} guids={len(cached.guids)} "
+                f"fetched={time.strftime('%Y-%m-%d %H:%M', time.gmtime(cached.fetched_at))} UTC")
+    _section(lines, "official", off)
+
     def card():
         card = mw.reviewer.card if mw.reviewer else None
         if card is None:
@@ -591,7 +650,7 @@ def diagnostics_text() -> str:
                 f"  note type: {note.note_type()['name']!r}",
                 f"  fields: {names}",
                 f"  {identity.ID_FIELD!r} value: {doc!r}",
-                f"  supported: {identity.is_doctrine_card(names, deck)}"]
+                f"  official: {card_is_official(note, deck)}"]
     _section(lines, "card", card)
 
     lines.append("")
@@ -676,3 +735,4 @@ gui_hooks.webview_will_set_content.append(on_webview_will_set_content)
 gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.main_window_did_init.append(setup_menu)
+gui_hooks.profile_did_open.append(lambda: refresh_official_in_background())

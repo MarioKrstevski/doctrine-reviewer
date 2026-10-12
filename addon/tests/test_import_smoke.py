@@ -21,6 +21,8 @@ def _stub_anki():
     mw.addonManager.getConfig.return_value = {}
     aqt.mw = mw
     aqt.gui_hooks = mock.MagicMock()
+    aqt.gui_hooks.profile_did_open = []
+    aqt.gui_hooks.main_window_did_init = []
     qt = types.ModuleType("aqt.qt")
     for name in ("QApplication", "QDialog", "QVBoxLayout", "QHBoxLayout", "QLabel",
                  "QComboBox", "QTextEdit", "QLineEdit", "QPushButton",
