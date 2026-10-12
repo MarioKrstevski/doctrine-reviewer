@@ -1389,6 +1389,17 @@ class Handler(BaseHTTPRequestHandler):
                 with db() as conn:
                     files = [r["filename"] for r in conn.execute("SELECT filename FROM media")]
                 self._json(200, {"files": files})
+        elif path == "/api/sync/version":
+            with db() as conn:
+                cur = releases.current_release(conn)
+                row = conn.execute("SELECT published_at, note_count FROM releases WHERE version=?", (cur,)).fetchone() if cur else None
+            self._json(200, {"current": cur, "published_at": row["published_at"] if row else None,
+                             "note_count": row["note_count"] if row else None})
+        elif path == "/api/sync":
+            since = parse_qs(urlparse(self.path).query).get("since", [""])[0]
+            with db() as conn:
+                payload = sync_payload(conn, since)
+            self._json(200, payload)
         elif path == "/api/releases":
             with db() as conn:
                 self._json(200, {"current": releases.current_release(conn),
@@ -2481,6 +2492,72 @@ def latest_package(conn):
 def package_for_version(conn, version):
     r = conn.execute("SELECT version, package_path FROM releases WHERE version=? AND status='published'", (version,)).fetchone()
     return (r["version"], r["package_path"]) if r and r["package_path"] and os.path.exists(r["package_path"]) else (None, None)
+
+
+# ---------------------------------------------------------------- sync
+
+_MEDIA_REF = re.compile(r'(?:src=["\']|\[sound:)([^"\'\]]+)')
+
+
+def _release_order(conn):
+    return [r["version"] for r in conn.execute(
+        "SELECT version FROM releases WHERE status='published' ORDER BY published_at, created_at")]
+
+
+def sync_payload(conn, since):
+    """Changes a collection at release `since` needs to reach the current release.
+
+    Collapses multiple revisions of one field to its final value and reports
+    `before` (the field at `since`) so the add-on can tell a local edit from
+    an untouched card. Unknown `since` → everything after the first release.
+    """
+    order = _release_order(conn)
+    current = order[-1] if order else None
+    baseline_missing = since not in order
+    later = order[order.index(since) + 1:] if not baseline_missing else order[1:]
+    if not current or not later:
+        return {"from": since, "to": current, "changed": [], "added": [], "retired": [],
+                "media": [], "baseline_missing": baseline_missing}
+    marks = ",".join("?" * len(later))
+    revs = conn.execute(
+        f"SELECT * FROM revisions WHERE release IN ({marks}) ORDER BY id", later).fetchall()
+    added, retired, before = {}, [], {}
+    touched = set()
+    for r in revs:
+        if r["field"] == "added":
+            added[r["guid"]] = True
+        elif r["field"] == "retired":
+            retired.append(r["guid"])
+        elif r["field"] in revisions.EDITABLE_FIELDS:
+            touched.add(r["guid"])
+            before.setdefault(r["guid"], {}).setdefault(r["field"], r["before"])
+    changed, added_out, media = [], [], set()
+    for guid in sorted(touched - set(added) - set(retired)):
+        row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+        if row is None:
+            continue
+        fields = json.loads(row["fields_json"] or "{}")
+        now_fields = {f: fields.get(f, "") for f in revisions.EDITABLE_FIELDS}
+        b = {f: before[guid].get(f, now_fields[f]) for f in revisions.EDITABLE_FIELDS}
+        changed.append({"guid": guid, "fields": now_fields, "before": b})
+        for f in now_fields.values():
+            media.update(_MEDIA_REF.findall(f or ""))
+    for guid in added:
+        row = conn.execute("SELECT note_type, fields_json, tags_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+        if row is None:
+            continue
+        fields = json.loads(row["fields_json"] or "{}")
+        added_out.append({"guid": guid, "note_type": row["note_type"], "fields": fields,
+                          "tags": json.loads(row["tags_json"] or "[]")})
+        for f in fields.values():
+            media.update(_MEDIA_REF.findall(f or ""))
+    known = set()
+    if media:
+        m = ",".join("?" * len(media))
+        known = {r["filename"] for r in conn.execute(f"SELECT filename FROM media WHERE filename IN ({m})", sorted(media))}
+    return {"from": since, "to": current, "changed": changed, "added": added_out,
+            "retired": sorted(set(retired)), "media": sorted(known),
+            "baseline_missing": baseline_missing}
 
 
 # ---------------------------------------------------------------- outbox
