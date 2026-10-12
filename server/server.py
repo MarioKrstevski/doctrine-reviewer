@@ -24,6 +24,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 import hmac
+import threading
 import os
 import re
 import socketserver
@@ -31,6 +32,7 @@ import socketserver
 import auth
 import email_out
 import releases
+import release_build
 import reupload
 import revisions
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -217,6 +219,14 @@ def init_db():
             applied_at TEXT,
             applied_by INTEGER
         );
+        CREATE TABLE IF NOT EXISTS download_tokens (
+            token TEXT PRIMARY KEY,
+            note TEXT,
+            created_by INTEGER,
+            created_at TEXT,
+            expires_at TEXT,
+            downloads INTEGER DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS media (
             filename TEXT PRIMARY KEY,
             sha256 TEXT NOT NULL,
@@ -231,6 +241,9 @@ def init_db():
         # are added in place when missing rather than recreating the table.
         _ensure_columns(conn, "notes", {"doctorine_id": "TEXT", "guid": "TEXT",
                                         "retired": "INTEGER DEFAULT 0"})
+        _ensure_columns(conn, "releases", {"package_path": "TEXT", "build_log": "TEXT",
+                                           "published_at": "TEXT", "built_by": "INTEGER"})
+        _ensure_columns(conn, "suggestions", {"release": "TEXT"})
         _ensure_columns(conn, "suggestions", {
             "resolved_by": "INTEGER",
             # identity, both halves: their id (may be empty) and Anki's guid
@@ -663,6 +676,8 @@ label.chk { display:inline-flex; gap:7px; align-items:center;
 
 LEDGER_CSS = """
 .ledger { border-top:2px solid var(--ink); margin-top:10px; }
+.release-head { font-family:var(--serif); font-size:17px; font-weight:600; margin:22px 6px 4px;
+  color:var(--accent-ink); }
 .entry { display:grid; grid-template-columns:130px 1fr auto;
   gap:20px; padding:18px 6px; border-bottom:1px solid var(--line);
   align-items:baseline; }
@@ -708,6 +723,8 @@ def page(title, body, active="", user=None, csrf=""):
         outbox_link = f'<a href="/outbox"{cls}>Outbox{count}</a>'
         pcls = ' class="active"' if active == "pending" else ""
         outbox_link += f'<a href="/releases/pending"{pcls}>Pending</a>'
+        rcls = ' class="active"' if active == "releases" else ""
+        outbox_link += f'<a href="/releases"{rcls}>Releases</a>'
     account_link = nav_link("/account", "Account", "account") if user else ""
     signed_in = ""
     if user:
@@ -928,14 +945,26 @@ def render_updates():
     accepted = counts["accepted"] or 0
 
     if rows:
-        entries = "".join(f"""
+        def entry(r):
+            return f"""
 <div class="entry">
   <div class="stamp"><b>#{r['id']}</b>{esc((r['closed_at'] or '').split(' ')[0])}</div>
   <div class="what"><span class="kind">{esc(TYPE_LABELS.get(r['suggestion_type'], 'Fix'))}</span>
     {esc(r['publish_summary'] or r['text'][:120])}</div>
   <div class="credit">{('suggested by ' + esc(r['credit_name'])) if r['credit_name'] else 'community suggestion'}</div>
-</div>""" for r in rows)
-        ledger = f'<div class="ledger">{entries}</div>'
+</div>"""
+        rendered = [dict(r, html=entry(r)) for r in rows]
+        groups, order = {}, []
+        for r in rendered:
+            key = r["release"] or ""
+            if key not in groups:
+                groups[key] = []; order.append(key)
+            groups[key].append(r["html"])
+        parts = []
+        for key in order:
+            title = f"Release {esc(key)}" if key else "Accepted, in the next release"
+            parts.append(f'<h2 class="release-head">{title}</h2>' + "".join(groups[key]))
+        ledger = f'<div class="ledger">{"".join(parts)}</div>'
     else:
         ledger = ('<div class="ledger"><div class="empty">No published updates '
                   'yet — accepted suggestions will appear here.</div></div>')
@@ -1304,6 +1333,21 @@ class Handler(BaseHTTPRequestHandler):
         supplied = form.get("csrf", [""])[0]
         return bool(token) and auth.csrf_ok(supplied, token, session_secret())
 
+    def _send_file(self, path, filename, ctype="application/octet-stream"):
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "private, no-store")
+        self.end_headers()
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
     def _db_unavailable(self):
         body = page("Busy", "<h1>Busy</h1><p>The database is momentarily "
                             "locked by another request. Please retry.</p>")
@@ -1390,6 +1434,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/reviewer")
             else:
                 self._send(200, render_login())
+        elif path.startswith("/dl/"):
+            token = path[len("/dl/"):]
+            with db() as conn:
+                row = conn.execute("SELECT * FROM download_tokens WHERE token=?", (token,)).fetchone()
+                ok = row is not None and not auth.is_expired(
+                    datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc), auth.utcnow())
+                version, pkg = latest_package(conn) if ok else (None, None)
+                if pkg:
+                    conn.execute("UPDATE download_tokens SET downloads=downloads+1 WHERE token=?", (token,))
+            if not pkg:
+                self._send(404, page("Not found", "<h1>Link not valid</h1><p>This download link is "
+                                     "unknown, expired, or no release is published yet.</p>"))
+            else:
+                self._send_file(pkg, f"Doctorine-{version}.apkg")
+        elif path == "/releases" or path.startswith("/download/release/"):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            elif path == "/releases":
+                self._send(200, render_releases(user, auth.csrf_token(self._cookie_token(), session_secret())))
+            else:
+                want = path[len("/download/release/"):]
+                with db() as conn:
+                    version, pkg = latest_package(conn) if want == "latest" else package_for_version(conn, want)
+                if not pkg:
+                    self._send(404, page("Not found", "<h1>No package for that release</h1>"))
+                else:
+                    self._send_file(pkg, f"Doctorine-{version}.apkg")
         elif path.startswith("/uploads/"):
             user = self._current_user()
             if user is None:
@@ -1460,6 +1532,30 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
+        elif path in ("/releases/cut", "/releases/token") or (path.startswith("/releases/") and path.endswith("/build")):
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            elif path == "/releases/cut":
+                ok, message = cut_release(form.get("version", [""])[0], user["id"])
+                if ok:
+                    self._redirect("/releases")
+                else:
+                    self._send(200, render_releases(user, auth.csrf_token(self._cookie_token(), session_secret()), message))
+            elif path == "/releases/token":
+                if user["role"] != "admin":
+                    self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+                else:
+                    token = mint_download_token(form.get("note", [""])[0], form.get("days", ["7"])[0], user["id"])
+                    self._send(200, render_releases(user, auth.csrf_token(self._cookie_token(), session_secret()),
+                                                    token_link=f"{CFG.public_base_url}/dl/{token}"))
+            else:
+                version = path[len("/releases/"):-len("/build")]
+                start_build(version, user["id"])
+                self._redirect("/releases")
         elif path == "/api/reupload":
             if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
                 self._json(401, {"error": "Unauthorized."})
@@ -2202,6 +2298,189 @@ def apply_upload(upload_id, form, user_id):
         conn.execute("UPDATE uploads SET status='applied', applied_at=?, applied_by=? WHERE id=?",
                      (now(), user_id, up["id"]))
     return True
+
+
+# ---------------------------------------------------------------- releases
+
+def _previous_published(conn, before_version):
+    r = conn.execute(
+        "SELECT * FROM releases WHERE status='published' AND version != ? "
+        "ORDER BY published_at DESC, created_at DESC LIMIT 1", (before_version,)).fetchone()
+    return dict(r) if r else None
+
+
+def cut_release(version, user_id):
+    """Draft release from everything pending. Returns (ok, message)."""
+    version = (version or "").strip()
+    if not version or "/" in version or ".." in version:
+        return False, "Version is required (e.g. 1.1)."
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM releases WHERE version=?", (version,)).fetchone():
+            return False, f"Release {version} already exists."
+        groups = revisions.pending(conn)
+        if not groups:
+            return False, "Nothing is pending; there is no change to release."
+        lines = []
+        for g in groups:
+            kinds = sorted({r["field"] for r in g["revisions"]})
+            lines.append(f"{g['guid']}: {', '.join(kinds)}")
+        changelog = "\n".join(lines)
+        n = revisions.stamp_release(conn, version)
+        conn.execute("UPDATE suggestions SET release=? WHERE status='resolved' AND release IS NULL "
+                     "AND id IN (SELECT CAST(substr(source, 12) AS INTEGER) FROM revisions "
+                     "WHERE release=? AND source LIKE 'suggestion:%')", (version, version))
+        conn.execute(
+            "INSERT INTO releases (version, status, note_count, changelog, created_at, built_by) "
+            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0), ?, ?, ?)",
+            (version, changelog, now(), user_id))
+    return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
+
+
+def _build_release(version):
+    """Runs in a background thread. Patches the previous collection, writes
+    the package, publishes, and removes older package files."""
+    try:
+        with db() as conn:
+            rel = dict(conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone())
+            prev = _previous_published(conn, version)
+            if prev is None or not prev.get("collection_path"):
+                raise RuntimeError("no previous published release with a collection file")
+            revs = [dict(r) for r in conn.execute(
+                "SELECT * FROM revisions WHERE release=? ORDER BY id", (version,))]
+            changed_guids = {r["guid"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS}
+            added_guids = [r["guid"] for r in revs if r["field"] == "added"]
+            retired = [r["guid"] for r in revs if r["field"] == "retired"]
+            changed = {}
+            for guid in changed_guids - set(added_guids):
+                row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+                fields = json.loads(row["fields_json"]) if row else {}
+                changed[guid] = {f: fields.get(f, "") for f in revisions.EDITABLE_FIELDS if f in fields}
+            new_notes = []
+            for guid in added_guids:
+                row = conn.execute("SELECT note_type, fields_json, tags_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+                if row:
+                    new_notes.append({"guid": guid, "note_type": row["note_type"],
+                                      "fields": json.loads(row["fields_json"]),
+                                      "tags": json.loads(row["tags_json"] or "[]")})
+            media = [(r["filename"], releases.sha_path(r["sha256"]))
+                     for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")]
+
+        d = releases.release_dir(version)
+        os.makedirs(d, exist_ok=True)
+        col_path = os.path.join(d, "collection.sqlite")
+        counts = release_build.patch_collection(prev["collection_path"], col_path, changed, new_notes,
+                                                retired, now=int(datetime.now(timezone.utc).timestamp()))
+        pkg_path = os.path.join(d, f"Doctorine-{version}.apkg")
+        info = release_build.write_apkg(pkg_path, col_path, [m for m in media if os.path.exists(m[1])])
+
+        with db() as conn:
+            conn.execute(
+                "UPDATE releases SET status='published', collection_path=?, package_path=?, "
+                "published_at=?, build_log=? WHERE version=?",
+                (col_path, pkg_path, now(), json.dumps({"patch": counts, "package": info}), version))
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('current_release', ?)", (version,))
+            # Keep only the newest package on disk; collections stay per version.
+            for r in conn.execute("SELECT version, package_path FROM releases WHERE version != ? "
+                                  "AND package_path IS NOT NULL", (version,)).fetchall():
+                try:
+                    if r["package_path"] and os.path.exists(r["package_path"]):
+                        os.remove(r["package_path"])
+                except OSError:
+                    pass
+                conn.execute("UPDATE releases SET package_path=NULL WHERE version=?", (r["version"],))
+        _official_cache["key"] = None
+    except Exception as e:  # recorded, never raised into the thread
+        import traceback
+        with db() as conn:
+            conn.execute("UPDATE releases SET status='failed', build_log=? WHERE version=?",
+                         (f"{e}\n{traceback.format_exc()}", version))
+
+
+def start_build(version, user_id):
+    with db() as conn:
+        rel = conn.execute("SELECT status FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None or rel["status"] not in ("draft", "failed"):
+            return False
+        conn.execute("UPDATE releases SET status='building', built_by=? WHERE version=?", (user_id, version))
+    threading.Thread(target=_build_release, args=(version,), daemon=True).start()
+    return True
+
+
+def render_releases(user, csrf, notice=None, token_link=None):
+    with db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM releases ORDER BY created_at DESC")]
+        cur = releases.current_release(conn)
+        pending_n = len(revisions.pending(conn))
+        tokens = [dict(r) for r in conn.execute(
+            "SELECT * FROM download_tokens ORDER BY created_at DESC LIMIT 20")] if user["role"] == "admin" else []
+    items = []
+    for r in rows:
+        act = ""
+        if r["status"] in ("draft", "failed"):
+            act = (f'<form method="post" action="/releases/{esc(r["version"])}/build" class="inline">'
+                   f'<input type="hidden" name="csrf" value="{csrf}"><button>Build and publish</button></form>')
+        elif r["status"] == "building":
+            act = '<span class="badge warn">Building…</span>'
+        elif r["status"] == "published":
+            act = ('<span class="badge ok">Published</span>' +
+                   (f' <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>' if r.get("package_path") else ''))
+        log = f'<details class="trace"><summary>Build log</summary><pre>{esc(r["build_log"] or "")}</pre></details>' if r.get("build_log") else ""
+        items.append(f"""
+<div class="card"><div class="card-head">
+  <span class="meta"><b>Release {esc(r['version'])}</b> &middot; {esc(r['status'])} &middot; {r['note_count'] or 0} notes
+  {"&middot; current" if r['version'] == cur else ""}</span>
+  <span class="row-actions">{act}</span>
+  <time>{esc(r.get('published_at') or r['created_at'] or '')}</time>
+</div>
+<div class="proposal"><pre class="small" style="white-space:pre-wrap;margin:0">{esc(r['changelog'] or '')}</pre>{log}</div></div>""")
+    msg = f'<p class="notice">{esc(notice)}</p>' if notice else ""
+    if token_link:
+        msg += (f'<div class="pw-reveal"><p><strong>Download link</strong></p><code>{esc(token_link)}</code>'
+                f'<p class="pw-note">Give this to the buyer. It serves the latest published release until it expires.</p></div>')
+    cut = f"""
+<form method="post" action="/releases/cut" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="text" name="version" placeholder="New version, e.g. 1.1" required>
+  <button type="submit" {"disabled" if not pending_n else ""}>Cut release from {pending_n} pending note(s)</button>
+</form>"""
+    tok = ""
+    if user["role"] == "admin":
+        rows_t = "".join(f'<tr><td><code>/dl/{esc(t["token"][:8])}…</code></td><td>{esc(t["note"] or "")}</td>'
+                         f'<td>{esc(t["expires_at"])}</td><td>{t["downloads"]}</td></tr>' for t in tokens)
+        tok = f"""
+<h2>Download links for buyers</h2>
+<form method="post" action="/releases/token" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="text" name="note" placeholder="Who is this for (optional)">
+  <input type="text" name="days" value="7" style="width:70px"> days
+  <button type="submit">Create link</button>
+</form>
+<table class="users"><thead><tr><th>Link</th><th>For</th><th>Expires</th><th>Downloads</th></tr></thead><tbody>{rows_t}</tbody></table>
+<p class="admin-note">Stripe can mint these automatically once a webhook secret is configured (route reserved: /api/purchases/stripe).</p>"""
+    body = (f'<h1>Releases</h1><p class="sub">Current release: <b>{esc(cur or "—")}</b>. Cutting a release stamps every '
+            f'pending change with the version; building patches the previous collection and writes the .apkg.</p>'
+            + msg + cut + "".join(items) + tok)
+    return page("Releases", body, "releases", user, csrf)
+
+
+def mint_download_token(note, days, user_id):
+    token = auth.new_token()
+    expires = (datetime.now(timezone.utc) + __import__("datetime").timedelta(days=max(1, min(int(days or 7), 90))))
+    with db() as conn:
+        conn.execute("INSERT INTO download_tokens (token, note, created_by, created_at, expires_at) VALUES (?,?,?,?,?)",
+                     (token, (note or "").strip(), user_id, now(), expires.strftime("%Y-%m-%d %H:%M UTC")))
+    return token
+
+
+def latest_package(conn):
+    r = conn.execute("SELECT version, package_path FROM releases WHERE status='published' AND package_path IS NOT NULL "
+                     "ORDER BY published_at DESC LIMIT 1").fetchone()
+    return (r["version"], r["package_path"]) if r and os.path.exists(r["package_path"]) else (None, None)
+
+
+def package_for_version(conn, version):
+    r = conn.execute("SELECT version, package_path FROM releases WHERE version=? AND status='published'", (version,)).fetchone()
+    return (r["version"], r["package_path"]) if r and r["package_path"] and os.path.exists(r["package_path"]) else (None, None)
 
 
 # ---------------------------------------------------------------- outbox
