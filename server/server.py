@@ -235,6 +235,8 @@ def init_db():
             "install_id": "TEXT",
             "addon_version": "TEXT",
             "anki_version": "TEXT",
+            # P3+: the student's proposed exact change (editable fields only)
+            "proposed_fields_json": "TEXT",
         })
 
         # Master copies were once stored as rendered card HTML plus a per-row
@@ -356,6 +358,62 @@ def trace_block(r):
         return ""
     return (f'<details class="trace"><summary>Trace</summary>'
             f'<dl>{rows}</dl></details>')
+
+
+def _words(text):
+    return re.findall(r"\s+|<[^>]+>|\{\{c\d+::|\}\}|[^\s<{}]+|[{}]", text or "")
+
+
+def diff_words(before, after):
+    """Word-level HTML diff with <ins>/<del>, everything escaped."""
+    import difflib
+    a, b = _words(before), _words(after)
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            out.append(esc("".join(a[i1:i2])))
+        if op in ("replace", "delete"):
+            out.append("<del>" + esc("".join(a[i1:i2])) + "</del>")
+        if op in ("replace", "insert"):
+            out.append("<ins>" + esc("".join(b[j1:j2])) + "</ins>")
+    return "".join(out)
+
+
+def diff_fields(current, proposed):
+    """[(field, html_diff)] for proposed fields that differ from current."""
+    out = []
+    for name in revisions.EDITABLE_FIELDS:
+        if name in proposed and proposed[name] != (current or {}).get(name, ""):
+            out.append((name, diff_words((current or {}).get(name, ""), proposed[name])))
+    return out
+
+
+def proposal_block(r, master, csrf):
+    """The student's proposed change as a diff against the current master."""
+    if not r["proposed_fields_json"]:
+        return ""
+    try:
+        proposed = json.loads(r["proposed_fields_json"])
+    except ValueError:
+        return ""
+    current = json.loads(master["fields_json"]) if master is not None else {}
+    diffs = diff_fields(current, proposed)
+    if not diffs:
+        return ('<div class="proposal"><div class="pane-label">Proposed change</div>'
+                '<p class="small">Identical to the current card.</p></div>')
+    rows = "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
+    accept = ""
+    if r["status"] == "open" and master is not None:
+        accept = f"""
+<form method="post" action="/reviewer/action" class="inline">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="hidden" name="id" value="{r['id']}">
+  <button name="do" value="accept_proposal">Accept proposal</button>
+  <a class="btn-link" href="/edit/{r['id']}?from=proposal">Edit before accepting</a>
+</form>"""
+    return (f'<div class="proposal"><div class="pane-label">Proposed change '
+            f'<span class="small">(against current master)</span></div>'
+            f'<dl class="fields">{rows}</dl>{accept}</div>')
 
 
 def fields_pane(fields_json, label):
@@ -519,6 +577,11 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .copy-btn { margin-top:6px; }
 .badge.substantial { background:#e5edf7; color:#2a4a6f; }
 .badge.brief { background:#eee; color:#666; }
+.proposal { padding:10px 16px 12px; border-top:1px solid var(--line); background:#fbfbf8; }
+.proposal .fields { padding:8px 0 0; height:auto; max-height:260px; }
+.diff del { background:#fde2e2; color:#8a1f1f; text-decoration:line-through; padding:0 2px; }
+.diff ins { background:#dcf5e4; color:#145a32; text-decoration:none; padding:0 2px; }
+.btn-link { margin-left:10px; font-size:13px; }
 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
 .chip { font-size:11px; padding:2px 8px; border-radius:10px; background:#eef1ee;
   color:#3a4a40; border:1px solid #dfe5df; white-space:nowrap; }
@@ -813,6 +876,7 @@ def render_reviewer(user=None, secret=None, session_token=None):
   </div>
   {tag_chips(r["tags_json"])}
   <div class="panes">{snapshot_pane}{master_pane}{sugg_pane}</div>
+  {proposal_block(r, master, csrf)}
   {trace_block(r)}
   {actions}
 </div>""")
@@ -966,6 +1030,13 @@ def api_suggestion(data):
 
         token = uuid.uuid4().hex[:16]
         tags = data.get("tags")
+        proposed = data.get("proposed_fields")
+        if isinstance(proposed, dict):
+            proposed = {k: v for k, v in proposed.items()
+                        if k in revisions.EDITABLE_FIELDS and isinstance(v, str)}
+            proposed_json = json.dumps(proposed) if proposed else None
+        else:
+            proposed_json = None
         conn.execute(
             """INSERT INTO suggestions
                (token, doctrine_id, anki_note_id, note_type, deck,
@@ -974,8 +1045,8 @@ def api_suggestion(data):
                 snap_hash, created_at,
                 tags_json, note_mod, card_id, card_ord, template_name,
                 deck_id, original_deck_id, install_id, addon_version,
-                anki_version, doctorine_id, guid)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?)""",
+                anki_version, doctorine_id, guid, proposed_fields_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?,?,?,?,?,?, ?,?,?)""",
             (token, doc_id, data.get("anki_note_id"),
              data.get("note_type"), data.get("deck"),
              data.get("suggestion_type", "other"), text, data.get("email"),
@@ -987,7 +1058,7 @@ def api_suggestion(data):
              data.get("template_name"), data.get("deck_id"),
              data.get("original_deck_id") or None, data.get("install_id"),
              data.get("addon_version"), data.get("anki_version"),
-             doctorine_id, guid),
+             doctorine_id, guid, proposed_json),
         )
     return 200, {"ok": True,
                  "tracking_url": f"{CFG.public_base_url}/s/{token}"}
