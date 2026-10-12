@@ -724,6 +724,8 @@ def page(title, body, active="", user=None, csrf=""):
         outbox_link += f'<a href="/releases/next"{pcls}>Next release</a>'
         rcls = ' class="active"' if active == "releases" else ""
         outbox_link += f'<a href="/releases"{rcls}>Releases</a>'
+        ccls = ' class="active"' if active == "cards" else ""
+        outbox_link += f'<a href="/cards"{ccls}>Cards</a>'
     account_link = nav_link("/account", "Account", "account") if user else ""
     signed_in = ""
     if user:
@@ -1481,6 +1483,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
         elif path == "/releases/pending":
             self._redirect("/releases/next")
+        elif path in ("/cards", "/cards/edit"):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                qs = parse_qs(urlparse(self.path).query)
+                if path == "/cards":
+                    self._send(200, render_cards(user, csrf, qs.get("q", [""])[0]))
+                else:
+                    html = render_card_edit(user, csrf, qs.get("guid", [""])[0])
+                    if html is None:
+                        self._send(404, page("Not found", "<h1>No such card</h1>", "cards", user, csrf))
+                    else:
+                        self._send(200, html)
         elif path.startswith("/edit/") or path in ("/notes/new", "/releases/next") or \
                 (path.startswith("/releases/") and path.endswith("/confirm")):
             user = self._current_user()
@@ -1718,6 +1735,24 @@ class Handler(BaseHTTPRequestHandler):
                         user,
                         auth.csrf_token(self._cookie_token(), session_secret()),
                         error=message))
+        elif path == "/cards/edit":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            guid = parse_qs(urlparse(self.path).query).get("guid", [""])[0]
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            else:
+                values = {f: form.get(f, [""])[0] for f in revisions.EDITABLE_FIELDS if f in form}
+                try:
+                    with db() as conn:
+                        revisions.apply_edit(conn, guid, values, user["id"], "staff")
+                    self._redirect("/releases/next")
+                except (ValueError, LookupError) as e:
+                    csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                    html = render_card_edit(user, csrf, guid, str(e))
+                    self._send(200 if html else 404, html or page("Not found", "<h1>No such card</h1>"))
         elif path.startswith("/edit/") or path == "/notes/new":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
@@ -2810,6 +2845,83 @@ def sync_payload(conn, since):
     return {"from": since, "to": current, "changed": changed, "added": added_out,
             "retired": sorted(set(retired)), "media": sorted(known),
             "baseline_missing": baseline_missing}
+
+
+# ---------------------------------------------------------------- cards (direct edit)
+
+CARDS_LIMIT = 50
+
+
+def search_cards(conn, q):
+    q = (q or "").strip()
+    if not q:
+        return []
+    exact = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (q,)).fetchone()
+    if exact:
+        return [exact]
+    if q.isdigit():
+        rows = conn.execute("SELECT * FROM notes WHERE anki_note_id=? AND retired=0", (int(q),)).fetchall()
+        if rows:
+            return rows
+    like = f"%{q}%"
+    return conn.execute(
+        "SELECT * FROM notes WHERE retired=0 AND fields_json LIKE ? ORDER BY doctrine_id LIMIT ?",
+        (like, CARDS_LIMIT + 1)).fetchall()
+
+
+def render_cards(user, csrf, q):
+    with db() as conn:
+        rows = search_cards(conn, q)
+    capped = len(rows) > CARDS_LIMIT
+    rows = rows[:CARDS_LIMIT]
+    items = []
+    for r in rows:
+        fields = json.loads(r["fields_json"] or "{}")
+        text = re.sub(r"<[^>]+>", "", fields.get("Text", ""))[:160]
+        extra = re.sub(r"<[^>]+>", "", fields.get("Extra", ""))[:120]
+        items.append(f"""
+<div class="card"><div class="card-head">
+  <span class="meta"><code>{esc(r['doctrine_id'])}</code> &middot; nid {r['anki_note_id'] or '—'} &middot; v{r['version']}</span>
+  <span class="row-actions"><a class="btn-link-primary" href="/cards/edit?guid={quote(r['doctrine_id'], safe='')}">Edit</a></span>
+</div><div class="proposal"><p style="margin:0 0 4px"><b>{esc(text)}</b></p>
+<p class="small" style="margin:0">{esc(extra)}</p>{tag_chips(r['tags_json'])}</div></div>""")
+    note = ""
+    if capped:
+        note = f'<p class="small">Showing the first {CARDS_LIMIT} matches; narrow the search.</p>'
+    elif q and not rows:
+        note = '<p class="small">No official card matches.</p>'
+    body = f"""
+<h1>Cards</h1>
+<p class="sub">Find any card in the online deck and edit it directly. Edits go to Next release like accepted suggestions.</p>
+<form method="get" action="/cards" class="create-form">
+  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, or paste a note id / guid" style="min-width:360px" autofocus>
+  <button type="submit">Search</button>
+</form>
+{note}{''.join(items)}"""
+    return page("Cards", body, "cards", user, csrf)
+
+
+def render_card_edit(user, csrf, guid, error=None):
+    with db() as conn:
+        master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+    if master is None:
+        return None
+    values = json.loads(master["fields_json"] or "{}")
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    tags = tag_chips(master["tags_json"])
+    body = f"""
+<h1>Edit card</h1>
+<p class="sub"><code>{esc(guid)}</code> &middot; {esc(master['note_type'])} &middot; v{master['version']}.
+Saving changes the card in the online deck and queues it for the next release.</p>
+{tags}{msg}
+<div class="ed-grid">
+  <div class="ed-left">
+    <div class="pane-label">Current card</div>
+    {fields_pane(master['fields_json'], 'Current master')}
+  </div>
+  <div>{editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save")}</div>
+</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
+    return page("Edit card", body, "cards", user, csrf)
 
 
 # ---------------------------------------------------------------- outbox
