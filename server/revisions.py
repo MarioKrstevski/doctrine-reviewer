@@ -105,3 +105,61 @@ def pending(conn):
 def stamp_release(conn, version):
     """Mark every pending revision as shipped in `version`. Returns the count."""
     return conn.execute("UPDATE revisions SET release=? WHERE release IS NULL", (version,)).rowcount
+
+
+KIND_LABELS = {
+    "typo": "Typo / spelling",
+    "incorrect": "Incorrect information",
+    "confusing": "Confusing / unclear",
+    "media": "Image / audio",
+    "other": "Other suggestions",
+    "staff": "Direct edits",
+    "upload": "Re-upload",
+    "added": "New notes",
+    "retired": "Retired notes",
+}
+KIND_ORDER = ["incorrect", "typo", "confusing", "media", "other", "staff", "upload", "added", "retired"]
+
+
+def kind_of(conn, rev):
+    """Group key for a revision, derived from its source."""
+    if rev["field"] in ("added", "retired"):
+        return rev["field"]
+    src = rev["source"] or ""
+    if src.startswith("suggestion:"):
+        row = conn.execute("SELECT suggestion_type FROM suggestions WHERE id=?",
+                           (src.split(":", 1)[1],)).fetchone()
+        return (row["suggestion_type"] if row and row["suggestion_type"] in KIND_LABELS else "other")
+    if src.startswith("upload:"):
+        return "upload"
+    return "staff"
+
+
+def pending_by_kind(conn, only_guids=None):
+    """[{kind, label, notes: [{guid, revisions, sources, users}]}] in KIND_ORDER."""
+    groups = {}
+    for g in pending(conn):
+        if only_guids is not None and g["guid"] not in only_guids:
+            continue
+        kinds = [kind_of(conn, rv) for rv in g["revisions"]]
+        # a note touched by several sources is filed under its first revision's kind
+        kind = kinds[0]
+        entry = groups.setdefault(kind, {"kind": kind, "label": KIND_LABELS.get(kind, kind), "notes": []})
+        entry["notes"].append({"guid": g["guid"], "revisions": g["revisions"],
+                               "sources": sorted({rv["source"] or "" for rv in g["revisions"]}),
+                               "users": sorted({rv["username"] or "?" for rv in g["revisions"]})})
+    return [groups[k] for k in KIND_ORDER if k in groups] + [v for k, v in groups.items() if k not in KIND_ORDER]
+
+
+def stamp_guids(conn, version, guids):
+    """Stamp pending revisions of these notes only. Returns the count."""
+    if not guids:
+        return 0
+    marks = ",".join("?" * len(guids))
+    return conn.execute(
+        f"UPDATE revisions SET release=? WHERE release IS NULL AND guid IN ({marks})",
+        [version, *guids]).rowcount
+
+
+def unstamp(conn, version):
+    return conn.execute("UPDATE revisions SET release=NULL WHERE release=?", (version,)).rowcount

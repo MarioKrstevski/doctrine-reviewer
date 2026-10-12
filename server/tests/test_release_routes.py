@@ -45,7 +45,7 @@ class CutTest(unittest.TestCase):
                 revisions.apply_edit(conn, "guidAAAAAA", {"Text": "new"}, 1, "staff")
             cookie = staff(base)
             status, headers, _ = request(base, "POST", "/releases/cut",
-                                         {"version": "1.1", "csrf": csrf_for(cookie)}, cookie=cookie)
+                                         {"version": "1.1", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
             with server.db() as conn:
                 rel = dict(conn.execute("SELECT * FROM releases WHERE version='1.1'").fetchone())
                 stamped = conn.execute("SELECT COUNT(*) FROM revisions WHERE release='1.1'").fetchone()[0]
@@ -60,7 +60,7 @@ class CutTest(unittest.TestCase):
         with running_server() as base:
             seed_baseline()
             cookie = staff(base)
-            status, _, html = request(base, "POST", "/releases/cut", {"version": "1.1", "csrf": csrf_for(cookie)}, cookie=cookie)
+            status, _, html = request(base, "POST", "/releases/cut", {"version": "1.1", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
             with server.db() as conn:
                 n = conn.execute("SELECT COUNT(*) FROM releases WHERE version='1.1'").fetchone()[0]
         self.assertEqual(0, n)
@@ -69,7 +69,7 @@ class CutTest(unittest.TestCase):
         with running_server() as base:
             seed_baseline()
             cookie = staff(base)
-            status, _, html = request(base, "POST", "/releases/cut", {"version": "1.0", "csrf": csrf_for(cookie)}, cookie=cookie)
+            status, _, html = request(base, "POST", "/releases/cut", {"version": "1.0", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
         self.assertEqual(200, status)
         self.assertIn("already exists", html)
 
@@ -86,13 +86,13 @@ class BuildTest(unittest.TestCase):
             revisions.apply_edit(conn, "guidAAAAAA", {"Text": "<b>p53</b> NEW", "Extra": "e"}, 1, "staff")
             releases.store_media(conn, "pic.png", b"\x89PNG" + b"\x00" * 10)
         cookie = staff(base)
-        request(base, "POST", "/releases/cut", {"version": "1.1", "csrf": csrf_for(cookie)}, cookie=cookie)
+        request(base, "POST", "/releases/cut", {"version": "1.1", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
         return cookie
 
     def test_build_publishes_and_writes_a_valid_package(self):
         with running_server() as base:
             cookie = self._cut(base)
-            status, _, _ = request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie)}, cookie=cookie)
+            status, _, _ = request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
             self.assertEqual(303, status)
             for _ in range(100):
                 with server.db() as conn:
@@ -118,7 +118,7 @@ class BuildTest(unittest.TestCase):
     def test_a_second_publish_removes_the_older_package_file(self):
         with running_server() as base:
             cookie = self._cut(base)
-            request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie)}, cookie=cookie)
+            request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
             for _ in range(100):
                 with server.db() as conn:
                     r11 = dict(conn.execute("SELECT * FROM releases WHERE version='1.1'").fetchone())
@@ -126,8 +126,8 @@ class BuildTest(unittest.TestCase):
                 time.sleep(0.1)
             with server.db() as conn:
                 revisions.apply_edit(conn, "guidAAAAAA", {"Text": "again"}, 1, "staff")
-            request(base, "POST", "/releases/cut", {"version": "1.2", "csrf": csrf_for(cookie)}, cookie=cookie)
-            request(base, "POST", "/releases/1.2/build", {"csrf": csrf_for(cookie)}, cookie=cookie)
+            request(base, "POST", "/releases/cut", {"version": "1.2", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
+            request(base, "POST", "/releases/1.2/build", {"csrf": csrf_for(cookie), "confirm": "1.2"}, cookie=cookie)
             for _ in range(100):
                 with server.db() as conn:
                     r12 = dict(conn.execute("SELECT * FROM releases WHERE version='1.2'").fetchone())
@@ -154,7 +154,7 @@ class BuildTest(unittest.TestCase):
 class DownloadTest(unittest.TestCase):
     def _published(self, base):
         cookie = BuildTest._cut(self, base)
-        request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie)}, cookie=cookie)
+        request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
         for _ in range(100):
             with server.db() as conn:
                 rel = dict(conn.execute("SELECT * FROM releases WHERE version='1.1'").fetchone())

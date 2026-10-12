@@ -166,7 +166,7 @@ class PendingPageTest(unittest.TestCase):
             _, cookie = login(base, user, pw)
             with server.db() as conn:
                 revisions.apply_edit(conn, GUID, {"Text": "changed"}, 1, "staff")
-            status, _, html = request(base, "GET", "/releases/pending", cookie=cookie)
+            status, _, html = request(base, "GET", "/releases/next", cookie=cookie)
         self.assertEqual(200, status)
         self.assertIn(GUID.replace("%", "%"), html.replace("&amp;", "&"))
         self.assertIn("<del>", html)
@@ -174,4 +174,4 @@ class PendingPageTest(unittest.TestCase):
 
     def test_requires_login(self):
         with running_server() as base:
-            self.assertEqual(303, request(base, "GET", "/releases/pending")[0])
+            self.assertEqual(303, request(base, "GET", "/releases/next")[0])

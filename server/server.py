@@ -718,7 +718,7 @@ def page(title, body, active="", user=None, csrf=""):
         cls = ' class="active"' if active == "outbox" else ""
         outbox_link = f'<a href="/outbox"{cls}>Outbox{count}</a>'
         pcls = ' class="active"' if active == "pending" else ""
-        outbox_link += f'<a href="/releases/pending"{pcls}>Pending</a>'
+        outbox_link += f'<a href="/releases/next"{pcls}>Next release</a>'
         rcls = ' class="active"' if active == "releases" else ""
         outbox_link += f'<a href="/releases"{rcls}>Releases</a>'
     account_link = nav_link("/account", "Account", "account") if user else ""
@@ -1476,7 +1476,10 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 csrf = auth.csrf_token(self._cookie_token(), session_secret())
                 self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
-        elif path.startswith("/edit/") or path in ("/notes/new", "/releases/pending"):
+        elif path == "/releases/pending":
+            self._redirect("/releases/next")
+        elif path.startswith("/edit/") or path in ("/notes/new", "/releases/next") or \
+                (path.startswith("/releases/") and path.endswith("/confirm")):
             user = self._current_user()
             if user is None:
                 self._redirect("/login")
@@ -1484,8 +1487,10 @@ class Handler(BaseHTTPRequestHandler):
                 csrf = auth.csrf_token(self._cookie_token(), session_secret())
                 if path == "/notes/new":
                     self._send(200, render_new_note(user, csrf))
-                elif path == "/releases/pending":
-                    self._send(200, render_pending(user, csrf))
+                elif path == "/releases/next":
+                    self._send(200, render_next_release(user, csrf))
+                elif path.endswith("/confirm"):
+                    self._send(200, render_build_confirm(user, csrf, path[len("/releases/"):-len("/confirm")]))
                 else:
                     qs = parse_qs(urlparse(self.path).query)
                     self._send(200, render_edit(user, csrf, path[len("/edit/"):],
@@ -1539,19 +1544,28 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
-        elif path in ("/releases/cut", "/releases/token") or (path.startswith("/releases/") and path.endswith("/build")):
+        elif path in ("/releases/cut", "/releases/token", "/releases/confirm") or \
+                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard"))):
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
             if user is None:
                 self._redirect("/login")
             elif not self._csrf_ok(form):
                 self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            elif path == "/releases/confirm":
+                self._send(200, render_confirm_selection(
+                    user, auth.csrf_token(self._cookie_token(), session_secret()), _selected_guids(form)))
             elif path == "/releases/cut":
-                ok, message = cut_release(form.get("version", [""])[0], user["id"])
+                guids = _selected_guids(form)
+                ok, message = cut_release(form.get("version", [""])[0], user["id"], guids)
                 if ok:
                     self._redirect("/releases")
                 else:
-                    self._send(200, render_releases(user, auth.csrf_token(self._cookie_token(), session_secret()), message))
+                    self._send(200, render_confirm_selection(
+                        user, auth.csrf_token(self._cookie_token(), session_secret()), guids, message))
+            elif path.endswith("/discard"):
+                discard_release(path[len("/releases/"):-len("/discard")])
+                self._redirect("/releases/next")
             elif path == "/releases/token":
                 if user["role"] != "admin":
                     self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
@@ -1561,8 +1575,13 @@ class Handler(BaseHTTPRequestHandler):
                                                     token_link=f"{CFG.public_base_url}/dl/{token}"))
             else:
                 version = path[len("/releases/"):-len("/build")]
-                start_build(version, user["id"])
-                self._redirect("/releases")
+                if form.get("confirm", [""])[0].strip() != version:
+                    self._send(200, render_build_confirm(
+                        user, auth.csrf_token(self._cookie_token(), session_secret()), version,
+                        "Type the version exactly to confirm."))
+                else:
+                    start_build(version, user["id"])
+                    self._redirect("/releases")
         elif path == "/api/reupload":
             if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
                 self._json(401, {"error": "Unauthorized."})
@@ -2374,23 +2393,35 @@ def _previous_published(conn, before_version):
     return dict(r) if r else None
 
 
-def cut_release(version, user_id):
-    """Draft release from everything pending. Returns (ok, message)."""
+def _selected_guids(form):
+    return [k[4:] for k in form if k.startswith("rev:")]
+
+
+def changelog_for(conn, guids):
+    lines = []
+    for g in revisions.pending_by_kind(conn, set(guids)):
+        lines.append(f"## {g['label']} ({len(g['notes'])})")
+        for n in g["notes"]:
+            fields = sorted({rv["field"] for rv in n["revisions"]})
+            lines.append(f"- {n['guid']}: {', '.join(fields)}  [{', '.join(n['sources'])}]")
+    return "\n".join(lines)
+
+
+def cut_release(version, user_id, guids):
+    """Draft release from the selected notes' pending changes. Returns (ok, message)."""
     version = (version or "").strip()
     if not version or "/" in version or ".." in version:
         return False, "Version is required (e.g. 1.1)."
+    if not guids:
+        return False, "Nothing selected. Tick the changes to include, then review the selection."
     with db() as conn:
         if conn.execute("SELECT 1 FROM releases WHERE version=?", (version,)).fetchone():
             return False, f"Release {version} already exists."
-        groups = revisions.pending(conn)
+        groups = [g for g in revisions.pending(conn) if g["guid"] in set(guids)]
         if not groups:
-            return False, "Nothing is pending; there is no change to release."
-        lines = []
-        for g in groups:
-            kinds = sorted({r["field"] for r in g["revisions"]})
-            lines.append(f"{g['guid']}: {', '.join(kinds)}")
-        changelog = "\n".join(lines)
-        n = revisions.stamp_release(conn, version)
+            return False, "Nothing is pending for the selected notes."
+        changelog = changelog_for(conn, guids)
+        n = revisions.stamp_guids(conn, version, [g["guid"] for g in groups])
         conn.execute("UPDATE suggestions SET release=? WHERE status='resolved' AND release IS NULL "
                      "AND id IN (SELECT CAST(substr(source, 12) AS INTEGER) FROM revisions "
                      "WHERE release=? AND source LIKE 'suggestion:%')", (version, version))
@@ -2399,6 +2430,119 @@ def cut_release(version, user_id):
             "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0), ?, ?, ?)",
             (version, changelog, now(), user_id))
     return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
+
+
+def discard_release(version):
+    """Drop a draft: its revisions go back to Next release."""
+    with db() as conn:
+        rel = conn.execute("SELECT status FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None or rel["status"] not in ("draft", "failed"):
+            return False
+        revisions.unstamp(conn, version)
+        conn.execute("UPDATE suggestions SET release=NULL WHERE release=?", (version,))
+        conn.execute("DELETE FROM releases WHERE version=?", (version,))
+    return True
+
+
+def render_next_release(user, csrf):
+    with db() as conn:
+        groups = revisions.pending_by_kind(conn)
+        current = releases.current_release(conn)
+    total = sum(len(g["notes"]) for g in groups)
+    sections = []
+    for g in groups:
+        rows = ""
+        for n in g["notes"]:
+            parts = ""
+            for rv in n["revisions"]:
+                if rv["field"] == "added":
+                    parts += f'<dt>added</dt><dd class="diff"><ins>{esc((rv["after"] or "")[:400])}</ins></dd>'
+                elif rv["field"] == "retired":
+                    parts += '<dt>retired</dt><dd class="diff"><del>removed from the deck</del></dd>'
+                else:
+                    parts += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{diff_words(rv["before"], rv["after"])}</dd>'
+            src = ", ".join(s.replace("suggestion:", "#") for s in n["sources"])
+            rows += f"""
+<div class="card nr-note"><div class="card-head">
+  <label class="chk"><input type="checkbox" name="rev:{esc(n['guid'])}" value="1" checked data-group="{esc(g['kind'])}"> <code>{esc(n['guid'])}</code></label>
+  <span class="meta">{esc(', '.join(n['users']))} &middot; {esc(src)}</span>
+</div><div class="proposal"><dl class="fields">{parts}</dl></div></div>"""
+        sections.append(f"""
+<h2 class="nr-head"><label class="chk"><input type="checkbox" checked data-toggle="{esc(g['kind'])}"> {esc(g['label'])}</label>
+<span class="count">{len(g['notes'])}</span></h2>{rows}""")
+    body = f"""
+<h1>Next release</h1>
+<p class="sub">Accepted changes waiting to ship, since release <b>{esc(current or '—')}</b>:
+<b>{total} note{'s' if total != 1 else ''}</b>. Untick anything that should wait. Nothing is built from this page.</p>
+{'<form method="post" action="/releases/confirm"><input type="hidden" name="csrf" value="' + csrf + '">' if groups else ''}
+{''.join(sections) or '<div class="empty"><b>Nothing waiting</b>Accepted suggestions, direct edits and new notes appear here.</div>'}
+{'<div class="actions"><button type="submit">Review selection</button></div></form>' if groups else ''}
+<script>
+document.querySelectorAll('input[data-toggle]').forEach(function (t) {{
+  t.addEventListener('change', function () {{
+    document.querySelectorAll('input[data-group="' + t.dataset.toggle + '"]').forEach(function (c) {{ c.checked = t.checked; }});
+  }});
+}});
+</script>
+<style>.nr-head {{ font-family:var(--serif); font-size:18px; margin:26px 0 10px; display:flex; align-items:center; gap:10px; }}
+.nr-note .card-head code {{ margin-left:6px; }}</style>"""
+    return page("Next release", body, "pending", user, csrf)
+
+
+def render_confirm_selection(user, csrf, guids, error=None):
+    with db() as conn:
+        groups = revisions.pending_by_kind(conn, set(guids))
+        cur = releases.current_release(conn)
+    total = sum(len(g["notes"]) for g in groups)
+    hidden = "".join(f'<input type="hidden" name="rev:{esc(n["guid"])}" value="1">' for g in groups for n in g["notes"])
+    lines = "".join(f'<h3>{esc(g["label"])} <span class="count">{len(g["notes"])}</span></h3><ul>'
+                    + "".join(f'<li><code>{esc(n["guid"])}</code> &middot; {esc(", ".join(sorted({rv["field"] for rv in n["revisions"]})))}</li>' for n in g["notes"])
+                    + "</ul>" for g in groups)
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    body = f"""
+<h1>Confirm release contents</h1>
+<p class="sub"><b>{total} note{'s' if total != 1 else ''}</b> will be stamped with the new version. Everything else stays in Next release.
+Cutting only drafts the release; building it is a separate confirmed step.</p>
+{msg}
+<div class="card"><div class="proposal">{lines or '<p>Nothing selected.</p>'}</div></div>
+<form method="post" action="/releases/cut" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">{hidden}
+  <input type="text" name="version" placeholder="Version, e.g. {esc(_bump(cur))}" required>
+  <button type="submit" {'disabled' if not total else ''}>Cut release</button>
+  <a class="btn-link" href="/releases/next">Back</a>
+</form>"""
+    return page("Confirm release", body, "pending", user, csrf)
+
+
+def _bump(version):
+    try:
+        major, minor = (version or "1.0").split(".")[:2]
+        return f"{major}.{int(minor) + 1}"
+    except ValueError:
+        return "1.1"
+
+
+def render_build_confirm(user, csrf, version, error=None):
+    with db() as conn:
+        rel = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
+    if rel is None:
+        return page("Not found", "<h1>No such release</h1>", "releases", user, csrf)
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    body = f"""
+<h1>Build and publish release {esc(version)}</h1>
+<p class="sub">This writes the new deck package, makes {esc(version)} the current release, and starts offering it
+to students through the add-on and the download links. It cannot be undone from this page.</p>
+{msg}
+<div class="card"><div class="card-head"><span class="meta"><b>Changelog</b></span></div>
+<div class="proposal"><pre class="small" style="white-space:pre-wrap;margin:0">{esc(rel['changelog'] or '')}</pre></div></div>
+<form method="post" action="/releases/{esc(version)}/build" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <label class="small">To continue, type the version: <b>{esc(version)}</b></label>
+  <input type="text" name="confirm" autocomplete="off" placeholder="{esc(version)}">
+  <button type="submit">Build and publish</button>
+  <a class="btn-link" href="/releases">Back</a>
+</form>"""
+    return page("Build release", body, "releases", user, csrf)
 
 
 def _build_release(version):
@@ -2482,8 +2626,9 @@ def render_releases(user, csrf, notice=None, token_link=None):
     for r in rows:
         act = ""
         if r["status"] in ("draft", "failed"):
-            act = (f'<form method="post" action="/releases/{esc(r["version"])}/build" class="inline">'
-                   f'<input type="hidden" name="csrf" value="{csrf}"><button>Build and publish</button></form>')
+            act = (f'<a class="btn-link-primary" href="/releases/{esc(r["version"])}/confirm">Build and publish…</a> '
+                   f'<form method="post" action="/releases/{esc(r["version"])}/discard" class="inline">'
+                   f'<input type="hidden" name="csrf" value="{csrf}"><button class="ghost">Discard draft</button></form>')
         elif r["status"] == "building":
             act = '<span class="badge warn">Building…</span>'
         elif r["status"] == "published":
@@ -2502,12 +2647,8 @@ def render_releases(user, csrf, notice=None, token_link=None):
     if token_link:
         msg += (f'<div class="pw-reveal"><p><strong>Download link</strong></p><code>{esc(token_link)}</code>'
                 f'<p class="pw-note">Give this to the buyer. It serves the latest published release until it expires.</p></div>')
-    cut = f"""
-<form method="post" action="/releases/cut" class="create-form">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="version" placeholder="New version, e.g. 1.1" required>
-  <button type="submit" {"disabled" if not pending_n else ""}>Cut release from {pending_n} pending note(s)</button>
-</form>"""
+    cut = (f'<p><a class="btn-link-primary" href="/releases/next">Next release: {pending_n} note(s) waiting</a></p>'
+           if pending_n else '<p class="small">Nothing is waiting for the next release.</p>')
     tok = ""
     if user["role"] == "admin":
         rows_t = "".join(f'<tr><td><code>/dl/{esc(t["token"][:8])}…</code></td><td>{esc(t["note"] or "")}</td>'
