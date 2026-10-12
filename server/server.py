@@ -31,6 +31,7 @@ import socketserver
 import auth
 import email_out
 import releases
+import reupload
 import revisions
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote, unquote
@@ -205,6 +206,17 @@ def init_db():
             created_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_revisions_release ON revisions(release);
+        CREATE TABLE IF NOT EXISTS uploads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',   -- pending|applied|discarded
+            incoming_json TEXT NOT NULL,              -- {guid: {fields, tags, note_type}}
+            diff_json TEXT NOT NULL,
+            summary_json TEXT,
+            created_at TEXT,
+            applied_at TEXT,
+            applied_by INTEGER
+        );
         CREATE TABLE IF NOT EXISTS media (
             filename TEXT PRIMARY KEY,
             sha256 TEXT NOT NULL,
@@ -1378,6 +1390,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/reviewer")
             else:
                 self._send(200, render_login())
+        elif path.startswith("/uploads/"):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
         elif path.startswith("/edit/") or path in ("/notes/new", "/releases/pending"):
             user = self._current_user()
             if user is None:
@@ -1441,6 +1460,30 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
+        elif path == "/api/reupload":
+            if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
+                self._json(401, {"error": "Unauthorized."})
+            else:
+                try:
+                    data = json.loads(raw or b"{}")
+                    upload_id, summary = create_upload(data.get("label") or "", data.get("notes") or [])
+                    self._json(200, {"ok": True, "upload_id": upload_id, "summary": summary,
+                                     "review_url": f"{CFG.public_base_url}/uploads/{upload_id}"})
+                except json.JSONDecodeError:
+                    self._json(400, {"error": "Invalid JSON."})
+                except ValueError as e:
+                    self._json(400, {"error": str(e)})
+        elif path.startswith("/uploads/") and path.endswith("/apply"):
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            else:
+                upload_id = path[len("/uploads/"):-len("/apply")]
+                apply_upload(upload_id, form, user["id"])
+                self._redirect("/releases/pending")
         elif path.startswith("/api/media/") or path == "/api/baseline":
             if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
                 self._json(401, {"error": "Unauthorized."})
@@ -2057,6 +2100,108 @@ def new_note_from_form(form, user_id):
     with db() as conn:
         return revisions.add_note(conn, form.get("note_type", [""])[0] or "AnKingOverhaul++++++",
                                   fields, tags, user_id)
+
+
+# ---------------------------------------------------------------- re-upload
+
+def create_upload(label, notes):
+    """Compare the submitted notes against the online deck and store the result.
+
+    Raises reupload.IdMismatch / ValueError; nothing is stored in that case.
+    """
+    incoming = {}
+    for n in notes:
+        guid = (n.get("guid") or n.get("doctrine_id") or "").strip()
+        if not guid:
+            continue
+        incoming[guid] = {"fields": n.get("fields") or {}, "tags": list(n.get("tags") or []),
+                          "note_type": n.get("note_type") or ""}
+    with db() as conn:
+        diff = reupload.compare(reupload.snapshot(conn), incoming,
+                                pending_guids=reupload.pending_guids(conn))
+        summary = {k: (len(v) if isinstance(v, (dict, list)) else v) for k, v in diff.items()}
+        cur = conn.execute(
+            """INSERT INTO uploads (label, incoming_json, diff_json, summary_json, created_at)
+               VALUES (?,?,?,?,?)""",
+            (label, json.dumps(incoming), json.dumps(diff), json.dumps(summary), now()))
+        return cur.lastrowid, summary
+
+
+def _upload_row(conn, upload_id):
+    r = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def render_upload(user, csrf, upload_id):
+    with db() as conn:
+        up = _upload_row(conn, upload_id)
+    if up is None:
+        return page("Not found", "<h1>Upload not found</h1>", "pending", user, csrf)
+    diff = json.loads(up["diff_json"]); incoming = json.loads(up["incoming_json"]); summ = json.loads(up["summary_json"] or "{}")
+    applied = up["status"] != "pending"
+
+    def radio(guid, options, default):
+        if applied:
+            return ""
+        return " ".join(
+            f'<label class="chk"><input type="radio" name="d:{esc(guid)}" value="{v}"'
+            f'{" checked" if v == default else ""}> {label}</label>' for v, label in options)
+
+    def section(title, guids, body_fn, options=None, default=None):
+        if not guids:
+            return ""
+        items = "".join(
+            f'<div class="card"><div class="card-head"><span class="meta"><code>{esc(g)}</code></span>'
+            f'<span class="row-actions">{radio(g, options, default) if options else ""}</span></div>'
+            f'<div class="proposal">{body_fn(g)}</div></div>' for g in guids)
+        return f'<h2>{title} <span class="count">{len(guids)}</span></h2>{items}'
+
+    def field_diffs(d):
+        return '<dl class="fields">' + "".join(
+            f'<dt>{esc(f)}</dt><dd class="diff">{diff_words(b, a)}</dd>' for f, (b, a) in d.items()) + "</dl>"
+
+    body = f"""
+<h1>Re-upload: {esc(up['label'] or '')}</h1>
+<p class="sub">Uploaded {esc(up['created_at'])} &middot; status <b>{esc(up['status'])}</b> &middot;
+{summ.get('unchanged', 0)} unchanged, {summ.get('changed', 0)} changed, {summ.get('conflicts', 0)} conflicts,
+{summ.get('new', 0)} new, {summ.get('missing', 0)} missing from the file.
+Tag changes ({summ.get('tag_changes', 0)}) and changes to non-editable fields ({summ.get('other_field_changes', 0)})
+are listed but never applied.</p>
+<form method="post" action="/uploads/{up['id']}/apply">
+<input type="hidden" name="csrf" value="{csrf}">
+{section("Changed", list(diff["changed"]), lambda g: field_diffs(diff["changed"][g]["fields"]),
+         [("file", "Apply file version"), ("skip", "Skip")], "file")}
+{section("Conflicts (edited on the platform since the file's base)", list(diff["conflicts"]),
+         lambda g: field_diffs(diff["conflicts"][g]),
+         [("platform", "Keep platform version"), ("file", "Take file version")], "platform")}
+{section("New notes", list(diff["new"]),
+         lambda g: '<dl class="fields">' + "".join(f'<dt>{esc(k)}</dt><dd>{esc(v)}</dd>' for k, v in (incoming[g].get("fields") or {}).items() if v) + "</dl>",
+         [("add", "Add"), ("skip", "Skip")], "add")}
+{section("Missing from the file", diff["missing"], lambda g: '<p class="small">Not in the uploaded deck. Kept unless retired.</p>',
+         [("keep", "Keep"), ("retire", "Retire")], "keep")}
+{section("Tag changes (not applied)", list(diff["tag_changes"]),
+         lambda g: f'<p class="small">platform: {esc(" ".join(diff["tag_changes"][g][0]))}<br>file: {esc(" ".join(diff["tag_changes"][g][1]))}</p>')}
+{section("Other field changes (not applied)", list(diff["other_field_changes"]),
+         lambda g: f'<p class="small">{esc(", ".join(diff["other_field_changes"][g]))}</p>')}
+{"" if applied else '<div class="actions"><button type="submit">Apply selected</button></div>'}
+</form>"""
+    return page("Re-upload", body, "pending", user, csrf)
+
+
+def apply_upload(upload_id, form, user_id):
+    with db() as conn:
+        up = _upload_row(conn, upload_id)
+        if up is None or up["status"] != "pending":
+            return False
+        diff = json.loads(up["diff_json"]); incoming = json.loads(up["incoming_json"])
+        decisions = {}
+        for key, vals in form.items():
+            if key.startswith("d:"):
+                decisions[key[2:]] = vals[0]
+        reupload.apply(conn, diff, incoming, decisions, user_id, up["id"])
+        conn.execute("UPDATE uploads SET status='applied', applied_at=?, applied_by=? WHERE id=?",
+                     (now(), user_id, up["id"]))
+    return True
 
 
 # ---------------------------------------------------------------- outbox
