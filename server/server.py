@@ -694,6 +694,8 @@ def page(title, body, active="", user=None, csrf=""):
         count = f' <span class="count">{n}</span>' if n else ""
         cls = ' class="active"' if active == "outbox" else ""
         outbox_link = f'<a href="/outbox"{cls}>Outbox{count}</a>'
+        pcls = ' class="active"' if active == "pending" else ""
+        outbox_link += f'<a href="/releases/pending"{pcls}>Pending</a>'
     account_link = nav_link("/account", "Account", "account") if user else ""
     signed_in = ""
     if user:
@@ -856,6 +858,13 @@ def render_reviewer(user=None, secret=None, session_token=None):
 </form></div>"""
         else:
             closed_bits = []
+            with db() as conn:
+                edited = conn.execute(
+                    "SELECT COUNT(*) FROM revisions WHERE source=?",
+                    (f"suggestion:{r['id']}",)).fetchone()[0]
+            if edited:
+                closed_bits.append(f'<span class="badge ok">Edited</span> '
+                                   f'{edited} field change(s) pending release')
             if r["resolution_note"]:
                 closed_bits.append(f"Note: {esc(r['resolution_note'])}")
             if r["published"]:
@@ -1161,9 +1170,53 @@ def queue_thank_you(conn, sid):
         (sid, r["email"].strip(), subject, body, now()))
 
 
+def _close_suggestion(conn, sid, status, form, user_id):
+    """open -> status with the form's publish fields. Returns rows changed."""
+    publish = 1 if (status == "resolved" and form.get("publish")) else 0
+    return conn.execute(
+        """UPDATE suggestions SET status=?, resolution_note=?, published=?,
+           publish_summary=?, credit_name=?, closed_at=?, resolved_by=?
+           WHERE id=? AND status='open'""",
+        (status, form.get("resolution_note", [""])[0].strip() or None,
+         publish, form.get("publish_summary", [""])[0].strip() or None,
+         form.get("credit_name", [""])[0].strip() or None, now(),
+         user_id, sid)).rowcount
+
+
+def accept_proposal(conn, sid, user_id):
+    """Apply the student's proposed edit to the note and resolve. False if none."""
+    r = conn.execute("SELECT doctrine_id, proposed_fields_json FROM suggestions "
+                     "WHERE id=? AND status='open'", (sid,)).fetchone()
+    if r is None or not r["proposed_fields_json"]:
+        return False
+    try:
+        proposed = json.loads(r["proposed_fields_json"])
+        revisions.apply_edit(conn, r["doctrine_id"], proposed, user_id, f"suggestion:{sid}")
+    except (ValueError, LookupError):
+        return False
+    if _close_suggestion(conn, sid, "resolved", {}, user_id) == 1:
+        queue_thank_you(conn, sid)
+    return True
+
+
+def apply_edit_and_resolve(conn, sid, new_values, form, user_id):
+    """Reviewer-edited fields: apply to the note, then resolve with publish fields."""
+    r = conn.execute("SELECT doctrine_id FROM suggestions WHERE id=? AND status='open'",
+                     (sid,)).fetchone()
+    if r is None:
+        raise LookupError("suggestion is not open")
+    revisions.apply_edit(conn, r["doctrine_id"], new_values, user_id, f"suggestion:{sid}")
+    if _close_suggestion(conn, sid, "resolved", form, user_id) == 1:
+        queue_thank_you(conn, sid)
+
+
 def reviewer_action(form, user_id=None):
     sid = form.get("id", [""])[0]
     action = form.get("do", [""])[0]
+    if action == "accept_proposal" and sid:
+        with db() as conn:
+            accept_proposal(conn, sid, user_id)
+        return
     status = {"resolve": "resolved", "decline": "declined",
               "expire": "expired"}.get(action)
     if not sid or not status:
@@ -1325,6 +1378,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/reviewer")
             else:
                 self._send(200, render_login())
+        elif path.startswith("/edit/") or path in ("/notes/new", "/releases/pending"):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                if path == "/notes/new":
+                    self._send(200, render_new_note(user, csrf))
+                elif path == "/releases/pending":
+                    self._send(200, render_pending(user, csrf))
+                else:
+                    qs = parse_qs(urlparse(self.path).query)
+                    self._send(200, render_edit(user, csrf, path[len("/edit/"):],
+                                                qs.get("from", [""])[0] == "proposal"))
         elif path == "/outbox":
             user = self._current_user()
             if user is None:
@@ -1473,6 +1540,30 @@ class Handler(BaseHTTPRequestHandler):
                         user,
                         auth.csrf_token(self._cookie_token(), session_secret()),
                         error=message))
+        elif path.startswith("/edit/") or path == "/notes/new":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            elif path == "/notes/new":
+                try:
+                    new_note_from_form(form, user["id"])
+                    self._redirect("/releases/pending")
+                except ValueError as e:
+                    csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                    self._send(200, render_new_note(user, csrf, str(e)))
+            else:
+                sid = path[len("/edit/"):]
+                values = {f: form.get(f, [""])[0] for f in revisions.EDITABLE_FIELDS if f in form}
+                try:
+                    with db() as conn:
+                        apply_edit_and_resolve(conn, sid, values, form, user["id"])
+                    self._redirect("/reviewer")
+                except (ValueError, LookupError) as e:
+                    csrf = auth.csrf_token(self._cookie_token(), session_secret())
+                    self._send(200, render_edit(user, csrf, sid, False, str(e)))
         elif path == "/reviewer/action":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -1847,6 +1938,125 @@ h2 {{ font-size:16px; margin-top:26px; }}
 </style>"""
     return page("Install", body, "install", user,
                 auth.csrf_token(session_token, session_secret()) if session_token else "")
+
+
+# ---------------------------------------------------------------- editor
+
+def _textarea(name, value, rows=8):
+    return (f'<label class="small" for="f-{name}">{esc(name)}</label>'
+            f'<textarea id="f-{name}" name="{esc(name)}" rows="{rows}" class="copyable">'
+            f'{esc(value or "")}</textarea>')
+
+
+def render_edit(user, csrf, sid, use_proposal=False, error=None):
+    with db() as conn:
+        r = conn.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
+        master = None
+        if r is not None:
+            master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0",
+                                  (r["doctrine_id"],)).fetchone()
+    if r is None or master is None:
+        return page("Not found", "<h1>Suggestion or note not found</h1>", "reviewer", user, csrf)
+    current = json.loads(master["fields_json"] or "{}")
+    values = dict(current)
+    if use_proposal and r["proposed_fields_json"]:
+        try:
+            values.update(json.loads(r["proposed_fields_json"]))
+        except ValueError:
+            pass
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    areas = "".join(_textarea(f, values.get(f, ""), 10 if f == "Text" else 6)
+                    for f in revisions.EDITABLE_FIELDS)
+    body = f"""
+<h1>Edit card</h1>
+<p class="sub">Suggestion #{r['id']} &middot; <code>{esc(r['doctrine_id'])}</code> &middot;
+current master v{master['version']}. Saving applies the change to the online deck as a
+pending revision and resolves the suggestion.</p>
+{msg}
+<div class="edit-grid">
+  <div>
+    <div class="pane-label">Student's suggestion</div>
+    <blockquote>{esc(r['text'])}</blockquote>
+    <div class="pane-label">Card as the student saw it</div>
+    {card_iframe(r['snap_question'], r['snap_answer'], r['snap_css'], 'Snapshot')}
+  </div>
+  <form method="post" action="/edit/{r['id']}" class="login-form">
+    <input type="hidden" name="csrf" value="{csrf}">
+    {areas}
+    <p class="small">Cloze markers look like <code>{{{{c1::answer}}}}</code>. Only Text and Extra can be edited here.</p>
+    <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to updates</label>
+    <input type="text" name="publish_summary" placeholder="Public one-liner (if publishing)">
+    <input type="text" name="credit_name" placeholder="Credit as (optional)">
+    <input type="text" name="resolution_note" placeholder="Internal note (optional)">
+    <div class="actions"><button type="submit">Save and resolve</button>
+    <a class="btn-link" href="/reviewer">Cancel</a></div>
+  </form>
+</div>
+<style>
+.edit-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:24px; align-items:start; }}
+.edit-grid blockquote {{ margin:8px 0 16px; padding:10px 12px; background:#f7f7f4; border-left:3px solid #cfd6cf; white-space:pre-wrap; }}
+.edit-grid .pane {{ border:1px solid var(--line); border-radius:6px; }}
+.edit-grid textarea {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }}
+@media (max-width: 800px) {{ .edit-grid {{ grid-template-columns:1fr; }} }}
+</style>"""
+    return page("Edit card", body, "reviewer", user, csrf)
+
+
+def render_new_note(user, csrf, error=None):
+    with db() as conn:
+        types = [r["note_type"] for r in conn.execute(
+            "SELECT note_type, COUNT(*) n FROM notes GROUP BY note_type ORDER BY n DESC")]
+    opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in types)
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    body = f"""
+<h1>Add a note</h1>
+<p class="sub">Creates an official note in the online deck (pending until the next release).
+Tags decide where the scheduler places it.</p>
+{msg}
+<form method="post" action="/notes/new" class="login-form" style="max-width:720px">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <label class="small" for="nt">Note type</label>
+  <select id="nt" name="note_type">{opts}</select>
+  {_textarea("Text", "", 10)}
+  {_textarea("Extra", "", 6)}
+  <label class="small" for="tags">Tags (space separated)</label>
+  <input id="tags" type="text" name="tags" placeholder="Doctorine::Yield::Step1::Gold Doctorine::Shelf::Internal_Medicine::Silver">
+  <div class="actions"><button type="submit">Add note</button></div>
+</form>"""
+    return page("Add a note", body, "reviewer", user, csrf)
+
+
+def render_pending(user, csrf):
+    with db() as conn:
+        groups = revisions.pending(conn)
+        current = releases.current_release(conn)
+    items = []
+    for g in groups:
+        rows = ""
+        for rv in g["revisions"]:
+            if rv["field"] == "added":
+                rows += f'<dt>added</dt><dd class="diff"><ins>{esc(rv["after"])}</ins></dd>'
+            else:
+                rows += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{diff_words(rv["before"], rv["after"])}</dd>'
+        who = ", ".join(sorted({(rv["username"] or "?") for rv in g["revisions"]}))
+        src = ", ".join(sorted({rv["source"] or "" for rv in g["revisions"]}))
+        items.append(f"""
+<div class="card"><div class="card-head"><span class="meta"><code>{esc(g['guid'])}</code>
+&middot; {esc(who)} &middot; {esc(src)}</span></div>
+<div class="proposal"><dl class="fields">{rows}</dl></div></div>""")
+    n = len(groups)
+    body = (f'<h1>Pending changes</h1><p class="sub">{n} note{"s" if n != 1 else ""} changed since '
+            f'release {esc(current or "—")}. These ship together in the next release.</p>'
+            + ("".join(items) or '<div class="empty"><b>Nothing pending</b>Accepted edits and new notes appear here.</div>'))
+    return page("Pending changes", body, "pending", user, csrf)
+
+
+def new_note_from_form(form, user_id):
+    tags = [t for t in (form.get("tags", [""])[0]).split() if t]
+    fields = {f: form.get(f, [""])[0] for f in revisions.EDITABLE_FIELDS}
+    with db() as conn:
+        return revisions.add_note(conn, form.get("note_type", [""])[0] or "AnKingOverhaul++++++",
+                                  fields, tags, user_id)
 
 
 # ---------------------------------------------------------------- outbox
