@@ -131,11 +131,25 @@ link must be tied to a purchase (see open items), or the paid deck is public.
   and is missing locally, then store the new version in `user_files/`.
 - Notes the student deleted are skipped and logged. Nothing else is touched.
 
-### Storage
+### Storage (decided 2026-10-12: stay on the volume)
 
-Media and release .apkg files go to object storage (Cloudflare R2 or S3, under the
-client's account). The Railway volume keeps only SQLite. One .apkg per release at
-2–3 GB would fill the 5 GB volume in two releases.
+Media (2.0 GB, 3,045 files, stored once by sha256) and release collection files
+(~110 MB each) live on the Railway volume at `/data/blobs`. Database ~30 MB.
+Volume is 4.6 GB, 50% used after release 1.0.
+
+Why not R2 now: reviewer traffic is tiny (target 10,000 students, ~5% ever
+suggesting, each item viewed a few times by a reviewer); storage grows only with
+new media and ~110 MB per release, so ~20 releases of headroom; and the deck is
+expected to need roughly one correction pass. Loss of the volume is recoverable:
+every shipped .apkg contains the same media and `tools/import_apkg.py` restores it
+in ~30 minutes.
+
+What would change the decision: serving the full 2 GB release .apkg to buyers from
+the container (phase 5 may put release files on R2 while media stays), or a volume
+loss becoming unacceptable. Switching is a backend swap in `releases.py` plus a
+one-off copy; nothing done now makes it harder. If R2 is used, serve through the
+platform (`/media/<name>`), no custom domain on the bucket, keep the `media` table
+as the manifest, so the bucket can be copied to the client's account in minutes.
 
 ## Phases
 
