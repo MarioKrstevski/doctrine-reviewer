@@ -138,3 +138,89 @@ def patch_collection(src_path, dst_path, changed, new_notes, retired, now):
         return out
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------- .apkg writer
+
+import hashlib as _hashlib
+import os as _os
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+import zipfile as _zipfile
+
+# Anki's newer package format: meta = PackageMetadata{version=3} (field 1,
+# varint 3); collection.anki21b = zstd(SQLite); media = zstd(MediaEntries);
+# a legacy collection.anki2 stub so old clients show a clear error.
+META_V3 = b"\x08\x03"
+LEGACY_STUB_SQL = (
+    "CREATE TABLE col (id integer primary key, crt integer, mod integer, scm integer, "
+    "ver integer, dty integer, usn integer, ls integer, conf text, models text, decks text, "
+    "dconf text, tags text);"
+    "INSERT INTO col VALUES (1, 0, 0, 0, 11, 0, 0, 0, '{}', '{}', '{}', '{}', '{}');"
+    "CREATE TABLE notes (id integer primary key, guid text, mid integer, mod integer, usn integer, "
+    "tags text, flds text, sfld text, csum integer, flags integer, data text);"
+    "INSERT INTO notes VALUES (1, 'legacy', 0, 0, 0, '', 'This deck requires a newer Anki version. "
+    "Please update to Anki 2.1.50 or later.', '', 0, 0, '');")
+
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F; n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b); return bytes(out)
+
+
+def _field(no, wire, payload):
+    return _varint((no << 3) | wire) + (_varint(len(payload)) + payload if wire == 2 else payload)
+
+
+def encode_media_manifest(entries):
+    """entries: [(name, size, sha1_bytes)] in zip-member order. Returns zstd bytes."""
+    body = b""
+    for name, size, sha1 in entries:
+        entry = _field(1, 2, name.encode("utf-8")) + _field(2, 0, _varint(size)) + _field(3, 2, sha1)
+        body += _field(1, 2, entry)
+    return zstd_compress(body)
+
+
+def zstd_compress(data, level=3):
+    if _shutil.which("zstd") is None:
+        raise RuntimeError("zstd CLI not found")
+    return _subprocess.run(["zstd", "-q", f"-{level}", "-c"], input=data, capture_output=True, check=True).stdout
+
+
+def write_apkg(out_path, collection_path, media, level=3):
+    """media: iterable of (filename, path_on_disk). Streams every file into
+    the zip, so a 2 GB package never sits in memory. Returns counts."""
+    tmp = out_path + ".tmp"
+    entries = []
+    nbytes = 0
+    with _zipfile.ZipFile(tmp, "w", _zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        z.writestr("meta", META_V3)
+        with open(collection_path, "rb") as fh:
+            z.writestr("collection.anki21b", zstd_compress(fh.read(), level))
+        with _tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as stub:
+            stub_path = stub.name
+        try:
+            c = sqlite3.connect(stub_path); c.executescript(LEGACY_STUB_SQL); c.commit(); c.close()
+            z.write(stub_path, "collection.anki2")
+        finally:
+            _os.unlink(stub_path)
+        for i, (name, path) in enumerate(media):
+            h = _hashlib.sha1()
+            size = 0
+            with open(path, "rb") as src, z.open(str(i), "w", force_zip64=True) as dst:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk); size += len(chunk); dst.write(chunk)
+            entries.append((name, size, h.digest()))
+            nbytes += size
+        z.writestr("media", encode_media_manifest(entries))
+    _os.replace(tmp, out_path)
+    return {"media": len(entries), "bytes": nbytes + _os.path.getsize(collection_path)}

@@ -139,3 +139,42 @@ class PatchTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             rb.patch_collection(self.src, self.dst, changed={"guidCCCCCC": {"Text": "x"}},
                                 new_notes=[], retired=[], now=T0)
+
+
+class WriteApkgTest(unittest.TestCase):
+    def test_package_round_trips_through_the_reader(self):
+        import sys, zipfile
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+        import apkg
+        with tempfile.TemporaryDirectory() as d:
+            col = os.path.join(d, "col.sqlite"); make_baseline(col)
+            media = [("heart sounds.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 20), ("a.mp3", b"ID3" + b"\x01" * 5)]
+            paths = []
+            for name, data in media:
+                p = os.path.join(d, hashlib.sha256(data).hexdigest()); open(p, "wb").write(data); paths.append((name, p))
+            out = os.path.join(d, "out.apkg")
+            info = rb.write_apkg(out, col, paths)
+            pkg = apkg.Package(out)
+            names = pkg.media_names()
+            self.assertEqual({"0": "heart sounds.png", "1": "a.mp3"}, names)
+            self.assertEqual(media[0][1], pkg.media_bytes("0"))
+            got = pkg.collection_sqlite()
+            self.assertEqual(open(col, "rb").read(), got)
+            members = set(zipfile.ZipFile(out).namelist())
+            self.assertTrue({"meta", "media", "collection.anki21b", "collection.anki2", "0", "1"} <= members)
+            self.assertEqual(2, info["media"]); self.assertGreater(info["bytes"], 0)
+            pkg.close()
+
+    def test_meta_declares_the_version_anki_expects(self):
+        import zipfile
+        with tempfile.TemporaryDirectory() as d:
+            col = os.path.join(d, "col.sqlite"); make_baseline(col)
+            out = os.path.join(d, "out.apkg"); rb.write_apkg(out, col, [])
+            self.assertEqual(b"\x08\x03", zipfile.ZipFile(out).read("meta"))
+
+    def test_media_manifest_encoder_matches_the_decoder(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+        import apkg
+        raw = rb.encode_media_manifest([("x.png", 5, b"\x00" * 20), ("y with space.jpg", 7, b"\x01" * 20)])
+        self.assertEqual({"0": "x.png", "1": "y with space.jpg"}, apkg.decode_media_manifest(raw))
