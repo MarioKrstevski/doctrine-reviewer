@@ -2088,10 +2088,78 @@ h2 {{ font-size:16px; margin-top:26px; }}
 
 # ---------------------------------------------------------------- editor
 
-def _textarea(name, value, rows=8):
-    return (f'<label class="small" for="f-{name}">{esc(name)}</label>'
-            f'<textarea id="f-{name}" name="{esc(name)}" rows="{rows}" class="copyable">'
-            f'{esc(value or "")}</textarea>')
+def _editor_field(name, value, rows):
+    return f"""
+<div class="ed-field">
+  <label for="f-{esc(name)}">{esc(name)}</label>
+  <textarea id="f-{esc(name)}" name="{esc(name)}" rows="{rows}" data-preview="p-{esc(name)}">{esc(value or "")}</textarea>
+  <div class="ed-preview" id="p-{esc(name)}" aria-live="polite"></div>
+</div>"""
+
+
+EDITOR_SCRIPT = """
+<script>
+(function () {
+  function render(src) {
+    var html = src.replace(/\\{\\{c(\\d+)::(.*?)(::[^}]*)?\\}\\}/g,
+      function (_, n, ans) { return '<mark title="cloze c' + n + '">' + ans + '</mark>'; });
+    return html.replace(/src="([^"]+)"/g, function (_, f) {
+      return /^(https?:|data:|\\/)/.test(f) ? 'src="' + f + '"' : 'src="/media/' + encodeURIComponent(f) + '"';
+    });
+  }
+  document.querySelectorAll('textarea[data-preview]').forEach(function (ta) {
+    var out = document.getElementById(ta.dataset.preview);
+    var sync = function () { out.innerHTML = render(ta.value); };
+    ta.addEventListener('input', sync); sync();
+  });
+})();
+</script>"""
+
+EDITOR_CSS = """
+<style>
+.ed-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:28px; align-items:start; }
+.ed-left blockquote { margin:8px 0 16px; padding:10px 12px; background:#f7f7f4; border-left:3px solid #cfd6cf; white-space:pre-wrap; }
+.ed-left .pane { border:1px solid var(--line); border-radius:6px; }
+.ed-field { margin:0 0 18px; }
+.ed-field label { display:block; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
+  color:var(--muted); margin:0 0 6px; }
+.ed-field textarea { width:100%; box-sizing:border-box; padding:10px 12px; border:1px solid var(--line-strong);
+  border-radius:6px; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; resize:vertical; background:#fff; }
+.ed-field textarea:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+.ed-preview { margin-top:6px; padding:10px 12px; border:1px dashed var(--line-strong); border-radius:6px;
+  background:#fff; font-size:14.5px; line-height:1.5; min-height:2.6em; }
+.ed-preview:empty::before { content:"(preview)"; color:var(--faint); }
+.ed-preview mark { background:#fff1a8; padding:0 3px; border-radius:2px; }
+.ed-preview img { max-width:100%; }
+.ed-publish { display:grid; gap:10px; padding:14px 16px; border:1px solid var(--line); border-radius:8px;
+  background:var(--panel); margin:6px 0 16px; }
+.ed-publish input[type=text] { width:100%; box-sizing:border-box; }
+.ed-actions { display:flex; gap:12px; align-items:center; }
+@media (max-width: 900px) { .ed-grid { grid-template-columns:minmax(0,1fr); } }
+</style>"""
+
+
+def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept"):
+    areas = "".join(_editor_field(f, values.get(f, ""), 14 if f == "Text" else 8)
+                    for f in revisions.EDITABLE_FIELDS)
+    publish = ""
+    if with_publish:
+        publish = """
+<div class="ed-publish">
+  <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to the community updates page</label>
+  <input type="text" name="publish_summary" placeholder="Public one-liner, e.g. 'Clarified HPV types on the vulvar carcinoma card'">
+  <input type="text" name="credit_name" placeholder="Credit as (optional, e.g. Marko S.)">
+  <input type="text" name="resolution_note" placeholder="Internal note (optional)">
+</div>"""
+    return f"""
+<form method="post" action="{action}">
+  <input type="hidden" name="csrf" value="{csrf}">
+  {areas}
+  <p class="small">Cloze markers look like <code>{{{{c1::answer}}}}</code> and are highlighted in the preview. Only Text and Extra can be edited.</p>
+  {publish}
+  <div class="ed-actions"><button type="submit">{esc(submit_label)}</button>
+  <a class="btn-link" href="/reviewer">Cancel</a></div>
+</form>"""
 
 
 def render_edit(user, csrf, sid, use_proposal=False, error=None):
@@ -2105,46 +2173,34 @@ def render_edit(user, csrf, sid, use_proposal=False, error=None):
         return page("Not found", "<h1>Suggestion or note not found</h1>", "reviewer", user, csrf)
     current = json.loads(master["fields_json"] or "{}")
     values = dict(current)
-    if use_proposal and r["proposed_fields_json"]:
+    proposal_html = ""
+    if r["proposed_fields_json"]:
         try:
-            values.update(json.loads(r["proposed_fields_json"]))
+            proposed = json.loads(r["proposed_fields_json"])
+            if use_proposal:
+                values.update(proposed)
+            diffs = diff_fields(current, proposed)
+            if diffs:
+                proposal_html = ('<div class="pane-label">Student\'s proposed change</div><dl class="fields" style="height:auto;max-height:240px">'
+                                 + "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs) + "</dl>")
         except ValueError:
             pass
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
-    areas = "".join(_textarea(f, values.get(f, ""), 10 if f == "Text" else 6)
-                    for f in revisions.EDITABLE_FIELDS)
     body = f"""
 <h1>Edit card</h1>
-<p class="sub">Suggestion #{r['id']} &middot; <code>{esc(r['doctrine_id'])}</code> &middot;
-current master v{master['version']}. Saving applies the change to the online deck as a
-pending revision and resolves the suggestion.</p>
+<p class="sub">Suggestion #{r['id']} &middot; <code>{esc(r['doctrine_id'])}</code> &middot; master v{master['version']}.
+Saving changes the card in the online deck, queues it for the next release, and accepts the suggestion.</p>
 {msg}
-<div class="edit-grid">
-  <div>
+<div class="ed-grid">
+  <div class="ed-left">
     <div class="pane-label">Student's suggestion</div>
     <blockquote>{esc(r['text'])}</blockquote>
+    {proposal_html}
     <div class="pane-label">Card as the student saw it</div>
     {card_iframe(r['snap_question'], r['snap_answer'], r['snap_css'], 'Snapshot')}
   </div>
-  <form method="post" action="/edit/{r['id']}" class="login-form">
-    <input type="hidden" name="csrf" value="{csrf}">
-    {areas}
-    <p class="small">Cloze markers look like <code>{{{{c1::answer}}}}</code>. Only Text and Extra can be edited here.</p>
-    <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to updates</label>
-    <input type="text" name="publish_summary" placeholder="Public one-liner (if publishing)">
-    <input type="text" name="credit_name" placeholder="Credit as (optional)">
-    <input type="text" name="resolution_note" placeholder="Internal note (optional)">
-    <div class="actions"><button type="submit">Save and resolve</button>
-    <a class="btn-link" href="/reviewer">Cancel</a></div>
-  </form>
-</div>
-<style>
-.edit-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:24px; align-items:start; }}
-.edit-grid blockquote {{ margin:8px 0 16px; padding:10px 12px; background:#f7f7f4; border-left:3px solid #cfd6cf; white-space:pre-wrap; }}
-.edit-grid .pane {{ border:1px solid var(--line); border-radius:6px; }}
-.edit-grid textarea {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }}
-@media (max-width: 800px) {{ .edit-grid {{ grid-template-columns:1fr; }} }}
-</style>"""
+  <div>{editor_form(f"/edit/{r['id']}", values, csrf)}</div>
+</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
     return page("Edit card", body, "reviewer", user, csrf)
 
 
@@ -2161,14 +2217,16 @@ Tags decide where the scheduler places it.</p>
 {msg}
 <form method="post" action="/notes/new" class="login-form" style="max-width:720px">
   <input type="hidden" name="csrf" value="{csrf}">
-  <label class="small" for="nt">Note type</label>
-  <select id="nt" name="note_type">{opts}</select>
-  {_textarea("Text", "", 10)}
-  {_textarea("Extra", "", 6)}
-  <label class="small" for="tags">Tags (space separated)</label>
-  <input id="tags" type="text" name="tags" placeholder="Doctorine::Yield::Step1::Gold Doctorine::Shelf::Internal_Medicine::Silver">
-  <div class="actions"><button type="submit">Add note</button></div>
-</form>"""
+  <div class="ed-field"><label for="nt">Note type</label>
+  <select id="nt" name="note_type">{opts}</select></div>
+  {_editor_field("Text", "", 12)}
+  {_editor_field("Extra", "", 8)}
+  <div class="ed-field"><label for="tags">Tags (space separated; the scheduler uses these)</label>
+  <input id="tags" type="text" name="tags" style="width:100%;box-sizing:border-box"
+         placeholder="Doctorine::Yield::Step1::Gold Doctorine::Shelf::Internal_Medicine::Silver"></div>
+  <div class="ed-actions"><button type="submit">Add note</button>
+  <a class="btn-link" href="/releases/next">Cancel</a></div>
+</form>{EDITOR_CSS}{EDITOR_SCRIPT}"""
     return page("Add a note", body, "reviewer", user, csrf)
 
 

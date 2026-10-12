@@ -89,9 +89,10 @@ class EditPageTest(unittest.TestCase):
             sid = suggest(base, {"Text": "PROPOSED"})
             _, _, html = request(base, "GET", f"/edit/{sid}", cookie=cookie)
             _, _, html2 = request(base, "GET", f"/edit/{sid}?from=proposal", cookie=cookie)
-        self.assertIn("cancer risk", html)
-        self.assertNotIn(">PROPOSED<", html)
-        self.assertIn("PROPOSED", html2)
+        # editor prefilled from the current card, proposal only in the diff panel
+        self.assertIn("cancer risk</textarea>", html)
+        self.assertNotIn("PROPOSED</textarea>", html)
+        self.assertIn("PROPOSED</textarea>", html2)
 
     def test_post_applies_the_edit_and_resolves(self):
         with running_server() as base:
