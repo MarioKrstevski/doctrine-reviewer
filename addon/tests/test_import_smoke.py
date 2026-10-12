@@ -26,7 +26,7 @@ def _stub_anki():
     qt = types.ModuleType("aqt.qt")
     for name in ("QApplication", "QDialog", "QVBoxLayout", "QHBoxLayout", "QLabel",
                  "QComboBox", "QTextEdit", "QLineEdit", "QPushButton",
-                 "QInputDialog", "Qt", "QMenu", "QAction"):
+                 "QInputDialog", "Qt", "QMenu", "QAction", "QCheckBox", "QPlainTextEdit"):
         setattr(qt, name, mock.MagicMock(name=name))
     utils = types.ModuleType("aqt.utils")
     for name in ("tooltip", "showInfo", "showWarning", "openLink"):

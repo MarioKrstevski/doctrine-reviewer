@@ -26,14 +26,14 @@ import urllib.error
 from aqt import mw, gui_hooks
 from aqt.qt import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QTextEdit, QLineEdit, QPushButton, QInputDialog, Qt
+    QTextEdit, QLineEdit, QPushButton, QInputDialog, QCheckBox, QPlainTextEdit, Qt
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
 from . import addon_log, chunk_util, identity, official, payload, resolver, state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.4"
+ADDON_VERSION = "1.5"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -157,10 +157,11 @@ def post_json(url: str, payload: dict, bearer: str = "",
 # ---------------------------------------------------------------- dialog
 
 class SuggestionDialog(QDialog):
-    def __init__(self, parent, card_label: str):
+    def __init__(self, parent, card_label: str, fields=None):
         super().__init__(parent)
         self.setWindowTitle("Suggest an edit")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
+        self._fields = dict(fields or {})
 
         layout = QVBoxLayout(self)
 
@@ -183,6 +184,28 @@ class SuggestionDialog(QDialog):
         self.text_edit.setMinimumHeight(110)
         layout.addWidget(self.text_edit)
 
+        # Optional: propose the exact change. Editable copies of Text and
+        # Extra; only fields that differ are sent. Never touches the note.
+        self.propose_box = QCheckBox("Propose the exact change (edit the card text)")
+        self.propose_box.setChecked(False)
+        layout.addWidget(self.propose_box)
+        self.propose_area = QVBoxLayout()
+        self.field_edits = {}
+        for name in payload.EDITABLE_FIELDS:
+            if name not in self._fields:
+                continue
+            lbl = QLabel(name)
+            edit = QPlainTextEdit()
+            edit.setPlainText(self._fields.get(name, ""))
+            edit.setMinimumHeight(90 if name == "Text" else 60)
+            lbl.setVisible(False); edit.setVisible(False)
+            self.propose_area.addWidget(lbl); self.propose_area.addWidget(edit)
+            self.field_edits[name] = (lbl, edit)
+        layout.addLayout(self.propose_area)
+        self.propose_box.toggled.connect(self._toggle_propose)
+        if not self.field_edits:
+            self.propose_box.setVisible(False)
+
         layout.addWidget(QLabel("Email (optional, to hear back about it):"))
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("you@example.com")
@@ -201,16 +224,27 @@ class SuggestionDialog(QDialog):
 
         self.result_data = None
 
+    def _toggle_propose(self, on):
+        for lbl, edit in self.field_edits.values():
+            lbl.setVisible(on); edit.setVisible(on)
+        self.adjustSize()
+
     def _on_send(self):
         text = self.text_edit.toPlainText().strip()
-        if not text:
-            showWarning("Please describe the issue before sending.")
+        proposed = {}
+        if self.propose_box.isChecked():
+            after = {name: edit.toPlainText() for name, (_, edit) in self.field_edits.items()}
+            proposed = payload.proposed(self._fields, after)
+        if not text and not proposed:
+            showWarning("Please describe the issue, or propose a change, before sending.")
             return
         self.result_data = {
             "suggestion_type": self.type_box.currentData(),
-            "text": text,
+            "text": text or "(proposed an edit, see the change)",
             "email": self.email_edit.text().strip() or None,
         }
+        if proposed:
+            self.result_data["proposed_fields"] = proposed
         self.accept()
 
 
@@ -339,7 +373,8 @@ def open_suggestion_dialog():
     except AttributeError:  # older Anki
         note_type = note.model()
 
-    dlg = SuggestionDialog(mw, f"{note_type['name']} — {deck_name}")
+    dlg = SuggestionDialog(mw, f"{note_type['name']} — {deck_name}",
+                           {name: note[name] for name in field_names})
     if not dlg.exec():
         return
 

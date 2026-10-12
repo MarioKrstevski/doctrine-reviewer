@@ -41,3 +41,24 @@ class TraceTest(unittest.TestCase):
     def test_tags_are_a_plain_list(self):
         self.assertEqual(["x"], self._t(tags=("x",))["tags"])
         self.assertEqual([], self._t(tags=None)["tags"])
+
+
+class ProposedTest(unittest.TestCase):
+    def test_only_changed_editable_fields(self):
+        from payload import proposed
+        before = {"Text": "a", "Extra": "b", "Pathoma": "p"}
+        after = {"Text": "a2", "Extra": "b", "Pathoma": "changed-but-not-editable"}
+        self.assertEqual({"Text": "a2"}, proposed(before, after))
+
+    def test_identical_is_empty(self):
+        from payload import proposed
+        self.assertEqual({}, proposed({"Text": "a", "Extra": "b"}, {"Text": "a", "Extra": "b"}))
+
+    def test_whitespace_only_change_is_still_a_change(self):
+        from payload import proposed
+        self.assertEqual({"Text": "a "}, proposed({"Text": "a"}, {"Text": "a "}))
+
+    def test_missing_keys_are_handled(self):
+        from payload import proposed
+        self.assertEqual({}, proposed({"Text": "a"}, {}))
+        self.assertEqual({"Extra": "x"}, proposed({}, {"Extra": "x"}))

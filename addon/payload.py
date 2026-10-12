@@ -32,3 +32,19 @@ def trace(tags, note_mod, card_id, card_ord, template_names, deck_id,
         "addon_version": addon_version,
         "anki_version": anki_version,
     }
+
+
+EDITABLE_FIELDS = ("Text", "Extra")
+
+
+def proposed(before, after):
+    """The student's proposed change: only editable fields that differ."""
+    out = {}
+    for name in EDITABLE_FIELDS:
+        b = (before or {}).get(name)
+        a = (after or {}).get(name)
+        if a is None:
+            continue
+        if a != (b if b is not None else ""):
+            out[name] = a
+    return out
