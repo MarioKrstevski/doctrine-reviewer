@@ -30,8 +30,9 @@ import socketserver
 
 import auth
 import email_out
+import releases
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote, unquote
 
 import config
 
@@ -183,6 +184,19 @@ def init_db():
             actioned_by INTEGER
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS releases (
+            version TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'draft',   -- draft|published
+            note_count INTEGER,
+            collection_path TEXT,
+            changelog TEXT,
+            created_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS media (
+            filename TEXT PRIMARY KEY,
+            sha256 TEXT NOT NULL,
+            size INTEGER
+        );
         CREATE INDEX IF NOT EXISTS idx_attempts_username
             ON login_attempts(username, attempted_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -354,8 +368,20 @@ def fields_pane(fields_json, label):
             f'<dl class="fields">{body}</dl></div>')
 
 
+_SRC = re.compile(r'(src=["\'])(?!https?://|data:|/)([^"\']+)(["\'])')
+
+
+def rewrite_media(html):
+    """Point relative src="file.png" at /media/file.png (served from the
+    baseline's media). Absolute and data URLs are left alone."""
+    if not html:
+        return html
+    return _SRC.sub(lambda m: m.group(1) + "/media/" + quote(m.group(2)) + m.group(3), html)
+
+
 def card_iframe(q_html, a_html, css, label):
     """Render a card snapshot inside a sandboxed iframe via srcdoc."""
+    q_html, a_html = rewrite_media(q_html), rewrite_media(a_html)
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <style>body{{font-family:system-ui,sans-serif;padding:18px;margin:0;
 background:#fff;color:#15201B;font-size:15px;line-height:1.5}}
@@ -1150,7 +1176,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _do_GET(self):
         path = urlparse(self.path).path
-        if path == "/api/official":
+        if path.startswith("/media/"):
+            name = unquote(path[len("/media/"):])
+            found = None
+            if releases.safe_filename(name):
+                with db() as conn:
+                    found = releases.media_file(conn, name)
+            if found is None:
+                self._send(404, b"not found", "text/plain")
+            else:
+                fpath, ctype = found
+                with open(fpath, "rb") as fh:
+                    data = fh.read()
+                self._send(200, data, ctype, {"Cache-Control": "public, max-age=31536000, immutable"})
+        elif path == "/api/media/manifest":
+            if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
+                self._json(401, {"error": "Unauthorized."})
+            else:
+                with db() as conn:
+                    files = [r["filename"] for r in conn.execute("SELECT filename FROM media")]
+                self._json(200, {"files": files})
+        elif path == "/api/releases":
+            with db() as conn:
+                self._json(200, {"current": releases.current_release(conn),
+                                 "releases": releases.list_releases(conn)})
+        elif path == "/api/official":
             etag, body = official_list()
             if self.headers.get("If-None-Match") == etag:
                 self.send_response(304)
@@ -1240,6 +1290,30 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
+        elif path.startswith("/api/media/") or path == "/api/baseline":
+            if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
+                self._json(401, {"error": "Unauthorized."})
+            elif path == "/api/baseline":
+                qs = parse_qs(urlparse(self.path).query)
+                version = (qs.get("version", [""])[0]).strip()
+                if not version or "/" in version or ".." in version:
+                    self._json(400, {"error": "version is required."})
+                else:
+                    try:
+                        count = int(qs.get("note_count", ["0"])[0])
+                        with db() as conn:
+                            info = releases.store_baseline(conn, version, count, raw, now())
+                        _official_cache["key"] = None
+                        self._json(200, info)
+                    except ValueError as e:
+                        self._json(400, {"error": str(e)})
+            else:
+                name = unquote(path[len("/api/media/"):])
+                if not releases.safe_filename(name):
+                    self._json(400, {"error": "Bad filename."})
+                else:
+                    with db() as conn:
+                        self._json(200, releases.store_media(conn, name, raw))
         elif path in ("/api/dev/register", "/api/master/sync"):
             # Writes master card state: never public. Fails closed when no
             # key is configured rather than falling back to open.

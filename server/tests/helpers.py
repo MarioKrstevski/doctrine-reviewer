@@ -5,6 +5,7 @@ state and never touch a developer's real doctrine.db.
 """
 
 import contextlib
+import os
 import tempfile
 import threading
 from pathlib import Path
@@ -30,6 +31,7 @@ def running_server(**env):
     with tempfile.TemporaryDirectory() as tmp:
         settings = {"DB_PATH": str(Path(tmp) / "test.db"), "PORT": "0",
                     "PIPELINE_API_KEY": TEST_PIPELINE_KEY}
+        os.environ["BLOB_ROOT"] = str(Path(tmp) / "blobs")
         settings.update(env)
 
         previous = server.CFG
