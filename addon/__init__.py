@@ -30,10 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import addon_log, chunk_util, identity, official, payload, resolver, state
+from . import addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.5"
+ADDON_VERSION = "1.6"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -605,6 +605,129 @@ def open_updates_page():
     openLink(cached_api_base(get_config()) + "/updates")
 
 
+# ---------------------------------------------------------------- deck sync
+
+class UpdatePromptDialog(QDialog):
+    """Release N available: what will change, and the choice to apply it."""
+
+    def __init__(self, parent, text, changelog_url):
+        super().__init__(parent)
+        self.setWindowTitle("Doctorine deck update")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        head = QLabel("<b>A deck update is available.</b>")
+        layout.addWidget(head)
+        body = QLabel(text)
+        body.setWordWrap(True)
+        layout.addWidget(body)
+        link = QLabel(f'<a href="{changelog_url}">See what changed</a>')
+        link.setOpenExternalLinks(True)
+        layout.addWidget(link)
+        note = QLabel("Only the card text is updated. Your study progress, tags and "
+                      "your own cards are not touched. Edit > Undo reverts the update.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #777; font-size: 12px;")
+        layout.addWidget(note)
+        row = QHBoxLayout()
+        later = QPushButton("Later")
+        later.clicked.connect(self.reject)
+        go = QPushButton("Update now")
+        go.setDefault(True)
+        go.clicked.connect(self.accept)
+        row.addStretch(); row.addWidget(later); row.addWidget(go)
+        layout.addLayout(row)
+
+
+def _fetch_sync_payload(api_base_url, since):
+    return get_json(api_base_url + "/api/sync?since=" + urllib.parse.quote(since or "", safe=""))
+
+
+def check_for_deck_updates(force=False, silent=False):
+    """Background: ask the server what changed since our release. On the main
+    thread: build the plan against the collection, prompt, apply."""
+    d = user_files_dir()
+    st = sync_state.load(d)
+    if not sync_state.due(st, time.time(), force):
+        return
+
+    def task():
+        cfg = get_config()
+        base = api_base(cfg)
+        current = get_json(base + "/api/sync/version").get("current")
+        if not current or current == st["release"]:
+            return {"base": base, "current": current, "payload": None}
+        return {"base": base, "current": current, "payload": _fetch_sync_payload(base, st["release"])}
+
+    def done(fut):
+        try:
+            result = fut.result()
+        except Exception as e:
+            addon_log.exception("deck update check")
+            if not silent:
+                showWarning(f"Could not check for deck updates:\n{e!r}")
+            return
+        sync_state.save(d, st["release"], time.time())
+        payload = result["payload"]
+        if payload is None:
+            if st["release"] == "" and result["current"]:
+                # First run on a collection that already matches: adopt the version.
+                sync_state.save(d, result["current"], time.time())
+            if not silent:
+                showInfo("Your Doctorine deck is up to date.")
+            return
+        _offer_update(result["base"], payload, silent)
+
+    mw.taskman.run_in_background(task, done)
+
+
+def _offer_update(base, payload, silent):
+    d = user_files_dir()
+    guids = [c["guid"] for c in payload.get("changed", [])] + [a["guid"] for a in payload.get("added", [])] \
+            + list(payload.get("retired", []))
+    local = sync.local_state(mw.col, guids)
+    have = sync.media_have(mw.col, payload.get("media", []))
+    plan = sync_plan.plan(payload, local, have)
+    to_version = payload.get("to") or "?"
+    if not plan["updates"] and not plan["adds"]:
+        sync_state.save(d, to_version, time.time())
+        _log.info("deck already matches release %s", to_version)
+        if not silent:
+            showInfo(f"Your Doctorine deck already matches release {to_version}.")
+        return
+    text = sync.describe(plan, to_version)
+    dlg = UpdatePromptDialog(mw, text, base + "/updates")
+    if not dlg.exec():
+        _log.info("deck update to %s deferred", to_version)
+        return
+    _apply_update(base, plan, to_version)
+
+
+def _apply_update(base, plan, to_version):
+    d = user_files_dir()
+    mw.progress.start(label="Updating Doctorine deck…", immediate=True)
+    try:
+        media_done, media_failed = sync.fetch_media(
+            mw.col, base, plan["media"],
+            on_progress=lambda i, n: mw.progress.update(label=f"Downloading media {i} of {n}…"))
+        counts, failures = sync.apply_plan(
+            mw.col, plan,
+            on_progress=lambda i, n: mw.progress.update(label=f"Updating cards {i} of {n}…"))
+    finally:
+        mw.progress.finish()
+    if counts["failed"] == 0:
+        sync_state.save(d, to_version, time.time())
+    _log.info("deck update to %s: %s media=%d/%d failures=%s", to_version, counts, media_done,
+              len(plan["media"]), failures[:5])
+    refresh_official_in_background(force=True)
+    mw.reset()
+    msg = (f"Updated to release {to_version}.\n\n{counts['updated']} card(s) updated, "
+           f"{counts['added']} added, {media_done} media file(s) downloaded.")
+    if counts["failed"] or media_failed:
+        msg += (f"\n\n{counts['failed']} card(s) and {len(media_failed)} media file(s) failed; "
+                "see Tools > Doctrine Editor > Diagnostics. Run the update again to retry.")
+    showInfo(msg)
+
+
 # ---------------------------------------------------------------- diagnostics
 
 def _section(lines, title, fn):
@@ -669,6 +792,9 @@ def diagnostics_text() -> str:
         return (f"official set: release={cached.release} guids={len(cached.guids)} "
                 f"fetched={time.strftime('%Y-%m-%d %H:%M', time.gmtime(cached.fetched_at))} UTC")
     _section(lines, "official", off)
+    _section(lines, "sync", lambda: "deck release: %s (last check %s)" % (
+        sync_state.load(user_files_dir())["release"] or "unknown",
+        time.strftime("%Y-%m-%d %H:%M", time.gmtime(sync_state.load(user_files_dir())["last_check"])) + " UTC"))
 
     def card():
         card = mw.reviewer.card if mw.reviewer else None
@@ -752,6 +878,10 @@ def setup_menu():
     a5.triggered.connect(open_diagnostics)
     menu.addAction(a5)
 
+    a6 = QAction("Check for deck updates…", mw)
+    a6.triggered.connect(lambda: check_for_deck_updates(force=True))
+    menu.addAction(a6)
+
     if DEV_MODE:
         menu.addSeparator()
 
@@ -771,3 +901,4 @@ gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.main_window_did_init.append(setup_menu)
 gui_hooks.profile_did_open.append(lambda: refresh_official_in_background())
+gui_hooks.profile_did_open.append(lambda: check_for_deck_updates(silent=True))
