@@ -33,7 +33,7 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.6"
+ADDON_VERSION = "1.6.1"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -373,7 +373,8 @@ def open_suggestion_dialog():
     except AttributeError:  # older Anki
         note_type = note.model()
 
-    dlg = SuggestionDialog(mw, f"{note_type['name']} — {deck_name}",
+    # Deck only: the note type is an internal name students need not see.
+    dlg = SuggestionDialog(mw, f"a card in {deck_name.split('::', 1)[0]}",
                            {name: note[name] for name in field_names})
     if not dlg.exec():
         return
