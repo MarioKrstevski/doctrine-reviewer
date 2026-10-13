@@ -42,7 +42,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       the editor (warn when an `src` name exists with different content).
 - [x] **T6 Release page.** (done) Version suggestion (minor/major radio), public notes
       (markdown-ish, plain) or silent; Updates shows release notes for public releases.
-- [ ] **T7 Add-on.** Prompt: "Your deck: 1.0 · Newest: 1.3 (3 releases behind)" side by
+- [x] **T7 Add-on.** (done: prompt shows your version vs newest and releases behind; ping shipped with T10; install page warning) Prompt: "Your deck: 1.0 · Newest: 1.3 (3 releases behind)" side by
       side; ping `/api/ping` with install_id, add-on version, deck release, license id
       (read from `_doctrine_license.json` in collection.media); install page warning.
 - [x] **T8 Deck page.** (done: raw-body upload with progress, admin only; media/claim not needed) Streamed browser upload to disk with free-space guard; choose
@@ -68,3 +68,4 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
   T4, T2+T3, T11, T5, T6, T8, T9, T10, T7. Deploy each task separately so he sees changes early.
 - 2026-10-13: T4, T2, T3, T11 done and deployed. Next: T5, T6, T8, T9, T10, then T7 (last).
 - 2026-10-13: T5, T6, T8, T9, T10 done and deployed. Only T7 (add-on update prompt, last by Mario's choice) remains.
+- 2026-10-13: T7 done. All of T1-T11 shipped. Remaining ideas: per-deck release UI, student-facing real-device test of 1.7.0.

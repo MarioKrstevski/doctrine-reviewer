@@ -614,13 +614,25 @@ def open_updates_page():
 class UpdatePromptDialog(QDialog):
     """Release N available: what will change, and the choice to apply it."""
 
-    def __init__(self, parent, text, changelog_url):
+    def __init__(self, parent, text, changelog_url, versions=None):
         super().__init__(parent)
         self.setWindowTitle("Doctorine deck update")
         self.setMinimumWidth(460)
         layout = QVBoxLayout(self)
         head = QLabel("<b>A deck update is available.</b>")
         layout.addWidget(head)
+        if versions:
+            mine, newest, gap = versions
+            vrow = QHBoxLayout()
+            for t in (mine, newest):
+                lab = QLabel(f"<b>{t}</b>")
+                lab.setStyleSheet("padding: 8px 12px; border: 1px solid #bbb; border-radius: 6px;")
+                vrow.addWidget(lab)
+            layout.addLayout(vrow)
+            if gap:
+                g = QLabel(gap)
+                g.setStyleSheet("color: #8a5800;")
+                layout.addWidget(g)
         body = QLabel(text)
         body.setWordWrap(True)
         layout.addWidget(body)
@@ -700,7 +712,9 @@ def _offer_update(base, payload, silent):
             showInfo(f"Your Doctorine deck already matches release {to_version}.")
         return
     text = sync.describe(plan, to_version)
-    dlg = UpdatePromptDialog(mw, text, base + "/updates")
+    st = sync_state.load(d)
+    dlg = UpdatePromptDialog(mw, text, base + "/updates",
+                             sync_plan.version_summary(st["release"], to_version, payload.get("behind")))
     if not dlg.exec():
         _log.info("deck update to %s deferred", to_version)
         return

@@ -70,3 +70,12 @@ class PlanTest(unittest.TestCase):
     def test_empty_payload_is_a_noop(self):
         p = plan({"changed": [], "added": [], "retired": [], "media": []}, LOCAL, set())
         self.assertEqual(0, sum(p["counts"].values()))
+
+
+class VersionSummaryTest(unittest.TestCase):
+    def test_lines(self):
+        import sync_plan as sp
+        self.assertEqual(("Your deck: 1.0", "Newest: 1.3", "3 releases behind"), sp.version_summary("1.0", "1.3", 3))
+        self.assertEqual("1 release behind", sp.version_summary("1.2", "1.3", 1)[2])
+        self.assertEqual("", sp.version_summary("1.3", "1.3", 0)[2])
+        self.assertEqual("Your deck: not recorded yet", sp.version_summary("", "1.3", None)[0])

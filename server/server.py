@@ -2481,6 +2481,16 @@ suggestion next to the current version of the card. Accepted fixes ship
 in the next deck update and can appear on the
 <a href="/updates">community updates</a> page with credit.</p>
 
+<h2>Updating your deck</h2>
+<p>When we release a new version of the deck, the add-on offers it the next time Anki
+opens. It shows <b>your version next to the newest one</b> and how many releases you are behind,
+and <b>Update now</b> is the default choice. Updating rewrites only the text of the cards that
+changed (the Text and Extra fields), downloads new images, and adds new cards. Your study progress,
+tags and your own cards are not touched.</p>
+<p class="notice"><b>If you edited a card yourself, an update replaces your edit on that card.</b>
+Send us the change with <b>&#9998; Suggest an edit</b> instead, and everyone gets it. Edit &rarr; Undo
+reverts an update right after it runs.</p>
+
 <h2>Already have an older version?</h2>
 <p>Tools &rarr; Add-ons &rarr; select <b>Doctrine Editor</b> &rarr; Delete, then
 install the new file. Your settings and pending suggestions are unaffected.</p>
@@ -3364,7 +3374,7 @@ def sync_payload(conn, since, deck_id=1):
     baseline_missing = since not in order
     later = order[order.index(since) + 1:] if not baseline_missing else order[1:]
     if not current or not later:
-        return {"from": since, "to": current, "changed": [], "added": [], "retired": [],
+        return {"from": since, "to": current, "behind": 0, "changed": [], "added": [], "retired": [],
                 "media": [], "baseline_missing": baseline_missing}
     marks = ",".join("?" * len(later))
     revs = conn.execute(
@@ -3406,7 +3416,7 @@ def sync_payload(conn, since, deck_id=1):
     if media:
         m = ",".join("?" * len(media))
         known = {r["filename"] for r in conn.execute(f"SELECT filename FROM media WHERE filename IN ({m})", sorted(media))}
-    return {"from": since, "to": current, "changed": changed, "added": added_out,
+    return {"from": since, "to": current, "behind": len(later), "changed": changed, "added": added_out,
             "retired": sorted(set(retired)), "media": sorted(known),
             "baseline_missing": baseline_missing}
 

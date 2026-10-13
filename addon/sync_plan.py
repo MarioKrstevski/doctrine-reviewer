@@ -55,3 +55,15 @@ def plan(payload, local, media_have):
               "retired_present": len(retired_present), "media": len(media), "local_edits": local_edits}
     return {"updates": updates, "adds": adds, "skipped": skipped, "retired_present": retired_present,
             "media": media, "counts": counts}
+
+
+def version_summary(frm, to, behind):
+    """('Your deck: 1.0', 'Newest: 1.3', '3 releases behind') for the update prompt."""
+    mine = f"Your deck: {frm}" if frm else "Your deck: not recorded yet"
+    newest = f"Newest: {to}"
+    try:
+        n = int(behind)
+    except (TypeError, ValueError):
+        n = 0
+    gap = "" if n <= 0 else ("1 release behind" if n == 1 else f"{n} releases behind")
+    return mine, newest, gap

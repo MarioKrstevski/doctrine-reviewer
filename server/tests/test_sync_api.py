@@ -56,6 +56,7 @@ class SyncPayloadTest(unittest.TestCase):
             status, body = sync(base, "1.0")
         self.assertEqual(200, status)
         self.assertEqual(("1.0", "1.2"), (body["from"], body["to"]))
+        self.assertEqual(2, body["behind"])
         self.assertEqual(1, len(body["changed"]))
         ch = body["changed"][0]
         self.assertEqual(A, ch["guid"])
