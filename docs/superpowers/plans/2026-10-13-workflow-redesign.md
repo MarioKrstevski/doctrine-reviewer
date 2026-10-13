@@ -21,7 +21,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
 
 ---
 
-- [ ] **T1 Brand + shell.** New tokens and fonts; public header (Updates, Install) with
+- [x] **T1 Brand + shell.** (done 2026-10-13, commit on main) New tokens and fonts; public header (Updates, Install) with
       no staff links; staff sidebar (Inbox, Cards, Next release, Releases, Outbox,
       Deck, Detection, Settings) with counts; tests that anonymous pages contain no
       staff links.
@@ -55,3 +55,12 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       from pings; page listing licenses by install count with thresholds.
 - [ ] **T11 Clean slate.** Wipe test data on production, re-import v2 as 1.0 (media
       claimed, not re-uploaded), deploy, verify end to end.
+
+## Progress log
+
+- 2026-10-13: production volume filled by a stored 2.15 GB package; package and a test
+  row deleted, DB vacuumed, writes restored. 1.1 collection kept; 1.1 content verified.
+- 2026-10-13: T1 done. Order agreed with Mario because of usage limits: T1, T4 (Inbox
+  by card), T2+T3 (release text fix + streamed downloads), T11 (clean slate), then
+  T5, T6, T7, T8, T9, T10 if budget remains. Mario confirmed: wipe all test data,
+  volume stays 4.6 GB unless more is needed, detection thresholds 20/100.
