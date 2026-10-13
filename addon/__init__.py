@@ -30,10 +30,10 @@ from aqt.qt import (
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
+from . import ping, addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.6.3"
+ADDON_VERSION = "1.7.0"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -905,5 +905,32 @@ gui_hooks.webview_will_set_content.append(on_webview_will_set_content)
 gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.main_window_did_init.append(setup_menu)
+def send_ping_in_background():
+    """Once a day, tell the platform this install exists (see ping.py)."""
+    d = user_files_dir()
+    if not ping.due(d):
+        return
+    try:
+        body = ping.payload(state.install_id(d), ADDON_VERSION,
+                            sync_state.load(d)["release"], mw.col.media.dir())
+    except Exception:
+        addon_log.exception("ping payload")
+        return
+
+    def task():
+        post_json(api_base(get_config()) + "/api/ping", body, timeout=10)
+        return True
+
+    def done(fut):
+        try:
+            if fut.result():
+                ping.mark_sent(d)
+        except Exception:
+            addon_log.exception("ping")
+
+    mw.taskman.run_in_background(task, done)
+
+
 gui_hooks.profile_did_open.append(lambda: refresh_official_in_background())
+gui_hooks.profile_did_open.append(lambda: send_ping_in_background())
 gui_hooks.profile_did_open.append(lambda: check_for_deck_updates(silent=True))

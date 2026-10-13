@@ -253,6 +253,17 @@ def init_db():
             name TEXT NOT NULL,
             created_at TEXT
         );""")
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS installs (
+            install_id TEXT PRIMARY KEY,
+            license TEXT,
+            addon_version TEXT,
+            release TEXT,
+            first_seen TEXT,
+            last_seen TEXT,
+            pings INTEGER DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_installs_license ON installs(license);""")
         if conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0] == 0:
             conn.execute("INSERT INTO decks (id, slug, name, created_at) VALUES (1, 'doctorine', 'Doctorine', datetime('now'))")
         for t in ("notes", "releases", "uploads", "suggestions"):
@@ -1130,6 +1141,65 @@ def is_official(guid) -> bool:
         ).fetchone() is not None
 
 
+WATCH_AT, FLAG_AT = 20, 100   # installs per license: watch, red flag
+
+
+def record_ping(data):
+    """Upsert one install from an add-on ping. Returns False for junk."""
+    iid = str(data.get("install_id") or "").strip()[:64]
+    if len(iid) < 8:
+        return False
+    lic = str(data.get("license") or "").strip()[:64] or None
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO installs (install_id, license, addon_version, release, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(install_id) DO UPDATE SET
+                 license=COALESCE(excluded.license, installs.license),
+                 addon_version=excluded.addon_version, release=excluded.release,
+                 last_seen=excluded.last_seen, pings=installs.pings+1""",
+            (iid, lic, str(data.get("addon_version") or "")[:20],
+             str(data.get("release") or "")[:40], now(), now()))
+    return True
+
+
+def detection_rows():
+    """[{license, note, installs, last_seen, level}] busiest first, plus untagged count."""
+    with db() as conn:
+        lic = [dict(r) for r in conn.execute(
+            "SELECT license, COUNT(*) AS installs, MAX(last_seen) AS last_seen FROM installs "
+            "WHERE license IS NOT NULL AND license!='staff' GROUP BY license ORDER BY installs DESC, last_seen DESC")]
+        untagged = conn.execute("SELECT COUNT(*) FROM installs WHERE license IS NULL").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM installs").fetchone()[0]
+        notes = {hashlib.sha256(r["token"].encode()).hexdigest()[:16]: r["note"]
+                 for r in conn.execute("SELECT token, note FROM download_tokens")}
+    for r in lic:
+        r["note"] = notes.get(r["license"], "")
+        r["level"] = "flag" if r["installs"] >= FLAG_AT else "watch" if r["installs"] >= WATCH_AT else "ok"
+    return lic, untagged, total
+
+
+def render_detection(user, csrf):
+    lic, untagged, total = detection_rows()
+    badge = {"flag": '<span class="badge warn">Red flag</span>',
+             "watch": '<span class="badge">Watch</span>', "ok": ""}
+    rows = "".join(
+        f'<tr><td><code>{esc(r["license"])}</code></td><td>{esc(r["note"] or "—")}</td>'
+        f'<td><b>{r["installs"]}</b></td><td>{esc((r["last_seen"] or "")[:16])}</td>'
+        f'<td>{badge[r["level"]]}</td></tr>'
+        for r in lic[:200])
+    body = f"""
+<h1>Detection</h1>
+<p class="sub">Each download carries a hidden license id; the add-on reports it with its install id.
+One license on many installs suggests the file was shared. This page only reports: nothing is blocked.
+Watch at {WATCH_AT} installs, red flag at {FLAG_AT}. Deleting the hidden file defeats it, and
+students who downloaded before tagging have no license.</p>
+<p class="queue-count"><b>{total}</b> installs seen &middot; <b>{len(lic)}</b> licenses &middot; {untagged} without a license</p>
+<table class="tbl"><tr><th>License</th><th>Buyer link note</th><th>Installs</th><th>Last seen</th><th></th></tr>
+{rows or '<tr><td colspan="5" class="small">No tagged installs have reported yet.</td></tr>'}</table>"""
+    return page("Detection", body, "detection", user, csrf)
+
+
 def deck_from_slug(conn, slug):
     """Row for a deck slug; the first deck when none is given; None if unknown."""
     if not slug:
@@ -1680,6 +1750,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
         elif path == "/releases/pending":
             self._redirect("/releases/next")
+        elif path == "/detection":
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin":
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+            else:
+                self._send(200, render_detection(user, auth.csrf_token(self._cookie_token(), session_secret())))
         elif path == "/deck" or path.startswith("/deck/status/"):
             user = self._current_user()
             if user is None:
@@ -1863,6 +1941,12 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     start_build(version, user["id"])
                     self._redirect("/releases")
+        elif path == "/api/ping":
+            try:
+                ok = record_ping(json.loads(raw or b"{}"))
+                self._json(200 if ok else 400, {"ok": ok})
+            except (json.JSONDecodeError, AttributeError):
+                self._json(400, {"ok": False})
         elif path == "/deck/new":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))

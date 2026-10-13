@@ -51,7 +51,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       `/api/media/claim` so the CLI skips uploading blobs already on disk.
 - [x] **T9 Multi-deck.** (done as foundation: decks table, platform_deck columns, per-deck official/sync/where, add-on pinned by DECK_SLUG, Add deck on Deck page. Not yet: per-deck release building UI and import into a second deck; release versions must be unique across decks) `decks` table; `deck_id` on scoped tables (default 1);
       queries filter by active deck; `/where` returns deck slug; add-on pinned to it.
-- [ ] **T10 Detection.** Licenses table; per-download license token; installs table
+- [x] **T10 Detection.** (done: /api/ping, installs table, Detection page 20/100, add-on 1.7.0 daily ping reads _doctrine_license.json) Licenses table; per-download license token; installs table
       from pings; page listing licenses by install count with thresholds.
 - [x] **T11 Clean slate.** (done 2026-10-13: test data wiped in place; v2 deck and 1.0 baseline kept, so no re-import and no media/claim needed) Wipe test data on production, re-import v2 as 1.0 (media
       claimed, not re-uploaded), deploy, verify end to end.
@@ -67,3 +67,4 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
 - 2026-10-13: Mario: the add-on automatic update prompt (T7) goes last (hardest). Order now:
   T4, T2+T3, T11, T5, T6, T8, T9, T10, T7. Deploy each task separately so he sees changes early.
 - 2026-10-13: T4, T2, T3, T11 done and deployed. Next: T5, T6, T8, T9, T10, then T7 (last).
+- 2026-10-13: T5, T6, T8, T9, T10 done and deployed. Only T7 (add-on update prompt, last by Mario's choice) remains.
