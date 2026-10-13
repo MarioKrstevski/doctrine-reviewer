@@ -32,7 +32,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       downloads stream; no package files; keep latest + previous collection, delete
       older. Tests: round-trip via `tools/apkg.py`, Content-Length exact, license file
       present when given.
-- [ ] **T4 Inbox by card.** Group open suggestions by note; card header with count;
+- [x] **T4 Inbox by card.** (done 2026-10-13) Group open suggestions by note; card header with count;
       per-suggestion Duplicate / Decline / Expired; card-level Accept proposal (pick
       one) or Edit card; saving resolves the selected suggestions (default all open on
       that card) and queues a thank-you for each with an email. Banner shows target
@@ -64,3 +64,5 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
   by card), T2+T3 (release text fix + streamed downloads), T11 (clean slate), then
   T5, T6, T7, T8, T9, T10 if budget remains. Mario confirmed: wipe all test data,
   volume stays 4.6 GB unless more is needed, detection thresholds 20/100.
+- 2026-10-13: Mario: the add-on automatic update prompt (T7) goes last (hardest). Order now:
+  T4, T2+T3, T11, T5, T6, T8, T9, T10, T7. Deploy each task separately so he sees changes early.

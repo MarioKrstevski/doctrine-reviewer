@@ -840,6 +840,22 @@ def fetch_masters(conn, doctrine_ids):
     return masters
 
 
+def _next_version_hint():
+    """Version the next release would get (minor bump of the newest cut)."""
+    try:
+        with db() as conn:
+            vs = [r[0] for r in conn.execute("SELECT version FROM releases")]
+        if not vs:
+            return "1.0"
+        def key(v):
+            return tuple(int(p) if p.isdigit() else 0 for p in v.split("."))
+        top = max(vs, key=key)
+        parts = list(key(top)) + [0, 0]
+        return f"{parts[0]}.{parts[1] + 1}"
+    except Exception:
+        return "the next one"
+
+
 def render_reviewer(user=None, secret=None, session_token=None):
     csrf = auth.csrf_token(session_token, secret) if session_token and secret else ""
     with db() as conn:
@@ -863,7 +879,9 @@ def render_reviewer(user=None, secret=None, session_token=None):
         return page("Reviewer queue", body, "reviewer", user, csrf)
 
     items = []
+    item_card = []
     for r in rows:
+        item_card.append((r["doctrine_id"], r["status"], r["id"]))
         master = masters.get(r["doctrine_id"])
         stale_cls = ""
         if master is None:
@@ -928,6 +946,7 @@ def render_reviewer(user=None, secret=None, session_token=None):
   <span class="btns">
     {accept}
     <a class="btn-link-primary" href="/edit/{r['id']}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
+    <button name="do" value="duplicate" class="secondary" title="Same issue as another report on this card; the student still gets a thank-you">Duplicate</button>
     <button name="do" value="decline" class="secondary">Decline</button>
     <button name="do" value="expire" class="ghost">Mark expired</button>
   </span>
@@ -966,8 +985,33 @@ def render_reviewer(user=None, secret=None, session_token=None):
   {actions}
 </div>""")
 
+    # Group open items by card; a card with several open reports gets a header.
+    order, groups, closed = [], {}, []
+    for html, (did, st, sid) in zip(items, item_card):
+        if st == "open":
+            if did not in groups:
+                groups[did] = []; order.append(did)
+            groups[did].append((sid, html))
+        else:
+            closed.append(html)
+    parts = []
+    for did in order:
+        members = groups[did]
+        if len(members) > 1:
+            parts.append(f'''<section class="card-group"><div class="group-head">
+<b>{len(members)} reports on this card</b> <code>{esc(did)}</code>
+<form method="post" action="/reviewer/action" style="display:inline">
+<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{members[0][0]}">
+<button name="do" value="resolve_card" class="secondary" title="Resolve every open report on this card as fixed (each student with an email gets a thank-you)">Card fixed — resolve all</button>
+</form></div>''' + "".join(h for _, h in members) + "</section>")
+        else:
+            parts.append(members[0][1])
+    items = parts + (['<h2 class="closed-h">Recently closed</h2>'] + closed if closed else [])
     n_open = sum(1 for r in rows if r["status"] == "open")
-    body = ('<h1>Reviewer queue</h1><p class="sub">Each item pairs the exact '
+    nxt = _next_version_hint()
+    banner = (f'<p class="sub">Accepting adds the change to the next release ({esc(nxt)}). '
+              'You choose what ships on the Next release page.</p>')
+    body = ('<h1>Inbox</h1>' + banner + '<p class="sub">Each item pairs the exact '
             'card the student saw with its current master version. If the two '
             'panes differ, the card has already moved on.</p>'
             f'<p class="queue-count"><b>{n_open} open</b> &middot; '
@@ -1271,6 +1315,30 @@ def _close_suggestion(conn, sid, status, form, user_id):
          user_id, sid)).rowcount
 
 
+def open_siblings(conn, sid):
+    """Other open suggestions on the same card as `sid`."""
+    r = conn.execute("SELECT doctrine_id FROM suggestions WHERE id=?", (sid,)).fetchone()
+    if r is None:
+        return []
+    return conn.execute(
+        "SELECT * FROM suggestions WHERE doctrine_id=? AND status='open' AND id!=? "
+        "ORDER BY id", (r["doctrine_id"], sid)).fetchall()
+
+
+def resolve_together(conn, sid, also_ids, user_id, note="Fixed together with another report on this card."):
+    """Resolve each id in also_ids (only open ones on the same card as sid) and
+    queue a thank-you for each that left an email."""
+    allowed = {r["id"] for r in open_siblings(conn, sid)}
+    for other in also_ids:
+        try:
+            other = int(other)
+        except (TypeError, ValueError):
+            continue
+        if other in allowed:
+            if _close_suggestion(conn, other, "resolved", {"resolution_note": [note]}, user_id) == 1:
+                queue_thank_you(conn, other)
+
+
 def accept_proposal(conn, sid, user_id):
     """Apply the student's proposed edit to the note and resolve. False if none."""
     r = conn.execute("SELECT doctrine_id, proposed_fields_json FROM suggestions "
@@ -1288,6 +1356,7 @@ def accept_proposal(conn, sid, user_id):
 
 
 def apply_edit_and_resolve(conn, sid, new_values, form, user_id):
+    also = form.get("also", [])
     """Reviewer-edited fields: apply to the note, then resolve with publish fields."""
     r = conn.execute("SELECT doctrine_id FROM suggestions WHERE id=? AND status='open'",
                      (sid,)).fetchone()
@@ -1296,6 +1365,7 @@ def apply_edit_and_resolve(conn, sid, new_values, form, user_id):
     revisions.apply_edit(conn, r["doctrine_id"], new_values, user_id, f"suggestion:{sid}")
     if _close_suggestion(conn, sid, "resolved", form, user_id) == 1:
         queue_thank_you(conn, sid)
+    resolve_together(conn, sid, also, user_id)
 
 
 def reviewer_action(form, user_id=None):
@@ -1304,6 +1374,21 @@ def reviewer_action(form, user_id=None):
     if action == "accept_proposal" and sid:
         with db() as conn:
             accept_proposal(conn, sid, user_id)
+        return
+    if action == "duplicate" and sid:
+        with db() as conn:
+            if _close_suggestion(conn, sid, "resolved", {"resolution_note": [
+                    "Duplicate of another report on this card."]}, user_id) == 1:
+                queue_thank_you(conn, sid)
+        return
+    if action == "resolve_card" and sid:
+        # sid = any open suggestion on the card; resolve all open ones there.
+        with db() as conn:
+            ids = [sid] + [str(r["id"]) for r in open_siblings(conn, sid)]
+            for one in ids:
+                if _close_suggestion(conn, one, "resolved", {"resolution_note": [
+                        "Card fixed; this report is covered by the fix."]}, user_id) == 1:
+                    queue_thank_you(conn, one)
         return
     status = {"resolve": "resolved", "decline": "declined",
               "expire": "expired"}.get(action)
@@ -2244,6 +2329,9 @@ EDITOR_CSS = """
 .ed-preview:empty::before { content:"(preview)"; color:var(--faint); }
 .ed-preview mark { background:#fff1a8; padding:0 3px; border-radius:2px; }
 .ed-preview img { max-width:100%; }
+.card-group { border:1px solid var(--line); border-left:3px solid var(--blue); border-radius:10px; padding:10px 12px; margin:14px 0; }
+.group-head { display:flex; gap:12px; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.closed-h { margin-top:28px; }
 .ed-publish { display:grid; gap:10px; padding:14px 16px; border:1px solid var(--line); border-radius:8px;
   background:var(--panel); margin:6px 0 16px; }
 .ed-publish input[type=text] { width:100%; box-sizing:border-box; }
@@ -2252,7 +2340,7 @@ EDITOR_CSS = """
 </style>"""
 
 
-def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept"):
+def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept", extra_html=""):
     areas = "".join(_editor_field(f, values.get(f, ""), 14 if f == "Text" else 8)
                     for f in revisions.EDITABLE_FIELDS)
     publish = ""
@@ -2269,6 +2357,7 @@ def editor_form(action, values, csrf, with_publish=True, submit_label="Save and 
   <input type="hidden" name="csrf" value="{csrf}">
   {areas}
   <p class="small">Cloze markers look like <code>{{{{c1::answer}}}}</code> and are highlighted in the preview. Only Text and Extra can be edited.</p>
+  {extra_html}
   {publish}
   <div class="ed-actions"><button type="submit">{esc(submit_label)}</button>
   <a class="btn-link" href="/reviewer">Cancel</a></div>
@@ -2279,11 +2368,22 @@ def render_edit(user, csrf, sid, use_proposal=False, error=None):
     with db() as conn:
         r = conn.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
         master = None
+        sibs = []
         if r is not None:
             master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0",
                                   (r["doctrine_id"],)).fetchone()
+            sibs = open_siblings(conn, sid)
     if r is None or master is None:
         return page("Not found", "<h1>Suggestion or note not found</h1>", "reviewer", user, csrf)
+    sib_html = ""
+    if sibs:
+        rows_ = "".join(
+            f'<label class="chk"><input type="checkbox" name="also" value="{x["id"]}" checked> '
+            f'#{x["id"]} &middot; {esc(TYPE_LABELS.get(x["suggestion_type"], x["suggestion_type"]))}: '
+            f'{esc((x["text"] or "")[:160])}</label>' for x in sibs)
+        sib_html = ('<div class="ed-publish"><b>Also resolve these reports on the same card</b>'
+                    '<span class="small">Each student with an email gets a thank-you. '
+                    f'Untick any this edit does not cover.</span>{rows_}</div>')
     current = json.loads(master["fields_json"] or "{}")
     values = dict(current)
     proposal_html = ""
@@ -2312,7 +2412,7 @@ Saving changes the card in the online deck, queues it for the next release, and 
     <div class="pane-label">Card as the student saw it</div>
     {card_iframe(r['snap_question'], r['snap_answer'], r['snap_css'], 'Snapshot')}
   </div>
-  <div>{editor_form(f"/edit/{r['id']}", values, csrf)}</div>
+  <div>{editor_form(f"/edit/{r['id']}", values, csrf, extra_html=sib_html)}</div>
 </div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
     return page("Edit card", body, "reviewer", user, csrf)
 
