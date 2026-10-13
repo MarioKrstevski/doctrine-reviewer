@@ -270,6 +270,7 @@ def init_db():
             conn.execute("INSERT INTO decks (id, slug, name, created_at) VALUES (1, 'doctorine', 'Doctorine', datetime('now'))")
         _ensure_columns(conn, "users", {"active_deck": "INTEGER"})
         _ensure_columns(conn, "installs", {"deck": "TEXT"})
+        _ensure_columns(conn, "media", {"platform_deck": "INTEGER DEFAULT 1"})
         for t in ("notes", "releases", "uploads", "suggestions", "download_tokens"):
             _ensure_columns(conn, t, {"platform_deck": "INTEGER DEFAULT 1"})
         _ensure_columns(conn, "suggestions", {"release": "TEXT"})
@@ -1668,7 +1669,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send_package(self, collection_path, version, license_id):
         """Build the .apkg on the fly. No Content-Length (HTTP/1.0, closes at the end)."""
         with db() as conn:
-            media = media_for_package(conn)
+            row = conn.execute("SELECT COALESCE(platform_deck,1) AS d FROM releases WHERE version=?", (version,)).fetchone()
+            media = media_for_package(conn, row["d"] if row else 1)
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -2361,7 +2363,7 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
 </tr>""")
 
     body = f"""
-<h1>Reviewers</h1>
+<h1>Users</h1>
 <p class="sub">Signed in as {esc(user['username'])} (admin)</p>
 {banner}
 <form method="post" action="/admin/users" class="create-form">
@@ -2379,7 +2381,7 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
 and signs them out immediately. Resetting a password also signs them out.
 There is no email in this system, so hand credentials over directly.</p>
 """
-    return page("Reviewers", body, "admin", user, csrf)
+    return page("Users", body, "admin", user, csrf)
 
 
 def render_account(user, csrf, notice=None, error=None):
@@ -3002,12 +3004,12 @@ def process_deck_upload(upload_id, path, deck_id=1):
                     data = pkg.media_bytes(member)
                     sha = hashlib.sha256(data).hexdigest()
                     if name not in known:
-                        releases.store_media(conn, name, data); known[name] = sha; stats["media_new"] += 1
+                        releases.store_media(conn, name, data, deck_id); known[name] = sha; stats["media_new"] += 1
                     elif known[name] == sha:
                         stats["media_same"] += 1
                     else:
                         new_name = apkgfile.renamed(name, sha)
-                        releases.store_media(conn, new_name, data); known[new_name] = sha
+                        releases.store_media(conn, new_name, data, deck_id); known[new_name] = sha
                         renames[name] = new_name; stats["media_renamed"] += 1
         pkg.close()
         if renames:
@@ -3083,13 +3085,13 @@ def render_deck(user, csrf, notice=None):
                 "retired": conn.execute("SELECT COUNT(*) FROM notes WHERE platform_deck=? AND retired=1", (d["id"],)).fetchone()[0],
                 "release": releases.current_release(conn, d["id"]),
             }
-        media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+        media = {d["id"]: conn.execute("SELECT COUNT(*) FROM media WHERE COALESCE(platform_deck,1)=?",
+                                       (d["id"],)).fetchone()[0] for d in decks}
         ups = [dict(r) for r in conn.execute(
             "SELECT id, label, status, created_at FROM uploads WHERE COALESCE(platform_deck,1)=? "
             "ORDER BY id DESC LIMIT 15", (deck_id,))]
     cur = next((d for d in decks if d["id"] == deck_id), decks[0])
     st = stats[cur["id"]]
-    free = shutil.disk_usage(releases.blob_root()).free if os.path.isdir(releases.blob_root()) else 0
 
     rows = ""
     dialogs = ""
@@ -3137,8 +3139,7 @@ def render_deck(user, csrf, notice=None):
         upload = f"""
 <div class="card"><div class="proposal" style="padding:16px 18px">
   <h3 style="margin:0 0 6px">Re-upload {esc(cur["name"])}</h3>
-  {ui.infobox("How a re-upload works", "<p>Choose the new <code>.apkg</code>. Nothing changes yet. You get a side-by-side review of what differs, and approved changes go to Next release. Cards are matched by note id, and a file whose ids mostly differ is refused. A changed image that reuses an old filename is saved under a new name automatically.</p>")}
-  <p class="small">Free space on the server: <b>{free / 1e9:.1f} GB</b>. A file needs about 1.3 times its size plus 0.4 GB.</p>
+  {ui.infobox("How a re-upload works", "<p>Choose the new <code>.apkg</code>. Nothing changes yet. You get a side-by-side review of what differs, and approved changes go to Next release. Cards are matched by note id, and a file whose ids mostly differ is refused. A changed image that reuses an old filename is saved under a new name automatically.</p><p>Large files need spare room on the server, about 1.3 times the file size plus 0.4 GB. If there is not enough, the upload is refused with a message before anything is sent.</p>")}
   <div class="row"><input type="file" id="deckfile" accept=".apkg"><button id="deckgo" type="button">Upload and compare</button></div>
   <div id="deckmsg" class="small" style="margin-top:8px"></div>
   <progress id="deckprog" value="0" max="100" style="width:100%;display:none"></progress>
@@ -3183,7 +3184,7 @@ b.addEventListener('click',function(){{
 <h2 style="margin-top:32px">{esc(cur["name"])}</h2>
 <div class="card"><div class="proposal">
   <p style="margin:0"><b>{st["cards"]:,}</b> active cards{f' &middot; {st["retired"]:,} retired' if st["retired"] else ''}
-  &middot; <b>{media:,}</b> media files &middot; current release <b>{esc(st["release"] or "none yet")}</b></p>
+  &middot; <b>{media[cur["id"]]:,}</b> media files &middot; current release <b>{esc(st["release"] or "none yet")}</b></p>
 </div></div>
 {upload}
 <h2>Recent uploads</h2>
@@ -3520,8 +3521,7 @@ def _build_release(version):
                     new_notes.append({"guid": guid, "note_type": row["note_type"],
                                       "fields": nf,
                                       "tags": json.loads(row["tags_json"] or "[]")})
-            media = [(r["filename"], releases.sha_path(r["sha256"]))
-                     for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")]
+            media = media_for_package(conn, deck_id)
 
         d = releases.release_dir(version)
         os.makedirs(d, exist_ok=True)
@@ -3740,9 +3740,11 @@ def package_for_version(conn, version):
     return (r["version"], r["collection_path"]) if r and r["collection_path"] and os.path.exists(r["collection_path"]) else (None, None)
 
 
-def media_for_package(conn):
+def media_for_package(conn, deck_id=1):
+    """Media files a deck's package carries: only the ones that deck owns."""
     return [(r["filename"], releases.sha_path(r["sha256"]))
-            for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")
+            for r in conn.execute("SELECT filename, sha256 FROM media WHERE COALESCE(platform_deck,1)=? "
+                                  "ORDER BY filename", (deck_id,))
             if os.path.exists(releases.sha_path(r["sha256"]))]
 
 

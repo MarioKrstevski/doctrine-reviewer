@@ -128,5 +128,34 @@ class DeckWorkspaceTest(unittest.TestCase):
         self.assertEqual((403, 2), (status, n))
 
 
+class DeckMediaTest(unittest.TestCase):
+    def test_media_belongs_to_a_deck_and_the_deck_page_counts_only_its_own(self):
+        import releases
+        with running_server() as base:
+            second = server.add_deck("Scratch Deck")
+            with server.db() as conn:
+                releases.store_media(conn, "a.png", b"AAAA")
+                releases.store_media(conn, "b.png", b"BBBB")
+                releases.store_media(conn, "c.png", b"CCCC", second)
+                self.assertEqual(["a.png", "b.png"], [m[0] for m in server.media_for_package(conn, 1)])
+                self.assertEqual(["c.png"], [m[0] for m in server.media_for_package(conn, second)])
+            admin = staff(base, "admin")
+            _, _, first = request(base, "GET", "/deck", cookie=admin)
+            request(base, "POST", "/deck/select", {"deck": "scratch-deck", "csrf": csrf_for(admin)}, cookie=admin)
+            _, _, other = request(base, "GET", "/deck", cookie=admin)
+        self.assertIn("<b>2</b> media files", first)
+        self.assertIn("<b>1</b> media files", other)
+        self.assertNotIn("Free space on the server", other)
+
+    def test_sidebar_says_users_not_settings(self):
+        with running_server() as base:
+            admin = staff(base, "admin")
+            _, _, html = request(base, "GET", "/reviewer", cookie=admin)
+            _, _, users = request(base, "GET", "/admin/users", cookie=admin)
+        self.assertIn("<span>Users</span>", html)
+        self.assertNotIn("<span>Settings</span>", html)
+        self.assertIn("<h1>Users</h1>", users)
+
+
 if __name__ == "__main__":
     unittest.main()

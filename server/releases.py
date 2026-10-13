@@ -34,7 +34,7 @@ def sha_path(sha256):
     return os.path.join(media_dir(), sha256)
 
 
-def store_media(conn, filename, data):
+def store_media(conn, filename, data, deck_id=1):
     """Write the bytes once (by sha256) and record the filename. Idempotent."""
     sha = hashlib.sha256(data).hexdigest()
     row = conn.execute("SELECT sha256 FROM media WHERE filename=?", (filename,)).fetchone()
@@ -47,8 +47,8 @@ def store_media(conn, filename, data):
             fh.write(data)
         os.replace(tmp, path)
     if not existing:
-        conn.execute("INSERT OR REPLACE INTO media (filename, sha256, size) VALUES (?,?,?)",
-                     (filename, sha, len(data)))
+        conn.execute("INSERT OR REPLACE INTO media (filename, sha256, size, platform_deck) VALUES (?,?,?,?)",
+                     (filename, sha, len(data), deck_id))
     return {"filename": filename, "sha256": sha, "size": len(data), "existing": existing}
 
 

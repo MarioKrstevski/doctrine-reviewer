@@ -80,6 +80,9 @@ ICONS = {
             '<path d="m3 13 9 5 9-5"/></svg>',
     "shield": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" '
               'stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z"/></svg>',
+    "users": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" '
+             'stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/>'
+             '<path d="M3 20c.5-3.3 3-5 6-5s5.5 1.7 6 5M16 5.2a3.2 3.2 0 0 1 0 5.6M21 20c-.3-2.4-1.7-4-3.8-4.7"/></svg>',
     "gear": '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" '
             'stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/>'
             '<path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
@@ -151,7 +154,7 @@ def sidebar(user, decks, active_deck, active, counts, csrf, esc=_esc):
   <span class="group">Deck</span>
   {item("/deck", "Deck", "deck", "deck")}
   {item("/detection", "Detection", "detection", "shield") if admin else ""}
-  {item("/admin/users", "Settings", "admin", "gear") if admin else ""}
+  {item("/admin/users", "Users", "admin", "users") if admin else ""}
   <span class="group">Help</span>
   {item("/addon", "Add-on and testing", "addon", "help")}
   <a href="/updates">{ICONS["globe"]}<span>Public site</span></a>
