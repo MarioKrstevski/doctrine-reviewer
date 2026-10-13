@@ -93,3 +93,32 @@ class DirectEditTest(unittest.TestCase):
             import urllib.parse
             status, _, _ = request(base, "POST", "/cards/edit?guid=" + urllib.parse.quote(A, safe=""), {"Text": "x"}, cookie=cookie)
         self.assertEqual(403, status)
+
+
+class HistoryAndTagsTest(unittest.TestCase):
+    def test_tag_search(self):
+        with running_server() as base:
+            seed(base)
+            with server.db() as conn:
+                conn.execute("UPDATE notes SET tags_json=? WHERE doctrine_id=?",
+                             (json.dumps(["Doctorine::Yield::Step1::Gold"]), A))
+            user, pw = make_user(); _, cookie = login(base, user, pw)
+            _, _, html = request(base, "GET", "/cards?q=tag:Yield::Step1", cookie=cookie)
+            _, _, html2 = request(base, "GET", "/cards?q=Step1::Gold", cookie=cookie)
+        for h in (html, html2):
+            self.assertIn("Vulvar carcinoma", h)
+            self.assertNotIn("p53 blocks", h)
+
+    def test_history_and_pending_notice(self):
+        import revisions
+        with running_server() as base:
+            seed(base)
+            with server.db() as conn:
+                revisions.apply_edit(conn, A, {"Extra": "HPV E6/E7 degrade p53"}, 1, "staff")
+            user, pw = make_user(); _, cookie = login(base, user, pw)
+            from urllib.parse import quote
+            _, _, html = request(base, "GET", f"/cards/edit?guid={quote(A, safe='')}", cookie=cookie)
+        self.assertIn("History", html)
+        self.assertIn("direct edit", html)
+        self.assertIn("pending, next release", html)
+        self.assertIn("already has 1 pending edit", html)

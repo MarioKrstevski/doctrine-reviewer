@@ -242,7 +242,8 @@ def init_db():
         _ensure_columns(conn, "notes", {"doctorine_id": "TEXT", "guid": "TEXT",
                                         "retired": "INTEGER DEFAULT 0"})
         _ensure_columns(conn, "releases", {"package_path": "TEXT", "build_log": "TEXT",
-                                           "published_at": "TEXT", "built_by": "INTEGER"})
+                                           "published_at": "TEXT", "built_by": "INTEGER",
+                                           "public_notes": "TEXT", "visibility": "TEXT"})
         _ensure_columns(conn, "suggestions", {"release": "TEXT"})
         _ensure_columns(conn, "suggestions", {
             "resolved_by": "INTEGER",
@@ -1035,33 +1036,41 @@ def render_updates():
     total = counts["total"] or 0
     accepted = counts["accepted"] or 0
 
-    if rows:
-        def entry(r):
-            return f"""
+    with db() as conn:
+        public = [dict(r) for r in conn.execute(
+            "SELECT version, published_at, public_notes FROM releases WHERE status='published' "
+            "AND COALESCE(visibility,'public')!='silent' ORDER BY rowid DESC")]
+    def entry(r):
+        return f"""
 <div class="entry">
   <div class="stamp"><b>#{r['id']}</b>{esc((r['closed_at'] or '').split(' ')[0])}</div>
   <div class="what"><span class="kind">{esc(TYPE_LABELS.get(r['suggestion_type'], 'Fix'))}</span>
     {esc(r['publish_summary'] or r['text'][:120])}</div>
   <div class="credit">{('suggested by ' + esc(r['credit_name'])) if r['credit_name'] else 'community suggestion'}</div>
 </div>"""
-        rendered = [dict(r, html=entry(r)) for r in rows]
-        groups, order = {}, []
-        for r in rendered:
-            key = r["release"] or ""
-            if key not in groups:
-                groups[key] = []; order.append(key)
-            groups[key].append(r["html"])
-        parts = []
-        for key in order:
-            title = f"Release {esc(key)}" if key else "Accepted, in the next release"
-            parts.append(f'<h2 class="release-head">{title}</h2>' + "".join(groups[key]))
+    by_release = {}
+    for r in rows:
+        by_release.setdefault(r["release"] or "", []).append(entry(r))
+    parts = []
+    if by_release.get(""):
+        parts.append('<h2 class="release-head">Accepted, in the next release</h2>' + "".join(by_release[""]))
+    for rel in public:
+        notes = (rel["public_notes"] or "").strip()
+        when = esc((rel["published_at"] or "").split(" ")[0])
+        notes_html = (f'<div class="release-notes">{"".join("<p>" + esc(p) + "</p>" for p in notes.split(chr(10) + chr(10)))}</div>'
+                      if notes else "")
+        fixes = by_release.get(rel["version"], [])
+        if notes or fixes:
+            parts.append(f'<h2 class="release-head">Release {esc(rel["version"])} <small>{when}</small></h2>'
+                         + notes_html + "".join(fixes))
+    if parts:
         ledger = f'<div class="ledger">{"".join(parts)}</div>'
     else:
         ledger = ('<div class="ledger"><div class="empty">No published updates '
-                  'yet — accepted suggestions will appear here.</div></div>')
+                  'yet — release notes and accepted suggestions will appear here.</div></div>')
 
     body = f"""
-<h1>Community updates</h1>
+<h1>Updates</h1>
 <p class="sub">Every entry below started as a suggestion sent by a student from
 inside Anki, was reviewed by our team, and shipped as a card update.
 {accepted} of {total} suggestions accepted so far.</p>
@@ -1726,7 +1735,8 @@ class Handler(BaseHTTPRequestHandler):
                     user, auth.csrf_token(self._cookie_token(), session_secret()), _selected_guids(form)))
             elif path == "/releases/cut":
                 guids = _selected_guids(form)
-                ok, message = cut_release(form.get("version", [""])[0], user["id"], guids)
+                ok, message = cut_release(form.get("version", [""])[0], user["id"], guids,
+                                          form.get("notes", [""])[0], form.get("visibility", ["public"])[0])
                 if ok:
                     self._redirect("/releases")
                 else:
@@ -2616,7 +2626,7 @@ def changelog_for(conn, guids):
     return "\n".join(lines)
 
 
-def cut_release(version, user_id, guids):
+def cut_release(version, user_id, guids, notes="", visibility="public"):
     """Draft release from the selected notes' pending changes. Returns (ok, message)."""
     version = (version or "").strip()
     if not version or "/" in version or ".." in version:
@@ -2635,9 +2645,11 @@ def cut_release(version, user_id, guids):
                      "AND id IN (SELECT CAST(substr(source, 12) AS INTEGER) FROM revisions "
                      "WHERE release=? AND source LIKE 'suggestion:%')", (version, version))
         conn.execute(
-            "INSERT INTO releases (version, status, note_count, changelog, created_at, built_by) "
-            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0), ?, ?, ?)",
-            (version, changelog, now(), user_id))
+            "INSERT INTO releases (version, status, note_count, changelog, created_at, built_by, "
+            "public_notes, visibility) "
+            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0), ?, ?, ?, ?, ?)",
+            (version, changelog, now(), user_id, (notes or "").strip() or None,
+             "silent" if visibility == "silent" else "public"))
     return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
 
 
@@ -2714,12 +2726,26 @@ def render_confirm_selection(user, csrf, guids, error=None):
 Cutting only drafts the release; building it is a separate confirmed step.</p>
 {msg}
 <div class="card"><div class="proposal">{lines or '<p>Nothing selected.</p>'}</div></div>
-<form method="post" action="/releases/cut" class="create-form">
+<form method="post" action="/releases/cut" class="create-form" style="display:grid;gap:14px;max-width:640px">
   <input type="hidden" name="csrf" value="{csrf}">{hidden}
-  <input type="text" name="version" placeholder="Version, e.g. {esc(_bump(cur))}" required>
-  <button type="submit" {'disabled' if not total else ''}>Cut release</button>
-  <a class="btn-link" href="/releases/next">Back</a>
-</form>"""
+  <div><b>Size of this release</b><br>
+    <label class="chk"><input type="radio" name="size" value="minor" checked> Minor, fixes and small additions &rarr; {esc(_bump(cur))}</label><br>
+    <label class="chk"><input type="radio" name="size" value="major"> Major, new content or restructuring &rarr; {esc(_bump_major(cur))}</label></div>
+  <div><label for="ver"><b>Version</b></label><br>
+    <input id="ver" type="text" name="version" value="{esc(_bump(cur))}" required></div>
+  <div><b>Who sees this release</b><br>
+    <label class="chk"><input type="radio" name="visibility" value="public" checked> Public: listed on the Updates page with the notes below</label><br>
+    <label class="chk"><input type="radio" name="visibility" value="silent"> Silent: students get it through the add-on, nothing is announced</label></div>
+  <div><label for="notes"><b>Release notes</b> (shown on the Updates page; blank line starts a new paragraph)</label><br>
+    <textarea id="notes" name="notes" rows="6" style="width:100%;box-sizing:border-box"></textarea></div>
+  <div><button type="submit" {'disabled' if not total else ''}>Cut release</button>
+  <a class="btn-link" href="/releases/next">Back</a></div>
+</form>
+<script>
+(function(){{var v=document.getElementById('ver');
+var m={{minor:{json.dumps(_bump(cur))},major:{json.dumps(_bump_major(cur))}}};
+document.querySelectorAll('input[name=size]').forEach(function(r){{r.addEventListener('change',function(){{v.value=m[r.value];}});}});}})();
+</script>"""
     return page("Confirm release", body, "pending", user, csrf)
 
 
@@ -2729,6 +2755,13 @@ def _bump(version):
         return f"{major}.{int(minor) + 1}"
     except ValueError:
         return "1.1"
+
+
+def _bump_major(version):
+    try:
+        return f"{int((version or '1.0').split('.')[0]) + 1}.0"
+    except ValueError:
+        return "2.0"
 
 
 def render_build_confirm(user, csrf, version, error=None):
@@ -3029,10 +3062,15 @@ def search_cards(conn, q):
         rows = conn.execute("SELECT * FROM notes WHERE anki_note_id=? AND retired=0", (int(q),)).fetchall()
         if rows:
             return rows
+    if q.lower().startswith("tag:"):
+        like = f"%{q[4:].strip()}%"
+        return conn.execute(
+            "SELECT * FROM notes WHERE retired=0 AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
+            (like, CARDS_LIMIT + 1)).fetchall()
     like = f"%{q}%"
     return conn.execute(
-        "SELECT * FROM notes WHERE retired=0 AND fields_json LIKE ? ORDER BY doctrine_id LIMIT ?",
-        (like, CARDS_LIMIT + 1)).fetchall()
+        "SELECT * FROM notes WHERE retired=0 AND (fields_json LIKE ? OR tags_json LIKE ?) "
+        "ORDER BY doctrine_id LIMIT ?", (like, like, CARDS_LIMIT + 1)).fetchall()
 
 
 def render_cards(user, csrf, q):
@@ -3060,18 +3098,58 @@ def render_cards(user, csrf, q):
 <h1>Cards</h1>
 <p class="sub">Find any card in the online deck and edit it directly. Edits go to Next release like accepted suggestions.</p>
 <form method="get" action="/cards" class="create-form">
-  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, or paste a note id / guid" style="min-width:360px" autofocus>
+  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, tag:Doctorine::Yield…, note id or guid" style="min-width:360px" autofocus>
   <button type="submit">Search</button>
 </form>
 {note}{''.join(items)}"""
     return page("Cards", body, "cards", user, csrf)
 
 
+def card_history_html(conn, guid):
+    """Timeline of every change and every suggestion on one card, newest first."""
+    events = []
+    for r in conn.execute(
+            "SELECT r.*, u.username FROM revisions r LEFT JOIN users u ON u.id=r.user_id "
+            "WHERE r.guid=? ORDER BY r.id DESC", (guid,)):
+        src = r["source"] or ""
+        if src.startswith("suggestion:"):
+            who = f'accepted suggestion #{esc(src.split(":")[1])}'
+        elif src.startswith("upload:"):
+            who = f"deck re-upload #{esc(src.split(':')[1])}"
+        else:
+            who = "direct edit"
+        by = f" by {esc(r['username'])}" if r["username"] else ""
+        state = (f'shipped in {esc(r["release"])}' if r["release"]
+                 else '<span class="badge warn">pending, next release</span>')
+        if r["field"] in revisions.EDITABLE_FIELDS:
+            diff = diff_words(r["before"] or "", r["after"] or "")
+            detail = f'<dl class="fields" style="height:auto"><dt>{esc(r["field"])}</dt><dd class="diff">{diff}</dd></dl>'
+        else:
+            detail = f'<p class="small">{esc(r["field"])}</p>'
+        events.append((r["created_at"] or "", r["id"], f"""
+<div class="entry"><div class="stamp"><b>Edit</b>{esc((r["created_at"] or "")[:16])}</div>
+<div class="what">{who}{by} &middot; {state}{detail}</div></div>"""))
+    for r in conn.execute("SELECT * FROM suggestions WHERE doctrine_id=? ORDER BY id DESC", (guid,)):
+        events.append((r["created_at"] or "", r["id"] + 10**9, f"""
+<div class="entry"><div class="stamp"><b>Report #{r["id"]}</b>{esc((r["created_at"] or "")[:16])}</div>
+<div class="what"><span class="badge dim">{esc(r["status"])}</span>
+{esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))}: {esc((r["text"] or "")[:300])}</div></div>"""))
+    if not events:
+        return '<p class="small">No changes or reports on this card yet.</p>'
+    events.sort(key=lambda e: (e[0], e[1]), reverse=True)
+    return "".join(e[2] for e in events)
+
+
 def render_card_edit(user, csrf, guid, error=None):
     with db() as conn:
         master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+        history = card_history_html(conn, guid) if master else ""
+        pend = conn.execute("SELECT COUNT(*) FROM revisions WHERE guid=? AND release IS NULL",
+                            (guid,)).fetchone()[0] if master else 0
     if master is None:
         return None
+    notice = (f'<p class="notice">This card already has {pend} pending edit(s) waiting for the next '
+              'release. The fields below show them; saving builds on top.</p>') if pend else ""
     values = json.loads(master["fields_json"] or "{}")
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
     tags = tag_chips(master["tags_json"])
@@ -3079,14 +3157,16 @@ def render_card_edit(user, csrf, guid, error=None):
 <h1>Edit card</h1>
 <p class="sub"><code>{esc(guid)}</code> &middot; {esc(master['note_type'])} &middot; v{master['version']}.
 Saving changes the card in the online deck and queues it for the next release.</p>
-{tags}{msg}
+{tags}{notice}{msg}
 <div class="ed-grid">
   <div class="ed-left">
     <div class="pane-label">Current card</div>
     {fields_pane(master['fields_json'], 'Current master')}
   </div>
   <div>{editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save")}</div>
-</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
+</div>
+<h2 style="margin-top:28px">History</h2>
+<div class="ledger">{history}</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
     return page("Edit card", body, "cards", user, csrf)
 
 

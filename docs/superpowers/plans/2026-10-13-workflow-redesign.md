@@ -37,10 +37,10 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       one) or Edit card; saving resolves the selected suggestions (default all open on
       that card) and queues a thank-you for each with an email. Banner shows target
       release.
-- [ ] **T5 Cards.** Tag search; History timeline (revisions + suggestions, date, who,
+- [x] **T5 Cards.** (done; image-rename rule moves to T8 where media is uploaded) Tag search; History timeline (revisions + suggestions, date, who,
       source, diff); "pending edit exists" notice on the editor; image-rename rule in
       the editor (warn when an `src` name exists with different content).
-- [ ] **T6 Release page.** Version suggestion (minor/major radio), public notes
+- [x] **T6 Release page.** (done) Version suggestion (minor/major radio), public notes
       (markdown-ish, plain) or silent; Updates shows release notes for public releases.
 - [ ] **T7 Add-on.** Prompt: "Your deck: 1.0 · Newest: 1.3 (3 releases behind)" side by
       side; ping `/api/ping` with install_id, add-on version, deck release, license id

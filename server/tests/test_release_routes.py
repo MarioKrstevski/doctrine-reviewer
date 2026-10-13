@@ -151,9 +151,32 @@ class BuildTest(unittest.TestCase):
                 conn.execute("INSERT INTO suggestions (token, doctrine_id, text, status, published, publish_summary, credit_name, closed_at, created_at) "
                              "VALUES ('t1','guidAAAAAA','x','resolved',1,'Fixed p53 wording','M.',?,?)", (server.now(), server.now()))
                 conn.execute("UPDATE suggestions SET release='1.1'")
+                conn.execute("UPDATE releases SET status='published', published_at=?, public_notes=? WHERE version='1.1'",
+                             (server.now(), "Cleaned up p53 cards.\n\nSecond paragraph."))
             html = server.render_updates()
+            with server.db() as conn:
+                conn.execute("UPDATE releases SET visibility='silent' WHERE version='1.1'")
+            silent = server.render_updates()
         self.assertIn("Release 1.1", html)
         self.assertIn("Fixed p53 wording", html)
+        self.assertIn("Cleaned up p53 cards.", html)
+        self.assertIn("<p>Second paragraph.</p>", html)
+        self.assertNotIn("Release 1.1", silent)
+        self.assertNotIn("Cleaned up p53", silent)
+
+    def test_cut_stores_notes_and_visibility_and_confirm_offers_major(self):
+        with running_server() as base:
+            cookie = self._cut(base)
+            with server.db() as conn:
+                revisions.apply_edit(conn, "guidAAAAAA", {"Text": "again"}, 1, "staff")
+            _, _, html = request(base, "POST", "/releases/confirm", {"csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
+            self.assertIn("2.0", html)
+            self.assertIn("1.2", html)
+            request(base, "POST", "/releases/cut", {"version": "2.0", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1",
+                                                    "notes": "Big one", "visibility": "silent"}, cookie=cookie)
+            with server.db() as conn:
+                r = dict(conn.execute("SELECT * FROM releases WHERE version='2.0'").fetchone())
+        self.assertEqual(("Big one", "silent"), (r["public_notes"], r["visibility"]))
 
 
 class DownloadTest(unittest.TestCase):
