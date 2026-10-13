@@ -17,6 +17,7 @@ constants below, changed by shipping a new build.
 """
 
 import hashlib
+import io
 import json
 import os
 import time
@@ -26,14 +27,14 @@ import urllib.error
 from aqt import mw, gui_hooks
 from aqt.qt import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QTextEdit, QLineEdit, QPushButton, QInputDialog, QCheckBox, QPlainTextEdit, Qt
+    QTextEdit, QLineEdit, QPushButton, QInputDialog, QCheckBox, QPlainTextEdit, QMessageBox, Qt
 )
 from aqt.utils import tooltip, showInfo, showWarning, openLink
 
-from . import ping, addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
+from . import ping, versions, addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.7.0"
+ADDON_VERSION = "1.7.1"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -261,7 +262,7 @@ class SentDialog(QDialog):
         self.url = url
 
         layout = QVBoxLayout(self)
-        head = QLabel("<b>Thank you — your suggestion was sent.</b>")
+        head = QLabel("<b>Thank you, your suggestion was sent.</b>")
         layout.addWidget(head)
 
         sub = QLabel("A reviewer will look at it. You can check what happened "
@@ -354,6 +355,12 @@ def open_suggestion_dialog():
     if card is None:
         tooltip("No card is being reviewed.")
         return
+    # The reviewer holds a cached copy of the card and its note. A deck update
+    # rewrites the note in the collection, so read both again from the collection.
+    try:
+        card = mw.col.get_card(card.id)
+    except Exception:
+        addon_log.exception("reload card")
 
     cfg = get_config()
     note = card.note()
@@ -442,7 +449,7 @@ def open_suggestion_dialog():
         if tracking:
             SentDialog(mw, tracking).exec()
         else:
-            tooltip("Suggestion sent — thank you!", period=2500)
+            tooltip("Suggestion sent, thank you!", period=2500)
 
     mw.taskman.run_in_background(task, on_done)
 
@@ -842,7 +849,7 @@ def diagnostics_text() -> str:
 class DiagnosticsDialog(QDialog):
     def __init__(self, parent, text):
         super().__init__(parent)
-        self.setWindowTitle("Doctrine Editor — Diagnostics")
+        self.setWindowTitle("Doctrine Editor: Diagnostics")
         self.setMinimumSize(640, 480)
         layout = QVBoxLayout(self)
         self.box = QTextEdit()
@@ -919,6 +926,58 @@ gui_hooks.webview_will_set_content.append(on_webview_will_set_content)
 gui_hooks.reviewer_did_show_question.append(on_reviewer_did_show_question)
 gui_hooks.webview_did_receive_js_message.append(on_js_message)
 gui_hooks.main_window_did_init.append(setup_menu)
+def check_for_addon_update():
+    """On open: if the server hands out a newer add-on, offer to install it."""
+    def task():
+        cfg = get_config()
+        base = api_base(cfg)
+        return base, get_json(base + "/where").get("addon_version")
+
+    def done(fut):
+        try:
+            base, latest = fut.result()
+        except Exception:
+            addon_log.exception("addon update check")
+            return
+        if not versions.newer(latest, ADDON_VERSION):
+            return
+        box = QMessageBox(mw)
+        box.setWindowTitle("Doctrine Editor update")
+        box.setText(f"A new version of the Doctrine Editor add-on is available.\n\n"
+                    f"You have {ADDON_VERSION}. Newest is {latest}.")
+        box.setInformativeText("Update now? Anki must be restarted afterwards.")
+        update = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is update:
+            _install_addon_update(base, latest)
+
+    mw.taskman.run_in_background(task, done)
+
+
+def _install_addon_update(base, latest):
+    def task():
+        url = base.rstrip("/") + "/download/doctrine_editor.ankiaddon"
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read()
+
+    def done(fut):
+        try:
+            data = fut.result()
+            result = mw.addonManager.install(io.BytesIO(data))
+            if getattr(result, "errmsg", None):
+                raise RuntimeError(result.errmsg)
+        except Exception as e:
+            addon_log.exception("addon self-update")
+            showWarning("The update could not be installed automatically.\n\n"
+                        f"{e}\n\nThe install page will open so you can install it by hand.")
+            openLink(base.rstrip("/") + "/install")
+            return
+        showInfo(f"Doctrine Editor {latest} is installed. Restart Anki to finish.")
+
+    mw.taskman.run_in_background(task, done)
+
+
 def send_ping_in_background():
     """Once a day, tell the platform this install exists (see ping.py)."""
     d = user_files_dir()
@@ -926,7 +985,7 @@ def send_ping_in_background():
         return
     try:
         body = ping.payload(state.install_id(d), ADDON_VERSION,
-                            sync_state.load(d)["release"], mw.col.media.dir())
+                            sync_state.load(d)["release"], mw.col.media.dir(), DECK_SLUG)
     except Exception:
         addon_log.exception("ping payload")
         return
@@ -947,4 +1006,5 @@ def send_ping_in_background():
 
 gui_hooks.profile_did_open.append(lambda: refresh_official_in_background())
 gui_hooks.profile_did_open.append(lambda: send_ping_in_background())
-gui_hooks.profile_did_open.append(lambda: check_for_deck_updates(silent=True))
+gui_hooks.profile_did_open.append(lambda: check_for_deck_updates(force=True, silent=True))
+gui_hooks.profile_did_open.append(lambda: check_for_addon_update())

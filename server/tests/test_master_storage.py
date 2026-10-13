@@ -120,7 +120,7 @@ class MasterPaneTest(unittest.TestCase):
                                            "Extra": "note here", "Empty": ""})
         self.assertIn("Text", html)
         self.assertIn("note here", html)
-        self.assertIn("Current master", html)
+        self.assertIn("Current card", html)
 
     def test_cloze_markers_are_highlighted_not_rendered_away(self):
         with running_server() as base:

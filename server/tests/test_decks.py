@@ -67,5 +67,66 @@ class DeckApiTest(unittest.TestCase):
         self.assertEqual(second, pd)
 
 
+class DeckWorkspaceTest(unittest.TestCase):
+    def _login(self, base, role="admin"):
+        return staff(base, role)
+
+    def test_selecting_a_deck_scopes_cards_and_the_inbox(self):
+        with running_server() as base:
+            register_note(base, "guidAAAAAA", fields={"Text": "first deck card", "Extra": ""})
+            register_note(base, "guidBBBBBB", fields={"Text": "second deck card", "Extra": ""})
+            second = server.add_deck("Pathoma Companion")
+            with server.db() as conn:
+                conn.execute("UPDATE notes SET platform_deck=? WHERE doctrine_id='guidBBBBBB'", (second,))
+            cookie = self._login(base)
+            _, _, html = request(base, "GET", "/cards?q=deck+card", cookie=cookie)
+            self.assertIn("first deck card", html)
+            self.assertNotIn("second deck card", html)
+            request(base, "POST", "/deck/select", {"deck": "pathoma-companion", "csrf": csrf_for(cookie)}, cookie=cookie)
+            _, _, html = request(base, "GET", "/cards?q=deck+card", cookie=cookie)
+            self.assertIn("second deck card", html)
+            self.assertNotIn("first deck card", html)
+            self.assertIn("Pathoma Companion", html)
+
+    def test_public_pages_stay_public_when_signed_in(self):
+        with running_server() as base:
+            cookie = self._login(base)
+            for path in ("/updates", "/install"):
+                _, _, html = request(base, "GET", path, cookie=cookie)
+                self.assertNotIn('class="sidebar"', html, path)
+                self.assertIn("Back to workspace", html, path)
+            _, _, html = request(base, "GET", "/reviewer", cookie=cookie)
+            self.assertIn('class="sidebar"', html)
+
+    def test_triple_confirm_delete_needs_the_typed_name_and_protects_the_first_deck(self):
+        with running_server() as base:
+            register_note(base, "guidBBBBBB")
+            second = server.add_deck("Scratch Deck")
+            with server.db() as conn:
+                conn.execute("UPDATE notes SET platform_deck=? WHERE doctrine_id='guidBBBBBB'", (second,))
+            cookie = self._login(base)
+            _, _, html = request(base, "GET", "/deck", cookie=cookie)
+            self.assertIn("Are you really sure?", html)
+            self.assertIn("Type the deck name to confirm", html)
+            self.assertEqual(1, html.count('data-dialog="del1-'))   # no delete button on the first deck
+            request(base, "POST", "/deck/delete", {"deck": "scratch-deck", "confirm_name": "wrong", "csrf": csrf_for(cookie)}, cookie=cookie)
+            request(base, "POST", "/deck/delete", {"deck": "doctorine", "confirm_name": "Doctorine", "csrf": csrf_for(cookie)}, cookie=cookie)
+            with server.db() as conn:
+                self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0])
+            request(base, "POST", "/deck/delete", {"deck": "scratch-deck", "confirm_name": "Scratch Deck", "csrf": csrf_for(cookie)}, cookie=cookie)
+            with server.db() as conn:
+                self.assertEqual(["doctorine"], [r[0] for r in conn.execute("SELECT slug FROM decks")])
+                self.assertEqual(0, conn.execute("SELECT COUNT(*) FROM notes WHERE doctrine_id='guidBBBBBB'").fetchone()[0])
+
+    def test_reviewers_cannot_delete(self):
+        with running_server() as base:
+            server.add_deck("Scratch Deck")
+            cookie = self._login(base, "reviewer")
+            status, _, _ = request(base, "POST", "/deck/delete", {"deck": "scratch-deck", "confirm_name": "Scratch Deck", "csrf": csrf_for(cookie)}, cookie=cookie)
+            with server.db() as conn:
+                n = conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0]
+        self.assertEqual((403, 2), (status, n))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -209,4 +209,4 @@ class OutboxPageTest(unittest.TestCase):
             resolved_with_email(base, cookie)
             _, _, html = request(base, "GET", "/reviewer", cookie=cookie)
         self.assertIn("Outbox", html)
-        self.assertRegex(html, r"Outbox[^<]*<[^>]*>\s*1\s*<")
+        self.assertRegex(html, r"Outbox</span><span class=\"count\">1</span>")

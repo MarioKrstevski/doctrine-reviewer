@@ -100,7 +100,7 @@ class ReviewerWithoutMasterTest(unittest.TestCase):
                     snapshot={"fields": {"Text": "Q"},
                               "content_hash": server.content_hash({"Text": "Q"})})
             html = self._html(base)
-        self.assertIn("Matches current version", html)
+        self.assertIn("Same as the current card", html)
 
     def test_guid_with_url_characters_is_escaped_in_html(self):
         with running_server() as base:

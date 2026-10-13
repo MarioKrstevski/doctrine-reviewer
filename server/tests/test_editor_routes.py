@@ -170,7 +170,7 @@ class PendingPageTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn(GUID.replace("%", "%"), html.replace("&amp;", "&"))
         self.assertIn("<del>", html)
-        self.assertIn("1 note", html)
+        self.assertIn("<b>1</b> card", html)
 
     def test_requires_login(self):
         with running_server() as base:

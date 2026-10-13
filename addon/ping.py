@@ -43,8 +43,10 @@ def mark_sent(directory, now=None):
         pass
 
 
-def payload(install_id, addon_version, release, media_dir):
+def payload(install_id, addon_version, release, media_dir, deck=""):
     out = {"install_id": install_id, "addon_version": addon_version, "release": release or ""}
+    if deck:
+        out["deck"] = deck
     lic = read_license(media_dir)
     if lic:
         out["license"] = lic

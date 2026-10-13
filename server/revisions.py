@@ -69,7 +69,7 @@ def new_guid(conn):
             return g
 
 
-def add_note(conn, note_type, fields, tags, user_id, deck="Doctorine v2"):
+def add_note(conn, note_type, fields, tags, user_id, deck="Doctorine v2", platform_deck=1):
     """Create an official note. Returns its guid."""
     fields = {k: (v if isinstance(v, str) else "") for k, v in (fields or {}).items()}
     if not fields.get("Text", "").strip():
@@ -77,10 +77,10 @@ def add_note(conn, note_type, fields, tags, user_id, deck="Doctorine v2"):
     guid = new_guid(conn)
     conn.execute(
         """INSERT INTO notes (doctrine_id, guid, doctorine_id, note_type, deck, fields_json,
-                              tags_json, content_hash, version, updated_at, retired)
-           VALUES (?,?,?,?,?,?,?,?,1,?,0)""",
+                              tags_json, content_hash, version, updated_at, retired, platform_deck)
+           VALUES (?,?,?,?,?,?,?,?,1,?,0,?)""",
         (guid, guid, "", note_type, deck, json.dumps(fields), json.dumps(list(tags or [])),
-         _content_hash(fields), _now()))
+         _content_hash(fields), _now(), platform_deck))
     conn.execute(
         """INSERT INTO revisions (guid, field, before, after, user_id, source, created_at)
            VALUES (?,?,?,?,?,?,?)""",
@@ -88,11 +88,13 @@ def add_note(conn, note_type, fields, tags, user_id, deck="Doctorine v2"):
     return guid
 
 
-def pending(conn):
-    """Unreleased revisions grouped by note, oldest note first."""
+def pending(conn, deck_id=None):
+    """Unreleased revisions grouped by note, oldest note first. deck_id limits to one deck."""
     rows = conn.execute(
         """SELECT r.*, u.username FROM revisions r LEFT JOIN users u ON u.id = r.user_id
-           WHERE r.release IS NULL ORDER BY r.id""").fetchall()
+           LEFT JOIN notes n ON n.doctrine_id = r.guid
+           WHERE r.release IS NULL AND (? IS NULL OR COALESCE(n.platform_deck,1) = ?)
+           ORDER BY r.id""", (deck_id, deck_id)).fetchall()
     groups, order = {}, []
     for r in rows:
         if r["guid"] not in groups:
@@ -135,10 +137,10 @@ def kind_of(conn, rev):
     return "staff"
 
 
-def pending_by_kind(conn, only_guids=None):
+def pending_by_kind(conn, only_guids=None, deck_id=None):
     """[{kind, label, notes: [{guid, revisions, sources, users}]}] in KIND_ORDER."""
     groups = {}
-    for g in pending(conn):
+    for g in pending(conn, deck_id):
         if only_guids is not None and g["guid"] not in only_guids:
             continue
         kinds = [kind_of(conn, rv) for rv in g["revisions"]]

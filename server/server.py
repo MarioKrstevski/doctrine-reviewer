@@ -35,6 +35,8 @@ import email_out
 import releases
 import release_build
 import apkgfile
+import cardview
+import ui
 import reupload
 import revisions
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -266,7 +268,9 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_installs_license ON installs(license);""")
         if conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0] == 0:
             conn.execute("INSERT INTO decks (id, slug, name, created_at) VALUES (1, 'doctorine', 'Doctorine', datetime('now'))")
-        for t in ("notes", "releases", "uploads", "suggestions"):
+        _ensure_columns(conn, "users", {"active_deck": "INTEGER"})
+        _ensure_columns(conn, "installs", {"deck": "TEXT"})
+        for t in ("notes", "releases", "uploads", "suggestions", "download_tokens"):
             _ensure_columns(conn, t, {"platform_deck": "INTEGER DEFAULT 1"})
         _ensure_columns(conn, "suggestions", {"release": "TEXT"})
         _ensure_columns(conn, "suggestions", {
@@ -778,18 +782,21 @@ FONTS_LINK = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
               '&family=Plus+Jakarta+Sans:ital,wght@0,400..700;1,400&display=swap">')
 
 
-def _staff_counts():
+def _staff_counts(deck_id=1):
     with db() as conn:
-        inbox = conn.execute("SELECT COUNT(DISTINCT doctrine_id) FROM suggestions WHERE status='open'").fetchone()[0]
-        nxt = conn.execute("SELECT COUNT(DISTINCT guid) FROM revisions WHERE release IS NULL").fetchone()[0]
-    return inbox, nxt, pending_thank_yous()
+        inbox = conn.execute("SELECT COUNT(DISTINCT doctrine_id) FROM suggestions WHERE status='open' "
+                             "AND COALESCE(platform_deck,1)=?", (deck_id,)).fetchone()[0]
+        nxt = conn.execute("SELECT COUNT(DISTINCT r.guid) FROM revisions r JOIN notes n ON n.doctrine_id=r.guid "
+                           "WHERE r.release IS NULL AND COALESCE(n.platform_deck,1)=?", (deck_id,)).fetchone()[0]
+    return inbox, nxt, pending_thank_yous(deck_id)
 
 
-def page(title, body, active="", user=None, csrf=""):
+def page(title, body, active="", user=None, csrf="", public=False):
+    """public=True always uses the public header, even for a signed-in staff member."""
     head = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} — Doctrine</title>{FONTS_LINK}
-<style>{BASE_CSS}{LEDGER_CSS}{SHELL_CSS}</style></head><body>"""
+<title>{esc(title)} | Doctrine</title>{FONTS_LINK}
+<style>{BASE_CSS}{LEDGER_CSS}{SHELL_CSS}{ui.UI_CSS}</style></head><body>"""
     script = """<script>
 document.querySelectorAll('.actions input[name=publish]').forEach(cb => {
   const fields = cb.closest('form').querySelector('.pub-fields');
@@ -797,46 +804,22 @@ document.querySelectorAll('.actions input[name=publish]').forEach(cb => {
   const sync = () => fields.classList.toggle('off', !cb.checked);
   cb.addEventListener('change', sync); sync();
 });
-</script></body></html>"""
+</script>""" + ui.UI_JS + "</body></html>"
 
-    if not user:
+    if not user or public:
         def pub(href, label, key):
             cls = ' class="active"' if key == active else ""
             return f'<a href="{href}"{cls}>{label}</a>'
+        back = (f'<a href="/reviewer" class="back">Back to workspace</a>' if user else "")
         return (head + f"""
 <header class="site"><div class="wrap">
   <span class="brand">Doctrine<small>Card quality</small></span>
-  <nav>{pub("/updates", "Updates", "updates")}{pub("/install", "Install the add-on", "install")}</nav>
+  <nav>{pub("/updates", "Updates", "updates")}{pub("/install", "Install the add-on", "install")}{back}</nav>
 </div></header>
 <div class="wrap">{body}</div>""" + script)
 
-    inbox, nxt, thanks = _staff_counts()
-
-    def item(href, label, key, n=0):
-        cls = ' class="active"' if key == active else ""
-        c = f'<span class="count">{n}</span>' if n else ""
-        return f'<a href="{href}"{cls}>{label}{c}</a>'
-
-    admin = user.get("role") == "admin"
-    side = f"""
-<aside class="sidebar">
-  <span class="brand">Doctrine<small>Deck workspace</small></span>
-  <span class="group">Review</span>
-  {item("/reviewer", "Inbox", "reviewer", inbox)}
-  {item("/cards", "Cards", "cards")}
-  <span class="group">Ship</span>
-  {item("/releases/next", "Next release", "pending", nxt)}
-  {item("/releases", "Releases", "releases")}
-  {item("/outbox", "Outbox", "outbox", thanks)}
-  <span class="group">Deck</span>
-  {item("/deck", "Deck", "deck")}
-  {item("/detection", "Detection", "detection") if admin else ""}
-  {item("/admin/users", "Settings", "admin") if admin else item("/account", "Account", "account")}
-  {item("/updates", "Public updates", "updates")}
-  <div class="who"><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}">
-  <span>{esc(user["username"])}</span><button type="submit">Sign out</button></form>
-  <a href="/account" style="padding:6px 0 0;font-size:12px">Account</a></div>
-</aside>"""
+    decks, deck_id = deck_context(user)
+    side = ui.sidebar(user, decks, deck_id, active, _staff_counts(deck_id), csrf, esc)
     return head + f'<div class="staff">{side}<main><div class="wrap">{body}</div></main></div>' + script
 
 
@@ -881,134 +864,190 @@ def _next_version_hint():
         return "the next one"
 
 
+def _mark_clozes(escaped):
+    return _CLOZE.sub(lambda m: f"<mark>{m.group(0)}</mark>", escaped)
+
+
+def _field_rows(fields):
+    return "".join(f'<dt>{esc(k)}</dt><dd>{_mark_clozes(esc(v))}</dd>' for k, v in (fields or {}).items()
+                   if k in revisions.EDITABLE_FIELDS and (v or "").strip()) or '<p class="small">No text.</p>'
+
+
+def _rendered(fields):
+    f = cardview.faces(fields)
+    extra = (f'<div class="sec extra" style="margin:8px 0 0"><div class="lab">Extra</div>'
+             f'<div class="txt">{f["extra"]}</div></div>') if f["extra"].strip() else ""
+    return (f'<div class="sec front" style="margin:0"><div class="lab">Front</div><div class="txt">{f["front"]}</div></div>'
+            f'<div class="sec back" style="margin:8px 0 0"><div class="lab">Back</div><div class="txt">{f["back"]}</div></div>'
+            f'{extra}')
+
+
+def _card_pane(label, badge, fields, other=None, group="", anki_iframe=""):
+    """A pane with Rendered | HTML (| Differences | As Anki showed it) views of one card's fields."""
+    views = [("rendered", "Rendered"), ("html", "HTML")]
+    diff_html = ""
+    if other is not None:
+        diffs = diff_fields(other, fields)
+        diff_html = ("".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
+                     or '<p class="small">No difference in Text or Extra.</p>')
+        views.append(("diff", "Differences"))
+    if anki_iframe:
+        views.append(("anki", "As Anki showed it"))
+    buttons = "".join(f'<button type="button" data-show="{v}"{" class=\"on\"" if i == 0 else ""}>{t}</button>'
+                      for i, (v, t) in enumerate(views))
+    panes = (f'<div data-group="{group}" data-value="rendered" class="rendered">{_rendered(fields)}</div>'
+             f'<div data-group="{group}" data-value="html" hidden><dl class="fields" style="height:auto;border:0;padding:0">'
+             f'{_field_rows(fields)}</dl></div>')
+    if other is not None:
+        panes += (f'<div data-group="{group}" data-value="diff" hidden><dl class="fields" '
+                  f'style="height:auto;border:0;padding:0">{diff_html}</dl></div>')
+    if anki_iframe:
+        panes += f'<div data-group="{group}" data-value="anki" hidden style="margin:-14px -16px">{anki_iframe}</div>'
+    return (f'<div class="pane"><div class="pane-label">{label}{badge}'
+            f'<span class="seg" data-for="{group}">{buttons}</span></div>'
+            f'<div class="pane-body">{panes}</div></div>')
+
+
+def render_inbox_item(r, master, csrf):
+    """One suggestion: the student's own copy, our current card, and what they asked for."""
+    sid = r["id"]
+    status = r["status"]
+    current = json.loads(master["fields_json"]) if master is not None else {}
+    try:
+        theirs = json.loads(r["snap_fields_json"] or "{}")
+    except ValueError:
+        theirs = {}
+    if master is None:
+        stale = False
+    elif theirs:
+        # Compare what a reviewer can change. Their copy matching ours is what makes a proposal safe to accept.
+        stale = any(theirs.get(f, "") != current.get(f, "") for f in revisions.EDITABLE_FIELDS if f in theirs)
+    else:
+        stale = master["content_hash"] != r["snap_hash"]
+    status_badge = {"open": '<span class="badge ok">Open</span>', "resolved": '<span class="badge dim">Resolved</span>',
+                    "declined": '<span class="badge dim">Declined</span>',
+                    "expired": '<span class="badge dim">Expired</span>'}[status]
+    if master is None:
+        state_badge = '<span class="badge">No master on file</span>'
+    elif stale:
+        state_badge = f'<span class="badge warn">Card changed since submission</span>'
+    else:
+        state_badge = '<span class="badge ok">Same as the current card</span>'
+
+    ours = (_card_pane(f'Current card (v{master["version"]})', "", current, None, f"c{sid}") if master is not None else
+            '<div class="pane"><div class="pane-label">Current card</div><div class="pane-body">'
+            '<p class="small">No copy of this card is on file. Compare the student\'s copy yourself.</p></div></div>')
+    anki_frame = (card_iframe(r["snap_question"], r["snap_answer"], r["snap_css"], "What the student saw")
+                  if (r["snap_question"] or r["snap_answer"]) else "")
+    student = _card_pane("What the student has", "", theirs, current if master is not None else None, f"s{sid}",
+                         anki_frame)
+
+    # the suggestion and the proposed change
+    proposal = ""
+    proposed = None
+    if r["proposed_fields_json"]:
+        try:
+            proposed = json.loads(r["proposed_fields_json"])
+        except ValueError:
+            proposed = None
+    if proposed is not None and master is not None:
+        diffs = diff_fields(current, proposed)
+        rows_ = "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
+        proposal = (f'<div class="pane-label" style="margin:12px -16px 0">Proposed change</div>'
+                    f'<dl class="fields" style="height:auto;border:0;padding:8px 0 0">'
+                    f'{rows_ or "<p class=small>Identical to the current card.</p>"}</dl>')
+        if stale:
+            proposal += ('<p class="stale-hint" style="margin-top:8px">The student wrote this against an older '
+                         'version of the card, so it cannot be accepted as is. Use Edit proposal.</p>')
+    sugg = (f'<div class="pane suggestion"><div class="pane-label">Suggestion<span class="badge dim">'
+            f'{esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))}</span></div>'
+            f'<div class="pane-body"><div class="sugg-body" style="padding:0">{esc(r["text"])}</div>{proposal}</div></div>')
+
+    # details drawer
+    contact = f'<dt>email</dt><dd>{esc(r["email"])}</dd>' if r["email"] else ""
+    details = (f'<details class="trace"><summary>Details</summary><dl>'
+               f'<dt>deck</dt><dd>{esc(r["deck"])}</dd><dt>note type</dt><dd>{esc(r["note_type"])}</dd>'
+               f'<dt>card id</dt><dd><code>{esc(r["doctrine_id"])}</code></dd>'
+               f'{f"<dt>nid</dt><dd>{r["anki_note_id"]}</dd>" if r["anki_note_id"] else ""}{contact}</dl>'
+               f'{trace_block(r)}</details>')
+    email_chip = '<span class="badge dim">Email left</span>' if r["email"] else ""
+
+    if status == "open":
+        has_proposal = bool(proposed) and master is not None and bool(diff_fields(current, proposed))
+        can_accept = has_proposal and not stale
+        accept = ('<button name="do" value="accept_proposal">Accept proposal</button>' if can_accept else "")
+        edit_label = "Edit proposal" if has_proposal else "Edit card"
+        expire_hint = ('<p class="stale-hint">The card already changed. If the issue is gone, mark it expired.</p>'
+                       if stale else "")
+        actions = f"""
+<div class="actions">{expire_hint}
+<form method="post" action="/reviewer/action">
+  <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{sid}">
+  <span class="hint">Accepting changes the card in the online deck and queues it for the next release.</span>
+  <span class="btns">
+    {accept}
+    <a class="btn-link-primary" href="/edit/{sid}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
+    <button name="do" value="duplicate" class="secondary" title="Same issue as another report on this card. The student still gets a thank-you.">Duplicate</button>
+    <button name="do" value="decline" class="secondary">Decline</button>
+    <button name="do" value="expire" class="ghost">Mark expired</button>
+  </span>
+</form></div>"""
+    else:
+        bits = []
+        with db() as conn:
+            edited = conn.execute("SELECT COUNT(*) FROM revisions WHERE source=?", (f"suggestion:{sid}",)).fetchone()[0]
+        if edited:
+            bits.append(f'<span class="badge ok">Edited</span> {edited} field change(s) in the next release')
+        if r["resolution_note"]:
+            bits.append(f"Note: {esc(r['resolution_note'])}")
+        if r["published"]:
+            bits.append(f"Published: &ldquo;{esc(r['publish_summary'])}&rdquo;")
+        if r["closed_at"]:
+            bits.append(ui.human_time(r["closed_at"]))
+        actions = f'<div class="actions">{" &middot; ".join(bits) or "Closed."}</div>'
+
+    return f"""
+<div class="card" data-scope>
+  <div class="card-head">
+    {status_badge} {state_badge} {email_chip}
+    <span class="meta"><b>#{sid}</b></span>
+    <time>{ui.human_time(r["created_at"])}</time>
+  </div>
+  {tag_chips(r["tags_json"])}
+  <div style="padding:0 16px">{details}</div>
+  <div class="panes eq">{student}{ours}{sugg}</div>
+  {actions}
+</div>"""
+
+
 def render_reviewer(user=None, secret=None, session_token=None):
     csrf = auth.csrf_token(session_token, secret) if session_token and secret else ""
+    deck_id = active_deck_id(user) if user else 1
     with db() as conn:
         # Every open item, plus a bounded tail of closed ones. Neither
         # query may scale with the size of the deck or of history.
         rows = conn.execute(
-            "SELECT * FROM suggestions WHERE status='open' ORDER BY id DESC"
-        ).fetchall()
+            "SELECT * FROM suggestions WHERE status='open' AND COALESCE(platform_deck,1)=? ORDER BY id DESC",
+            (deck_id,)).fetchall()
         rows += conn.execute(
-            "SELECT * FROM suggestions WHERE status!='open' "
-            "ORDER BY id DESC LIMIT ?", (RECENT_CLOSED_SHOWN,)
+            "SELECT * FROM suggestions WHERE status!='open' AND COALESCE(platform_deck,1)=? "
+            "ORDER BY id DESC LIMIT ?", (deck_id, RECENT_CLOSED_SHOWN)
         ).fetchall()
         masters = fetch_masters(conn, {r["doctrine_id"] for r in rows})
 
     if not rows:
-        body = ('<h1>Reviewer queue</h1><p class="sub">Suggestions from students '
+        body = ('<h1>Inbox</h1><p class="sub">Suggestions from students '
                 'land here, next to the card they saw and its current master '
                 'version.</p><div class="empty"><b>The queue is clear</b>'
                 'When a student clicks &#9998; Suggest inside Anki, their note '
                 'arrives here with the exact card they were looking at.</div>')
-        return page("Reviewer queue", body, "reviewer", user, csrf)
+        return page("Inbox", body, "reviewer", user, csrf)
 
     items = []
     item_card = []
     for r in rows:
         item_card.append((r["doctrine_id"], r["status"], r["id"]))
-        master = masters.get(r["doctrine_id"])
-        stale_cls = ""
-        if master is None:
-            state_badge = '<span class="badge">No master on file</span>'
-            master_pane = ('<div class="pane"><div class="pane-label">Current '
-                           'master</div><div class="sugg-body sugg-empty">No '
-                           'master copy on file for this card, so the '
-                           'snapshot on the left is the only version we have. '
-                           'Compare it against the deck yourself.</div></div>')
-            stale = False
-        else:
-            stale = master["content_hash"] != r["snap_hash"]
-            if stale:
-                state_badge = (f'<span class="badge warn">Card changed since '
-                               f'submission — now v{master["version"]}</span>')
-                stale_cls = " stale"
-            else:
-                state_badge = '<span class="badge ok">Matches current version</span>'
-            master_pane = fields_pane(
-                master["fields_json"], f'Current master (v{master["version"]})')
-            if stale_cls:
-                master_pane = master_pane.replace(
-                    '<div class="pane">', f'<div class="pane{stale_cls}">', 1)
-
-        status = r["status"]
-        status_badge = {
-            "open": '<span class="badge ok">Open</span>',
-            "resolved": '<span class="badge dim">Resolved</span>',
-            "declined": '<span class="badge dim">Declined</span>',
-            "expired": '<span class="badge dim">Expired</span>',
-        }[status]
-
-        snapshot_pane = card_iframe(
-            r["snap_question"], r["snap_answer"], r["snap_css"],
-            "What the student saw")
-
-        contact = f' &middot; {esc(r["email"])}' if r["email"] else ""
-        sugg_pane = (
-            '<div class="pane suggestion"><div class="pane-label">Suggestion'
-            f'<span class="badge dim">'
-            f'{esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))}'
-            f'</span></div>'
-            f'<div class="sugg-body">{esc(r["text"])}</div></div>'
-        )
-
-        if status == "open":
-            expire_hint = ""
-            if stale:
-                expire_hint = ('<p class="stale-hint">The card already '
-                               'changed — if the issue is gone, mark it '
-                               'expired.</p>')
-            has_proposal = bool(r["proposed_fields_json"]) and master is not None
-            accept = (f'<button name="do" value="accept_proposal">Accept proposal</button>'
-                      if has_proposal else "")
-            edit_label = "Edit and accept" if not has_proposal else "Edit proposal, then accept"
-            actions = f"""
-<div class="actions">{expire_hint}
-<form method="post" action="/reviewer/action">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="hidden" name="id" value="{r['id']}">
-  <span class="hint">Accepting changes the card in the online deck and queues it for the next release.</span>
-  <span class="btns">
-    {accept}
-    <a class="btn-link-primary" href="/edit/{r['id']}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
-    <button name="do" value="duplicate" class="secondary" title="Same issue as another report on this card; the student still gets a thank-you">Duplicate</button>
-    <button name="do" value="decline" class="secondary">Decline</button>
-    <button name="do" value="expire" class="ghost">Mark expired</button>
-  </span>
-</form></div>"""
-        else:
-            closed_bits = []
-            with db() as conn:
-                edited = conn.execute(
-                    "SELECT COUNT(*) FROM revisions WHERE source=?",
-                    (f"suggestion:{r['id']}",)).fetchone()[0]
-            if edited:
-                closed_bits.append(f'<span class="badge ok">Edited</span> '
-                                   f'{edited} field change(s) pending release')
-            if r["resolution_note"]:
-                closed_bits.append(f"Note: {esc(r['resolution_note'])}")
-            if r["published"]:
-                closed_bits.append(f"Published: &ldquo;{esc(r['publish_summary'])}&rdquo;")
-            if r["closed_at"]:
-                closed_bits.append(esc(r["closed_at"]))
-            actions = (f'<div class="actions">{" &middot; ".join(closed_bits) or "Closed."}'
-                       '</div>')
-
-        items.append(f"""
-<div class="card">
-  <div class="card-head">
-    {status_badge} {state_badge}
-    <span class="meta"><b>#{r['id']}</b> &middot; {esc(r['deck'])} &middot;
-    {esc(r['note_type'])} &middot; <code>{esc(r['doctrine_id'])}</code>
-    {f"&middot; <code>nid:{r['anki_note_id']}</code>" if r['anki_note_id'] else ""}{contact}</span>
-    <time>{esc(r['created_at'])}</time>
-  </div>
-  {tag_chips(r["tags_json"])}
-  <div class="panes">{snapshot_pane}{master_pane}{sugg_pane}</div>
-  {proposal_block(r, master, csrf)}
-  {trace_block(r)}
-  {actions}
-</div>""")
+        items.append(render_inbox_item(r, masters.get(r["doctrine_id"]), csrf))
 
     # Group open items by card; a card with several open reports gets a header.
     order, groups, closed = [], {}, []
@@ -1027,25 +1066,25 @@ def render_reviewer(user=None, secret=None, session_token=None):
 <b>{len(members)} reports on this card</b> <code>{esc(did)}</code>
 <form method="post" action="/reviewer/action" style="display:inline">
 <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{members[0][0]}">
-<button name="do" value="resolve_card" class="secondary" title="Resolve every open report on this card as fixed (each student with an email gets a thank-you)">Card fixed — resolve all</button>
+<button name="do" value="resolve_card" class="secondary" title="Resolve every open report on this card as fixed (each student with an email gets a thank-you)">Card fixed, resolve all</button>
 </form></div>''' + "".join(h for _, h in members) + "</section>")
         else:
             parts.append(members[0][1])
     items = parts + (['<h2 class="closed-h">Recently closed</h2>'] + closed if closed else [])
     n_open = sum(1 for r in rows if r["status"] == "open")
     nxt = _next_version_hint()
-    banner = (f'<p class="sub">Accepting adds the change to the next release ({esc(nxt)}). '
-              'You choose what ships on the Next release page.</p>')
-    body = ('<h1>Inbox</h1>' + banner + '<p class="sub">Each item pairs the exact '
-            'card the student saw with its current master version. If the two '
-            'panes differ, the card has already moved on.</p>'
-            f'<p class="queue-count"><b>{n_open} open</b> &middot; '
-            f'{len(rows) - n_open} closed</p>'
+    banner = ui.infobox("How to read this page", (
+        "<p>Each report shows <b>what the student has</b> on their computer next to <b>our current card</b> and what they "
+        "asked for. Switch a pane between Rendered, HTML and Differences. A proposal can only be accepted directly "
+        "when the student's copy matches our current card.</p>"
+        f"<p>Accepting adds the change to the next release ({esc(nxt)}). You choose what ships on the Next release page.</p>"))
+    body = ('<h1>Inbox</h1>' + banner
+            + f'<p class="queue-count"><b>{n_open} open</b> &middot; {len(rows) - n_open} closed</p>'
             + "".join(items))
-    return page("Reviewer queue", body, "reviewer", user, csrf)
+    return page("Inbox", body, "reviewer", user, csrf)
 
 
-def render_updates():
+def render_updates(user=None):
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM suggestions WHERE published=1 AND status='resolved' "
@@ -1091,7 +1130,7 @@ def render_updates():
         ledger = f'<div class="ledger">{"".join(parts)}</div>'
     else:
         ledger = ('<div class="ledger"><div class="empty">No published updates '
-                  'yet — release notes and accepted suggestions will appear here.</div></div>')
+                  'yet. Release notes and accepted suggestions will appear here.</div></div>')
 
     body = f"""
 <h1>Updates</h1>
@@ -1099,10 +1138,10 @@ def render_updates():
 inside Anki, was reviewed by our team, and shipped as a card update.
 {accepted} of {total} suggestions accepted so far.</p>
 {ledger}"""
-    return page("Community updates", body, "updates")
+    return page("Updates", body, "updates", user, public=True)
 
 
-def render_status(token):
+def render_status(token, user=None):
     with db() as conn:
         r = conn.execute(
             "SELECT * FROM suggestions WHERE token=?", (token,)
@@ -1112,7 +1151,7 @@ def render_status(token):
 
     status_text = {
         "open": ("In review", "Our reviewers haven't gotten to this one yet."),
-        "resolved": ("Accepted", "Thank you — the card was updated based on your suggestion."),
+        "resolved": ("Accepted", "Thank you. The card was updated based on your suggestion."),
         "declined": ("Reviewed, not applied", "A reviewer looked at this but decided not to change the card."),
         "expired": ("Already fixed", "The card had already been updated by the time we reviewed this."),
     }[r["status"]]
@@ -1129,7 +1168,7 @@ def render_status(token):
   <blockquote>{esc(r['text'])}</blockquote>
 </div>
 <p><a href="/updates">See all community updates &rarr;</a></p>"""
-    return page("Your suggestion", body)
+    return page("Your suggestion", body, user=user, public=True)
 
 
 # ---------------------------------------------------------------- api
@@ -1150,27 +1189,31 @@ def record_ping(data):
     if len(iid) < 8:
         return False
     lic = str(data.get("license") or "").strip()[:64] or None
+    deck = str(data.get("deck") or "").strip()[:64] or None
     with db() as conn:
         conn.execute(
-            """INSERT INTO installs (install_id, license, addon_version, release, first_seen, last_seen)
-               VALUES (?,?,?,?,?,?)
+            """INSERT INTO installs (install_id, license, addon_version, release, first_seen, last_seen, deck)
+               VALUES (?,?,?,?,?,?,?)
                ON CONFLICT(install_id) DO UPDATE SET
                  license=COALESCE(excluded.license, installs.license),
                  addon_version=excluded.addon_version, release=excluded.release,
-                 last_seen=excluded.last_seen, pings=installs.pings+1""",
+                 last_seen=excluded.last_seen, pings=installs.pings+1,
+                 deck=COALESCE(excluded.deck, installs.deck)""",
             (iid, lic, str(data.get("addon_version") or "")[:20],
-             str(data.get("release") or "")[:40], now(), now()))
+             str(data.get("release") or "")[:40], now(), now(), deck))
     return True
 
 
-def detection_rows():
-    """[{license, note, installs, last_seen, level}] busiest first, plus untagged count."""
+def detection_rows(deck_slug=None):
+    """([{license, note, installs, last_seen, level}], untagged, total) for one deck, busiest first."""
     with db() as conn:
+        cond, args = ("(deck=? OR deck IS NULL)", (deck_slug,)) if deck_slug else ("1=1", ())
         lic = [dict(r) for r in conn.execute(
-            "SELECT license, COUNT(*) AS installs, MAX(last_seen) AS last_seen FROM installs "
-            "WHERE license IS NOT NULL AND license!='staff' GROUP BY license ORDER BY installs DESC, last_seen DESC")]
-        untagged = conn.execute("SELECT COUNT(*) FROM installs WHERE license IS NULL").fetchone()[0]
-        total = conn.execute("SELECT COUNT(*) FROM installs").fetchone()[0]
+            f"SELECT license, COUNT(*) AS installs, MAX(last_seen) AS last_seen FROM installs "
+            f"WHERE license IS NOT NULL AND license!='staff' AND {cond} GROUP BY license "
+            f"ORDER BY installs DESC, last_seen DESC", args)]
+        untagged = conn.execute(f"SELECT COUNT(*) FROM installs WHERE license IS NULL AND {cond}", args).fetchone()[0]
+        total = conn.execute(f"SELECT COUNT(*) FROM installs WHERE {cond}", args).fetchone()[0]
         notes = {hashlib.sha256(r["token"].encode()).hexdigest()[:16]: r["note"]
                  for r in conn.execute("SELECT token, note FROM download_tokens")}
     for r in lic:
@@ -1180,24 +1223,54 @@ def detection_rows():
 
 
 def render_detection(user, csrf):
-    lic, untagged, total = detection_rows()
-    badge = {"flag": '<span class="badge warn">Red flag</span>',
-             "watch": '<span class="badge">Watch</span>', "ok": ""}
+    decks, deck_id = deck_context(user)
+    cur = next((d for d in decks if d["id"] == deck_id), decks[0])
+    lic, untagged, total = detection_rows(cur["slug"])
+    badge = {"flag": '<span class="badge bad">Red flag</span>',
+             "watch": '<span class="badge warn">Watch</span>', "ok": '<span class="badge dim">Normal</span>'}
     rows = "".join(
-        f'<tr><td><code>{esc(r["license"])}</code></td><td>{esc(r["note"] or "—")}</td>'
-        f'<td><b>{r["installs"]}</b></td><td>{esc((r["last_seen"] or "")[:16])}</td>'
-        f'<td>{badge[r["level"]]}</td></tr>'
-        for r in lic[:200])
+        f'<tr><td><code>{esc(r["license"])}</code></td><td>{esc(r["note"] or "Unknown buyer")}</td>'
+        f'<td class="num"><b>{r["installs"]}</b></td><td>{ui.human_time(r["last_seen"])}</td>'
+        f'<td>{badge[r["level"]]}</td></tr>' for r in lic[:200])
+    empty = ('<tr><td colspan="5" class="empty-row"><b>Nothing to show yet.</b><br>Rows appear once an add-on that was '
+             'installed after downloading a buyer link opens Anki. The add-on reports once a day.</td></tr>')
+    how = (f"<p>Every buyer download carries a hidden license id. The add-on reports that id with its own install id "
+           f"once a day. If one license shows up on many installs, the file was probably shared.</p>"
+           f"<ul><li><b>Watch</b> from {WATCH_AT} installs on one license, <b>red flag</b> from {FLAG_AT}.</li>"
+           f"<li><b>Detection only.</b> Nothing is blocked and nobody is notified.</li>"
+           f"<li><b>Without a license</b> means an install whose deck did not come from a tagged download, for example "
+           f"one imported before tagging or from a staff download. It is not a problem.</li>"
+           f"<li>Deleting the hidden file defeats it, so treat a flag as a hint and not as proof.</li></ul>")
     body = f"""
 <h1>Detection</h1>
-<p class="sub">Each download carries a hidden license id; the add-on reports it with its install id.
-One license on many installs suggests the file was shared. This page only reports: nothing is blocked.
-Watch at {WATCH_AT} installs, red flag at {FLAG_AT}. Deleting the hidden file defeats it, and
-students who downloaded before tagging have no license.</p>
-<p class="queue-count"><b>{total}</b> installs seen &middot; <b>{len(lic)}</b> licenses &middot; {untagged} without a license</p>
-<table class="tbl"><tr><th>License</th><th>Buyer link note</th><th>Installs</th><th>Last seen</th><th></th></tr>
-{rows or '<tr><td colspan="5" class="small">No tagged installs have reported yet.</td></tr>'}</table>"""
+<p class="sub">Spots a download being shared. {esc(cur["name"])}.</p>
+{ui.infobox("How detection works", how, True)}
+<p class="queue-count"><b>{total}</b> installs seen &middot; <b>{len(lic)}</b> licenses &middot; <b>{untagged}</b> without a license</p>
+<table class="tbl"><thead><tr><th>License</th><th>Buyer</th><th class="num">Installs</th><th>Last seen</th><th>Status</th></tr></thead>
+<tbody>{rows or empty}</tbody></table>"""
     return page("Detection", body, "detection", user, csrf)
+
+
+def deck_context(user):
+    """(decks, active deck id) for a signed-in user. Falls back to the first deck."""
+    with db() as conn:
+        decks = [dict(r) for r in conn.execute("SELECT id, slug, name FROM decks ORDER BY id")]
+    want = (user or {}).get("active_deck") or 1
+    ids = {d["id"] for d in decks}
+    return decks, (want if want in ids else (decks[0]["id"] if decks else 1))
+
+
+def active_deck_id(user):
+    return deck_context(user)[1]
+
+
+def select_deck(user_id, slug):
+    with db() as conn:
+        d = conn.execute("SELECT id FROM decks WHERE slug=?", (slug,)).fetchone()
+        if d:
+            conn.execute("UPDATE users SET active_deck=? WHERE id=?", (d["id"], user_id))
+            return True
+    return False
 
 
 def deck_from_slug(conn, slug):
@@ -1362,7 +1435,7 @@ def render_thank_you(deck, text, tracking_url, credit_name, published):
     if len(quote) > THANK_YOU_QUOTE_CHARS:
         quote = quote[:THANK_YOU_QUOTE_CHARS].rstrip() + "…"
 
-    subject = "Thank you — your Doctrine suggestion was accepted"
+    subject = "Thank you, your Doctrine suggestion was accepted"
     lines = [
         "Hi,",
         "",
@@ -1380,7 +1453,7 @@ def render_thank_you(deck, text, tracking_url, credit_name, published):
         "You can see its status any time here:",
         tracking_url,
         "",
-        "— The Doctrine team",
+        "The Doctrine team",
     ]
     return subject, "\n".join(lines)
 
@@ -1491,7 +1564,7 @@ def reviewer_action(form, user_id=None):
             ids = [sid] + [str(r["id"]) for r in open_siblings(conn, sid)]
             for one in ids:
                 if _close_suggestion(conn, one, "resolved", {"resolution_note": [
-                        "Card fixed; this report is covered by the fix."]}, user_id) == 1:
+                        "Card fixed. This report is covered by the fix."]}, user_id) == 1:
                     queue_thank_you(conn, one)
         return
     status = {"resolve": "resolved", "decline": "declined",
@@ -1687,6 +1760,7 @@ class Handler(BaseHTTPRequestHandler):
                     "api_base": CFG.public_base_url,
                     "min_addon_version": MIN_ADDON_VERSION,
                     "deck": deck["slug"] if deck else None,
+                    "addon_version": addon_version(),
                 }),
                 "application/json",
                 {"Cache-Control": "public, max-age=3600"},
@@ -1700,7 +1774,7 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self._send(404, page("Not found", "<h1>Add-on package not "
                                      "available</h1><p>It is built with the "
-                                     "server image; check the deployment.</p>"))
+                                     "server image. Check the deployment.</p>"))
             else:
                 self._send(200, data, "application/octet-stream", {
                     "Content-Disposition":
@@ -1718,7 +1792,7 @@ class Handler(BaseHTTPRequestHandler):
                 row = conn.execute("SELECT * FROM download_tokens WHERE token=?", (token,)).fetchone()
                 ok = row is not None and not auth.is_expired(
                     datetime.strptime(row["expires_at"], "%Y-%m-%d %H:%M UTC").replace(tzinfo=timezone.utc), auth.utcnow())
-                version, pkg = latest_package(conn) if ok else (None, None)
+                version, pkg = latest_package(conn, (row["platform_deck"] or 1) if ok else 1) if ok else (None, None)
                 if pkg:
                     conn.execute("UPDATE download_tokens SET downloads=downloads+1 WHERE token=?", (token,))
             if not pkg:
@@ -1743,7 +1817,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 want = path[len("/download/release/"):]
                 with db() as conn:
-                    version, pkg = latest_package(conn) if want == "latest" else package_for_version(conn, want)
+                    version, pkg = (latest_package(conn, active_deck_id(user)) if want == "latest"
+                                    else package_for_version(conn, want))
                 if not pkg:
                     self._send(404, page("Not found", "<h1>No package for that release</h1>"))
                 else:
@@ -1757,6 +1832,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
         elif path == "/releases/pending":
             self._redirect("/releases/next")
+        elif path == "/addon":
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                self._send(200, render_addon(user, auth.csrf_token(self._cookie_token(), session_secret())))
         elif path == "/detection":
             user = self._current_user()
             if user is None:
@@ -1787,7 +1868,7 @@ class Handler(BaseHTTPRequestHandler):
                 csrf = auth.csrf_token(self._cookie_token(), session_secret())
                 qs = parse_qs(urlparse(self.path).query)
                 if path == "/cards":
-                    self._send(200, render_cards(user, csrf, qs.get("q", [""])[0]))
+                    self._send(200, render_cards(user, csrf, qs.get("q", [""])[0], qs.get("n", [""])[0]))
                 else:
                     html = render_card_edit(user, csrf, qs.get("guid", [""])[0])
                     if html is None:
@@ -1843,9 +1924,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_reviewer(user, session_secret(),
                                                 self._cookie_token()))
         elif path == "/updates":
-            self._send(200, render_updates())
+            self._send(200, render_updates(self._current_user()))
         elif path.startswith("/s/"):
-            self._send(200, render_status(path[3:]))
+            self._send(200, render_status(path[3:], self._current_user()))
         else:
             self._send(404, page("Not found", "<h1>Not found</h1>"))
 
@@ -1866,8 +1947,8 @@ class Handler(BaseHTTPRequestHandler):
         label = unquote(parse_qs(urlparse(self.path).query).get("name", ["deck.apkg"])[0])[:200]
         with db() as conn:
             upload_id = conn.execute(
-                "INSERT INTO uploads (label, status, incoming_json, diff_json, created_at) VALUES (?,?,?,?,?)",
-                (label, "processing", "{}", "{}", now())).lastrowid
+                "INSERT INTO uploads (label, status, incoming_json, diff_json, created_at, platform_deck) VALUES (?,?,?,?,?,?)",
+                (label, "processing", "{}", "{}", now(), active_deck_id(user))).lastrowid
         tmp_dir = os.path.join(releases.blob_root(), "tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         path = os.path.join(tmp_dir, f"deck-{upload_id}.apkg")
@@ -1886,7 +1967,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             _set_upload(upload_id, "failed", error=f"Upload interrupted: {e}")
             return
-        threading.Thread(target=process_deck_upload, args=(upload_id, path), daemon=True).start()
+        threading.Thread(target=process_deck_upload, args=(upload_id, path, active_deck_id(user)), daemon=True).start()
         self._json(200, {"upload_id": upload_id})
 
     def _do_POST(self):
@@ -1936,7 +2017,8 @@ class Handler(BaseHTTPRequestHandler):
                 if user["role"] != "admin":
                     self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
                 else:
-                    token = mint_download_token(form.get("note", [""])[0], form.get("days", ["7"])[0], user["id"])
+                    token = mint_download_token(form.get("note", [""])[0], form.get("days", ["7"])[0], user["id"],
+                                            active_deck_id(user))
                     self._send(200, render_releases(user, auth.csrf_token(self._cookie_token(), session_secret()),
                                                     token_link=f"{CFG.public_base_url}/dl/{token}"))
             else:
@@ -1954,6 +2036,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200 if ok else 400, {"ok": ok})
             except (json.JSONDecodeError, AttributeError):
                 self._json(400, {"ok": False})
+        elif path == "/deck/select":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            else:
+                select_deck(user["id"], form.get("deck", [""])[0])
+                back = urlparse(self.headers.get("Referer", "")).path or "/reviewer"
+                self._redirect(back if back.startswith("/") and not back.startswith("//") else "/reviewer")
+        elif path == "/deck/delete":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin" or not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+            else:
+                with db() as conn:
+                    d = conn.execute("SELECT id FROM decks WHERE slug=?", (form.get("deck", [""])[0],)).fetchone()
+                ok, message = delete_deck(d["id"], form.get("confirm_name", [""])[0]) if d else (False, "No such deck.")
+                user = self._current_user()
+                self._send(200, render_deck(user, auth.csrf_token(self._cookie_token(), session_secret()), message))
         elif path == "/deck/new":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -2114,7 +2220,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
             elif path == "/notes/new":
                 try:
-                    new_note_from_form(form, user["id"])
+                    new_note_from_form(form, user["id"], active_deck_id(user))
                     self._redirect("/releases/pending")
                 except ValueError as e:
                     csrf = auth.csrf_token(self._cookie_token(), session_secret())
@@ -2215,8 +2321,8 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
 <div class="pw-reveal">
   <p><strong>Password for {esc(new_password[0])}</strong></p>
   <code>{esc(new_password[1])}</code>
-  <p class="pw-note">Shown once. Copy it now and send it to them —
-  it cannot be retrieved later, only reset.</p>
+  <p class="pw-note">Shown once. Copy it now and send it to them.
+  It cannot be retrieved later, only reset.</p>
 </div>"""
     elif notice:
         banner = f'<p class="notice">{esc(notice)}</p>'
@@ -2261,7 +2367,7 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
 </table>
 <p class="admin-note">Deactivating keeps a person's review history intact
 and signs them out immediately. Resetting a password also signs them out.
-There is no email in this system — hand credentials over directly.</p>
+There is no email in this system, so hand credentials over directly.</p>
 <style>
 .pw-reveal {{ margin: 16px 0; padding: 14px 16px; border-radius: 6px;
   background: #eef7f0; border: 1px solid #bcdcc6; }}
@@ -2306,8 +2412,8 @@ def render_account(user, csrf, notice=None, error=None):
   <input id="confirm" name="confirm" type="password" required>
   <button type="submit">Change password</button>
 </form>
-<p class="admin-note">Forgot your password? An administrator can reset it —
-there is no email recovery.</p>
+<p class="admin-note">Forgot your password? An administrator can reset it.
+There is no email recovery.</p>
 <style>
 .login-form {{ display: flex; flex-direction: column; gap: 6px; }}
 .login-form label {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
@@ -2363,7 +2469,7 @@ def admin_action(form):
     if action == "deactivate":
         # Refuse to remove the last way into the admin page.
         if target["role"] == "admin" and count_active_admins(exclude_id=user_id) == 0:
-            return ("That is the only active administrator — create another "
+            return ("That is the only active administrator. Create another "
                     "one before deactivating this account."), None
         set_active(user_id, False)
         return f"Deactivated {target['username']}.", None
@@ -2398,6 +2504,27 @@ def change_own_password(user_id, current, new, confirm):
 ADDON_PACKAGE_PATH = os.environ.get("ADDON_PACKAGE_PATH",
                                     "/app/doctrine_editor.ankiaddon")
 ADDON_PACKAGE_NAME = "doctrine_editor.ankiaddon"
+_addon_version_cache = {}
+
+
+def addon_version():
+    """Version of the add-on package this server hands out, read from the package itself."""
+    path = ADDON_PACKAGE_PATH
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    if _addon_version_cache.get("key") != (path, mtime):
+        import zipfile
+        version = None
+        try:
+            with zipfile.ZipFile(path) as z:
+                m = re.search(r'^ADDON_VERSION\s*=\s*"([^"]+)"', z.read("__init__.py").decode("utf-8"), re.M)
+                version = m.group(1) if m else None
+        except (OSError, KeyError, zipfile.BadZipFile):
+            version = None
+        _addon_version_cache.update(key=(path, mtime), value=version)
+    return _addon_version_cache["value"]
 
 
 def build_student_package(src_dir, out_path):
@@ -2418,52 +2545,44 @@ def build_student_package(src_dir, out_path):
                 z.write(full, os.path.relpath(full, src_dir))
 
 
-REVIEWER_INSTALL_HTML = """<h2 id="reviewers">Testing the full loop (reviewers)</h2>
-<p class="sub">If you have a reviewer login, this walks the whole path in
-about ten minutes &mdash; first as a student, then as a reviewer.</p>
+def render_addon(user, csrf):
+    """Staff page: the download plus the full test loop. The public /install page stays buyer-facing."""
+    body = f"""
+<h1>Add-on and testing</h1>
+<p class="sub">Install the add-on in a test profile and walk the whole loop, first as a student, then as a reviewer.</p>
+<div class="card"><div class="proposal" style="padding:16px 18px">
+  <a class="btn-link-primary" href="/download/{ADDON_PACKAGE_NAME}">Download {ADDON_PACKAGE_NAME}</a>
+  <p class="small" style="margin:10px 0 0">Version {esc(addon_version() or "unknown")}. Anki 23.10 or newer, desktop only.
+  Delete any older copy first (Tools, Add-ons, select it, Delete) and restart Anki after installing. The public
+  buyer page is <a href="/install">/install</a>.</p>
+</div></div>
+{ui.infobox("What the add-on does", "<p>One add-on, two jobs. <b>Suggest an edit</b> sends a report or an exact proposed change from the reviewer. <b>Deck updates</b> checks for a newer release every time Anki opens and offers it, showing your version next to the newest one.</p>", True)}
+<h2>The full loop</h2>
 <ol class="steps">
-  <li><b>As a student:</b> install the add-on above, review a Doctrine card,
-      click <b>&#9998; Suggest an edit</b>, describe something, add your email,
-      send. Open the tracking link it gives you &mdash; it should say
-      <i>In review</i>.</li>
-  <li><b>As a reviewer:</b> <a href="/login">sign in</a>. Your suggestion is in
-      the queue next to the card exactly as you saw it, the current master
-      copy, and a <i>Trace</i> block with the card and deck identifiers.</li>
-  <li><b>Resolve it.</b> Tick <i>Publish to updates</i>, write a one-line
-      public summary, put a name in <i>Credit as</i>, click <b>Resolve</b>.</li>
-  <li>Open <a href="/updates">Community updates</a> &mdash; your fix is listed
-      with the credit. Reload your tracking link &mdash; it now says
-      <i>Accepted</i>.</li>
-  <li>Because you left an email, <b>Outbox</b> (top nav) has a thank-you
-      note ready to copy. Copy it, then <b>Mark as thanked</b>.</li>
-  <li>Try the other outcomes on a second suggestion: <b>Decline</b> and
-      <b>Mark expired</b>. Neither publishes anything and neither queues a
-      thank-you.</li>
+  <li><b>Install and check.</b> Open Tools, Doctrine Editor, Diagnostics. It should show the version, the server as reachable and the deck <code>doctorine</code>.</li>
+  <li><b>Suggest.</b> Review any Doctorine card, click <b>Suggest an edit</b>, describe the problem or type the exact change, add an email if you want a thank-you, and send. Send two on the same card to see them grouped.</li>
+  <li><b>Inbox.</b> Open <a href="/reviewer">Inbox</a>. Try Accept proposal, Edit and accept, Duplicate and Card fixed.</li>
+  <li><b>Outbox.</b> Every report with an email gets a thank-you in the <a href="/outbox">Outbox</a>. Copy it, then mark it thanked.</li>
+  <li><b>Next release.</b> Review the changes on <a href="/releases/next">Next release</a>, choose what ships, pick minor or major, write notes or make it silent, and cut.</li>
+  <li><b>Releases.</b> Build and publish the draft. The page refreshes itself when the build is done.</li>
+  <li><b>Update in Anki.</b> Reopen Anki. The update prompt appears on its own. You can also run Tools, Doctrine Editor, Check for deck updates.</li>
+  <li><b>Public pages.</b> <a href="/updates">Updates</a> shows the release notes. The suggestion tracking link now says Accepted.</li>
+  <li><b>Detection.</b> Your install appears on <a href="/detection">Detection</a> after the first daily ping.</li>
 </ol>
+{ui.infobox("Known limits of this test build", "<ul><li>A deck update replaces the card text on this computer, including any local edits.</li><li>The web address is temporary. The final domain means installing the add-on once more.</li><li>Reviewer passwords are handed over by an administrator. There is no email reset.</li></ul>")}"""
+    return page("Add-on and testing", body, "addon", user, csrf)
 
-<h2>Known gaps in this test build</h2>
-<ul class="steps">
-  <li>Images and audio inside the card snapshot do not load &mdash; the
-      deck's media is not hosted yet. Text, cloze markers and layout are
-      intact.</li>
-  <li>The web address is temporary. When the final domain is chosen you
-      will install the add-on once more; nothing else changes.</li>
-  <li>Reviewer passwords are handed over directly by an administrator.
-      There is no email reset by design &mdash; ask an admin.</li>
-</ul>
-<p class="sub">Everything else is fair game for feedback: wording, layout,
-what's missing from the queue, what a reviewer would want to see.</p>
-"""
+
 
 
 def render_install(user=None, session_token=None):
     # Reviewer walkthrough and known-gaps list only for signed-in staff;
     # the page is public and must not confuse students.
-    reviewer_block = REVIEWER_INSTALL_HTML if user else ""
+    reviewer_block = ""
     body = f"""
 <h1>Install the Doctrine Editor add-on</h1>
 <p class="sub">Adds a <b>&#9998; Suggest an edit</b> button to Anki's reviewer
-on Doctrine cards. Suggestions go straight to the review team; you get a
+on Doctrine cards. Suggestions go straight to the review team, and you get a
 link to follow what happens to yours.</p>
 
 <div class="install-box">
@@ -2512,7 +2631,7 @@ install the new file. Your settings and pending suggestions are unaffected.</p>
 h2 {{ font-size:16px; margin-top:26px; }}
 </style>"""
     return page("Install", body, "install", user,
-                auth.csrf_token(session_token, session_secret()) if session_token else "")
+                auth.csrf_token(session_token, session_secret()) if session_token else "", public=True)
 
 
 # ---------------------------------------------------------------- editor
@@ -2526,21 +2645,101 @@ def _editor_field(name, value, rows):
 </div>"""
 
 
-EDITOR_SCRIPT = """
+EDITOR_SCRIPT = r"""
 <script>
 (function () {
-  function render(src) {
-    var html = src.replace(/\\{\\{c(\\d+)::(.*?)(::[^}]*)?\\}\\}/g,
-      function (_, n, ans) { return '<mark title="cloze c' + n + '">' + ans + '</mark>'; });
-    return html.replace(/src="([^"]+)"/g, function (_, f) {
-      return /^(https?:|data:|\\/)/.test(f) ? 'src="' + f + '"' : 'src="/media/' + encodeURIComponent(f) + '"';
+  var BAD = /^(script|style|iframe|object|embed|link|meta|form|input|button)$/i;
+  function clean(html) {
+    var doc = new DOMParser().parseFromString('<div>' + html + '</div>', 'text/html');
+    var root = doc.body.firstChild;
+    root.querySelectorAll('*').forEach(function (el) {
+      if (BAD.test(el.tagName)) { el.remove(); return; }
+      Array.from(el.attributes).forEach(function (a) {
+        var n = a.name.toLowerCase(), v = a.value;
+        if (n.indexOf('on') === 0 || n === 'style' || n === 'srcdoc') { el.removeAttribute(a.name); return; }
+        if ((n === 'href' || n === 'src') && /^\s*(javascript|vbscript):/i.test(v)) { el.removeAttribute(a.name); return; }
+        if (n === 'src' && !/^(https?:|data:image\/|\/)/i.test(v)) el.setAttribute('src', '/media/' + encodeURIComponent(v));
+      });
+      if (el.tagName === 'IMG') el.setAttribute('loading', 'lazy');
+    });
+    return root.innerHTML;
+  }
+  var CLOZE = /\{\{c(\d+)::([\s\S]*?)(?:::([\s\S]*?))?\}\}/g;
+  function cloze(text, active, reveal) {
+    return text.replace(CLOZE, function (_, n, ans, hint) {
+      if (+n !== active) return ans;
+      return reveal ? '<span class="cloze-show">' + ans + '</span>'
+                    : '<span class="cloze-hide">[' + (hint || '...') + ']</span>';
     });
   }
-  document.querySelectorAll('textarea[data-preview]').forEach(function (ta) {
+  function numbers(text) {
+    var out = [], m; CLOZE.lastIndex = 0;
+    while ((m = CLOZE.exec(text))) { if (out.indexOf(+m[1]) < 0) out.push(+m[1]); }
+    return out.sort(function (a, b) { return a - b; });
+  }
+  function highlight(src) {
+    return src.replace(CLOZE, function (_, n, ans) { return '<mark title="cloze c' + n + '">' + ans + '</mark>'; });
+  }
+  var areas = Array.from(document.querySelectorAll('textarea[data-preview]'));
+  var initial = {};
+  areas.forEach(function (ta) {
+    initial[ta.name] = ta.dataset.initial !== undefined ? ta.dataset.initial : ta.value;
     var out = document.getElementById(ta.dataset.preview);
-    var sync = function () { out.innerHTML = render(ta.value); };
-    ta.addEventListener('input', sync); sync();
+    var sync = function () { out.innerHTML = clean(highlight(ta.value)); dirty(); anki(); };
+    ta.addEventListener('input', sync);
+    ta._sync = sync;
   });
+  var save = document.getElementById('savebtn');
+  var status = document.getElementById('savestate');
+  function dirty() {
+    if (!save) return;
+    var changed = areas.some(function (ta) { return ta.value !== initial[ta.name]; });
+    if (!save.dataset.always) save.disabled = !changed;
+    if (status) status.textContent = changed ? 'Unsaved changes' : 'No changes yet';
+  }
+  // Anki view
+  var box = document.getElementById('anki');
+  var side = 'front', active = 1;
+  function field(name) { var t = document.querySelector('textarea[name="' + name + '"]'); return t ? t.value : ''; }
+  function anki() {
+    if (!box) return;
+    var text = field('Text'), extra = field('Extra'), nums = numbers(text);
+    var tabs = document.getElementById('anki-clozes'), face = document.getElementById('anki-face'), bar = document.getElementById('anki-bar');
+    if (nums.length && nums.indexOf(active) < 0) active = nums[0];
+    tabs.innerHTML = '';
+    nums.forEach(function (n) {
+      var b = document.createElement('button'); b.type = 'button'; b.textContent = 'c' + n;
+      if (n === active) b.className = 'on';
+      b.addEventListener('click', function () { active = n; side = 'front'; anki(); });
+      tabs.appendChild(b);
+    });
+    var front = clean(cloze(text, active, false)), back = clean(cloze(text, active, true));
+    face.innerHTML = side === 'front' ? front : back + (extra.trim() ? '<hr>' + clean(extra) : '');
+    bar.innerHTML = '';
+    if (side === 'front') {
+      var s = document.createElement('button'); s.type = 'button'; s.textContent = 'Show answer (Space)';
+      s.addEventListener('click', function () { side = 'back'; anki(); }); bar.appendChild(s);
+    } else {
+      [['Again', 1], ['Hard', 2], ['Good', 3], ['Easy', 4]].forEach(function (r) {
+        var b = document.createElement('button'); b.type = 'button'; b.textContent = r[0] + ' (' + r[1] + ')';
+        b.addEventListener('click', function () { rate(r[0]); }); bar.appendChild(b);
+      });
+    }
+  }
+  function rate(name) {
+    var note = document.getElementById('anki-note');
+    if (note) note.textContent = 'Rated ' + name + '. This is a preview, nothing is saved.';
+    side = 'front'; anki();
+  }
+  document.addEventListener('keydown', function (e) {
+    var pane = document.getElementById('anki-pane');
+    if (!box || !pane || pane.hidden || /^(TEXTAREA|INPUT)$/.test((e.target || {}).tagName)) return;
+    if (e.key === ' ') { e.preventDefault(); if (side === 'front') { side = 'back'; anki(); } }
+    var map = {'1': 'Again', '2': 'Hard', '3': 'Good', '4': 'Easy'};
+    if (side === 'back' && map[e.key]) rate(map[e.key]);
+  });
+  areas.forEach(function (ta) { ta._sync(); });
+  dirty(); anki();
 })();
 </script>"""
 
@@ -2571,28 +2770,49 @@ EDITOR_CSS = """
 </style>"""
 
 
-def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept", extra_html=""):
-    areas = "".join(_editor_field(f, values.get(f, ""), 14 if f == "Text" else 8)
+def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept", extra_html="",
+                always_enabled=False):
+    areas = "".join(_editor_field(f, values.get(f, ""), 5 if f == "Text" else 7)
                     for f in revisions.EDITABLE_FIELDS)
     publish = ""
     if with_publish:
         publish = """
-<div class="ed-publish">
-  <label class="chk"><input type="checkbox" name="publish" value="1"> Publish to the community updates page</label>
-  <input type="text" name="publish_summary" placeholder="Public one-liner, e.g. 'Clarified HPV types on the vulvar carcinoma card'">
+<details class="infobox" style="max-width:none"><summary><span class="i">+</span><span class="t">Credit this student on the Updates page (optional)</span></summary>
+<div class="b ed-publish" style="border:0;padding-top:0">
+  <label class="chk"><input type="checkbox" name="publish" value="1"> Publish a line about this fix on the Updates page</label>
+  <input type="text" name="publish_summary" placeholder="Public one-liner, e.g. Clarified HPV types on the vulvar carcinoma card">
   <input type="text" name="credit_name" placeholder="Credit as (optional, e.g. Marko S.)">
   <input type="text" name="resolution_note" placeholder="Internal note (optional)">
-</div>"""
+</div></details>"""
     return f"""
-<form method="post" action="{action}">
+<form method="post" action="{action}" id="edform">
   <input type="hidden" name="csrf" value="{csrf}">
   {areas}
-  <p class="small">Cloze markers look like <code>{{{{c1::answer}}}}</code> and are highlighted in the preview. Only Text and Extra can be edited.</p>
   {extra_html}
   {publish}
-  <div class="ed-actions"><button type="submit">{esc(submit_label)}</button>
+  <div class="ed-actions"><button type="submit" id="savebtn"{' data-always="1"' if always_enabled else ' disabled'}>{esc(submit_label)}</button>
+  <span class="small" id="savestate"></span>
   <a class="btn-link" href="/reviewer">Cancel</a></div>
 </form>"""
+
+
+_EDITOR_HINT = ui.infobox("Writing cards", "<p>Cloze markers look like <code>{{c1::answer}}</code> and are highlighted in the preview. "
+                          "Only <b>Text</b> and <b>Extra</b> can be edited here. Tags are never changed by edits, "
+                          "because the scheduler uses them.</p>")
+
+
+def _editor_tabs(edit_html, history_html):
+    anki_html = """
+<div class="anki" id="anki"><div class="seg" id="anki-clozes" style="align-self:center;margin-bottom:14px"></div>
+  <div class="face" id="anki-face"></div><div class="bar" id="anki-bar"></div>
+  <small id="anki-note" style="margin-top:12px">Preview of the text in the editor. Space shows the answer, keys 1 to 4 rate. Ratings are not saved.</small></div>"""
+    return f"""
+<div class="tabs" data-tabs><button type="button" data-tab="edit-pane">Edit</button>
+<button type="button" data-tab="history-pane">History</button>
+<button type="button" data-tab="anki-pane">Anki view</button></div>
+<div class="tabpane" id="edit-pane">{edit_html}</div>
+<div class="tabpane" id="history-pane" hidden><div class="ledger">{history_html}</div></div>
+<div class="tabpane" id="anki-pane" hidden>{anki_html}</div>"""
 
 
 def render_edit(user, csrf, sid, use_proposal=False, error=None):
@@ -2600,19 +2820,21 @@ def render_edit(user, csrf, sid, use_proposal=False, error=None):
         r = conn.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
         master = None
         sibs = []
+        history = ""
         if r is not None:
             master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0",
                                   (r["doctrine_id"],)).fetchone()
             sibs = open_siblings(conn, sid)
+            history = card_history_html(conn, r["doctrine_id"]) if master else ""
     if r is None or master is None:
         return page("Not found", "<h1>Suggestion or note not found</h1>", "reviewer", user, csrf)
     sib_html = ""
     if sibs:
         rows_ = "".join(
-            f'<label class="chk"><input type="checkbox" name="also" value="{x["id"]}" checked> '
+            f'<label class="chk" style="display:flex"><input type="checkbox" name="also" value="{x["id"]}" checked> '
             f'#{x["id"]} &middot; {esc(TYPE_LABELS.get(x["suggestion_type"], x["suggestion_type"]))}: '
             f'{esc((x["text"] or "")[:160])}</label>' for x in sibs)
-        sib_html = ('<div class="ed-publish"><b>Also resolve these reports on the same card</b>'
+        sib_html = ('<div class="ed-publish" style="margin-bottom:12px"><b>Also resolve these reports on the same card</b>'
                     '<span class="small">Each student with an email gets a thank-you. '
                     f'Untick any this edit does not cover.</span>{rows_}</div>')
     current = json.loads(master["fields_json"] or "{}")
@@ -2625,27 +2847,47 @@ def render_edit(user, csrf, sid, use_proposal=False, error=None):
                 values.update(proposed)
             diffs = diff_fields(current, proposed)
             if diffs:
-                proposal_html = ('<div class="pane-label">Student\'s proposed change</div><dl class="fields" style="height:auto;max-height:240px">'
+                proposal_html = ('<div class="pane-label" style="margin-top:10px">Proposed change</div><dl class="fields" style="height:auto;max-height:200px">'
                                  + "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs) + "</dl>")
         except ValueError:
             pass
+    pend = 0
+    with db() as conn:
+        pend = conn.execute("SELECT COUNT(*) FROM revisions WHERE guid=? AND release IS NULL", (r["doctrine_id"],)).fetchone()[0]
+    notice = (f'<p class="notice">This card already has {pend} pending edit(s) waiting for the next release. '
+              'The fields below include them.</p>') if pend else ""
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
-    body = f"""
-<h1>Edit card</h1>
-<p class="sub">Suggestion #{r['id']} &middot; <code>{esc(r['doctrine_id'])}</code> &middot; master v{master['version']}.
-Saving changes the card in the online deck, queues it for the next release, and accepts the suggestion.</p>
-{msg}
-<div class="ed-grid">
-  <div class="ed-left">
-    <div class="pane-label">Student's suggestion</div>
-    <blockquote>{esc(r['text'])}</blockquote>
-    {proposal_html}
-    <div class="pane-label">Card as the student saw it</div>
-    {card_iframe(r['snap_question'], r['snap_answer'], r['snap_css'], 'Snapshot')}
-  </div>
-  <div>{editor_form(f"/edit/{r['id']}", values, csrf, extra_html=sib_html)}</div>
-</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
+    context = f"""
+<div class="card" style="margin:0 0 16px"><div class="card-head"><span class="meta"><b>Student report #{r['id']}</b>
+&middot; {esc(TYPE_LABELS.get(r['suggestion_type'], r['suggestion_type']))}</span></div>
+<div class="proposal"><blockquote style="margin:0">{esc(r['text'])}</blockquote>{proposal_html}</div></div>"""
+    edit = (context + notice + msg + _EDITOR_HINT
+            + editor_form(f"/edit/{r['id']}", values, csrf, extra_html=sib_html,
+                          always_enabled=bool(use_proposal)))
+    body = (f'<h1>Edit card</h1><p class="sub">Report #{r["id"]}, master v{master["version"]}. '
+            'Saving changes the card in the online deck, queues it for the next release, and accepts the report.</p>'
+            + _editor_tabs(edit, history) + EDITOR_CSS + EDITOR_SCRIPT)
     return page("Edit card", body, "reviewer", user, csrf)
+
+
+def render_card_edit(user, csrf, guid, error=None):
+    with db() as conn:
+        master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+        history = card_history_html(conn, guid) if master else ""
+        pend = conn.execute("SELECT COUNT(*) FROM revisions WHERE guid=? AND release IS NULL",
+                            (guid,)).fetchone()[0] if master else 0
+    if master is None:
+        return None
+    notice = (f'<p class="notice">This card already has {pend} pending edit(s) waiting for the next '
+              'release. The fields below show them, and saving builds on top.</p>') if pend else ""
+    values = json.loads(master["fields_json"] or "{}")
+    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    edit = (notice + msg + _EDITOR_HINT + tag_chips(master["tags_json"])
+            + editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save"))
+    body = (f'<h1>Edit card</h1><p class="sub"><code>{esc(guid)}</code> &middot; version {master["version"]}. '
+            'Saving changes the card in the online deck and queues it for the next release.</p>'
+            + _editor_tabs(edit, history) + EDITOR_CSS + EDITOR_SCRIPT)
+    return page("Edit card", body, "cards", user, csrf)
 
 
 def render_new_note(user, csrf, error=None):
@@ -2665,7 +2907,7 @@ Tags decide where the scheduler places it.</p>
   <select id="nt" name="note_type">{opts}</select></div>
   {_editor_field("Text", "", 12)}
   {_editor_field("Extra", "", 8)}
-  <div class="ed-field"><label for="tags">Tags (space separated; the scheduler uses these)</label>
+  <div class="ed-field"><label for="tags">Tags (space separated, the scheduler uses these)</label>
   <input id="tags" type="text" name="tags" style="width:100%;box-sizing:border-box"
          placeholder="Doctorine::Yield::Step1::Gold Doctorine::Shelf::Internal_Medicine::Silver"></div>
   <div class="ed-actions"><button type="submit">Add note</button>
@@ -2694,17 +2936,17 @@ def render_pending(user, csrf):
 <div class="proposal"><dl class="fields">{rows}</dl></div></div>""")
     n = len(groups)
     body = (f'<h1>Pending changes</h1><p class="sub">{n} note{"s" if n != 1 else ""} changed since '
-            f'release {esc(current or "—")}. These ship together in the next release.</p>'
+            f'release {esc(current or "none")}. These ship together in the next release.</p>'
             + ("".join(items) or '<div class="empty"><b>Nothing pending</b>Accepted edits and new notes appear here.</div>'))
     return page("Pending changes", body, "pending", user, csrf)
 
 
-def new_note_from_form(form, user_id):
+def new_note_from_form(form, user_id, deck_id=1):
     tags = [t for t in (form.get("tags", [""])[0]).split() if t]
     fields = {f: form.get(f, [""])[0] for f in revisions.EDITABLE_FIELDS}
     with db() as conn:
         return revisions.add_note(conn, form.get("note_type", [""])[0] or "AnKingOverhaul++++++",
-                                  fields, tags, user_id)
+                                  fields, tags, user_id, platform_deck=deck_id)
 
 
 # ---------------------------------------------------------------- re-upload
@@ -2769,7 +3011,7 @@ def _set_upload(upload_id, status, **summary):
                      (status, json.dumps(summary) if summary else None, upload_id))
 
 
-def process_deck_upload(upload_id, path):
+def process_deck_upload(upload_id, path, deck_id=1):
     """Background: read the .apkg, store its media (renaming a changed image that
     reuses a filename), compare notes with the online deck, hand over to review."""
     try:
@@ -2801,7 +3043,7 @@ def process_deck_upload(upload_id, path):
                 n["fields"] = {k: apkgfile.rename_refs(v, renames) for k, v in n["fields"].items()}
         incoming = _incoming_map(notes)
         with db() as conn:
-            diff = reupload.compare(reupload.snapshot(conn), incoming,
+            diff = reupload.compare(reupload.snapshot(conn, deck_id), incoming,
                                     pending_guids=reupload.pending_guids(conn))
             summary = {k: (len(v) if isinstance(v, (dict, list)) else v) for k, v in diff.items()}
             summary.update(stats)
@@ -2819,33 +3061,113 @@ def process_deck_upload(upload_id, path):
             pass
 
 
-def render_deck(user, csrf):
+def delete_deck(deck_id, typed_name):
+    """Permanently remove a deck and everything that belongs to it. Returns (ok, message).
+
+    The first deck can never be deleted. The typed name must match the deck's name.
+    Media files are shared by name, so they stay.
+    """
     with db() as conn:
-        n = conn.execute("SELECT COUNT(*) FROM notes WHERE retired=0").fetchone()[0]
-        retired = conn.execute("SELECT COUNT(*) FROM notes WHERE retired=1").fetchone()[0]
+        deck = conn.execute("SELECT * FROM decks WHERE id=?", (deck_id,)).fetchone()
+        if deck is None:
+            return False, "No such deck."
+        first = conn.execute("SELECT id FROM decks ORDER BY id LIMIT 1").fetchone()["id"]
+        if deck["id"] == first:
+            return False, "The first deck cannot be deleted."
+        if (typed_name or "").strip() != deck["name"]:
+            return False, "The name you typed does not match."
+        paths = [r["collection_path"] for r in conn.execute(
+            "SELECT collection_path FROM releases WHERE platform_deck=? AND collection_path IS NOT NULL", (deck_id,))]
+        guids = [r["doctrine_id"] for r in conn.execute("SELECT doctrine_id FROM notes WHERE platform_deck=?", (deck_id,))]
+        for start in range(0, len(guids), 500):
+            chunk = guids[start:start + 500]
+            marks = ",".join("?" * len(chunk))
+            conn.execute(f"DELETE FROM revisions WHERE guid IN ({marks})", chunk)
+        conn.execute("DELETE FROM notifications WHERE suggestion_id IN (SELECT id FROM suggestions WHERE platform_deck=?)",
+                     (deck_id,))
+        for table in ("suggestions", "uploads", "download_tokens", "releases", "notes"):
+            conn.execute(f"DELETE FROM {table} WHERE platform_deck=?", (deck_id,))
+        conn.execute("DELETE FROM settings WHERE key=?", (releases.current_release_key(deck_id),))
+        conn.execute("UPDATE users SET active_deck=NULL WHERE active_deck=?", (deck_id,))
+        conn.execute("DELETE FROM decks WHERE id=?", (deck_id,))
+    for p in paths:
+        try:
+            os.remove(p)
+            os.rmdir(os.path.dirname(p))
+        except OSError:
+            pass
+    _official_cache.clear()
+    return True, f"Deleted {deck['name']}."
+
+
+def render_deck(user, csrf, notice=None):
+    decks, deck_id = deck_context(user)
+    admin = user["role"] == "admin"
+    with db() as conn:
+        stats = {}
+        for d in decks:
+            stats[d["id"]] = {
+                "cards": conn.execute("SELECT COUNT(*) FROM notes WHERE platform_deck=? AND retired=0", (d["id"],)).fetchone()[0],
+                "retired": conn.execute("SELECT COUNT(*) FROM notes WHERE platform_deck=? AND retired=1", (d["id"],)).fetchone()[0],
+                "release": releases.current_release(conn, d["id"]),
+            }
         media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
-        cur = releases.current_release(conn)
-        decks = [dict(r) for r in conn.execute(
-            "SELECT d.id, d.slug, d.name, (SELECT COUNT(*) FROM notes n WHERE n.platform_deck=d.id AND n.retired=0) AS cards "
-            "FROM decks d ORDER BY d.id")]
         ups = [dict(r) for r in conn.execute(
-            "SELECT id, label, status, created_at FROM uploads ORDER BY id DESC LIMIT 15")]
+            "SELECT id, label, status, created_at FROM uploads WHERE COALESCE(platform_deck,1)=? "
+            "ORDER BY id DESC LIMIT 15", (deck_id,))]
+    cur = next((d for d in decks if d["id"] == deck_id), decks[0])
+    st = stats[cur["id"]]
     free = shutil.disk_usage(releases.blob_root()).free if os.path.isdir(releases.blob_root()) else 0
-    rows = "".join(
-        f'<tr><td>#{u["id"]}</td><td>{esc(u["label"] or "")}</td><td>{esc(u["status"])}</td>'
-        f'<td>{esc(u["created_at"] or "")}</td>'
-        f'<td><a href="/uploads/{u["id"]}">open</a></td></tr>' for u in ups) or \
-        '<tr><td colspan="5" class="small">No uploads yet.</td></tr>'
-    if user["role"] == "admin":
-        form = f"""
-<div class="card"><div class="proposal">
-  <h3 style="margin-top:0">Re-upload this deck</h3>
-  <p class="small">Choose the new <code>.apkg</code>. Nothing changes yet: you get a side-by-side review of what
-  differs, and approved changes go to Next release. Cards are matched by their note id; a file whose ids mostly
-  differ is refused. A changed image that reuses an old filename is saved under a new name automatically.
-  Free space on the server: <b>{free / 1e9:.1f} GB</b>. Needs about 1.3&times; the file size plus 0.4 GB.</p>
-  <input type="file" id="deckfile" accept=".apkg">
-  <button id="deckgo" type="button">Upload and compare</button>
+
+    rows = ""
+    dialogs = ""
+    for i, d in enumerate(decks, start=1):
+        sel = d["id"] == deck_id
+        info = stats[d["id"]]
+        delete = ""
+        if admin and i > 1:
+            delete = (f'<button type="button" class="btn-text" data-dialog="del1-{d["id"]}">Delete</button>')
+            dialogs += f"""
+<div class="dlg-back" id="del1-{d["id"]}"><div class="dlg"><h3>Delete {esc(d["name"])}?</h3>
+  <p>This permanently removes the deck, its {info["cards"]:,} cards, its releases, reports, download links and uploads.
+  Students whose add-on is pinned to it will stop receiving updates.</p>
+  <div class="foot"><button type="button" class="btn-quiet" data-close>Cancel</button>
+  <button type="button" class="btn-danger" data-close data-dialog="del2-{d["id"]}">Continue</button></div></div></div>
+<div class="dlg-back" id="del2-{d["id"]}"><div class="dlg"><h3>Are you really sure?</h3>
+  <p>There is no undo. Deleting <b>{esc(d["name"])}</b> cannot be reversed, and the only way back is to upload the deck again.</p>
+  <div class="foot"><button type="button" class="btn-quiet" data-close>Cancel</button>
+  <button type="button" class="btn-danger" data-close data-dialog="del3-{d["id"]}">Yes, continue</button></div></div></div>
+<div class="dlg-back" id="del3-{d["id"]}"><div class="dlg"><h3>Type the deck name to confirm</h3>
+  <form method="post" action="/deck/delete">
+    <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="deck" value="{esc(d["slug"])}">
+    <p>Type <b>{esc(d["name"])}</b> to delete it for good.</p>
+    <input type="text" name="confirm_name" autocomplete="off" style="width:100%" data-confirm="{esc(d["name"])}">
+    <div class="foot"><button type="button" class="btn-quiet" data-close>Cancel</button>
+    <button type="submit" class="btn-danger" disabled>Delete forever</button></div>
+  </form></div></div>"""
+        rows += (f'<tr class="{"sel" if sel else ""}"><td class="num">{i}</td>'
+                 f'<td><div class="row" style="gap:8px;flex-wrap:nowrap"><form method="post" action="/deck/select" class="inline"><input type="hidden" name="csrf" value="{csrf}">'
+                 f'<input type="hidden" name="deck" value="{esc(d["slug"])}">'
+                 f'<button type="submit" class="deck-pick">{esc(d["name"])}</button></form>'
+                 f'{"<span class=\"badge current\">Selected</span>" if sel else ""}</div></td>'
+                 f'<td><code>{esc(d["slug"])}</code></td><td class="num">{info["cards"]:,}</td>'
+                 f'<td>{esc(info["release"] or "none yet")}</td><td>{delete}</td></tr>')
+
+    add = ""
+    if admin:
+        add = f"""
+<form method="post" action="/deck/new" class="row" style="margin:14px 0 0">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="text" name="name" placeholder="New deck name, for example Pathoma Companion" style="min-width:320px" required>
+  <button type="submit" class="secondary">Add deck</button>
+</form>"""
+    if admin:
+        upload = f"""
+<div class="card"><div class="proposal" style="padding:16px 18px">
+  <h3 style="margin:0 0 6px">Re-upload {esc(cur["name"])}</h3>
+  {ui.infobox("How a re-upload works", "<p>Choose the new <code>.apkg</code>. Nothing changes yet. You get a side-by-side review of what differs, and approved changes go to Next release. Cards are matched by note id, and a file whose ids mostly differ is refused. A changed image that reuses an old filename is saved under a new name automatically.</p>")}
+  <p class="small">Free space on the server: <b>{free / 1e9:.1f} GB</b>. A file needs about 1.3 times its size plus 0.4 GB.</p>
+  <div class="row"><input type="file" id="deckfile" accept=".apkg"><button id="deckgo" type="button">Upload and compare</button></div>
   <div id="deckmsg" class="small" style="margin-top:8px"></div>
   <progress id="deckprog" value="0" max="100" style="width:100%;display:none"></progress>
 </div></div>
@@ -2855,50 +3177,52 @@ var f=document.getElementById('deckfile'),b=document.getElementById('deckgo'),m=
 function poll(id){{fetch('/deck/status/'+id).then(r=>r.json()).then(function(s){{
   if(s.status==='pending'){{location.href='/uploads/'+id;}}
   else if(s.status==='failed'){{m.textContent=s.error||'Failed.';b.disabled=false;}}
-  else{{m.textContent='Reading the file and comparing cards…';setTimeout(function(){{poll(id);}},2500);}}}});}}
+  else{{m.textContent='Reading the file and comparing cards.';setTimeout(function(){{poll(id);}},2500);}}}});}}
 b.addEventListener('click',function(){{
   var file=f.files[0]; if(!file){{m.textContent='Choose a .apkg first.';return;}}
-  b.disabled=true;p.style.display='block';m.textContent='Uploading…';
+  b.disabled=true;p.style.display='block';m.textContent='Uploading.';
   var x=new XMLHttpRequest();
   x.open('POST','/deck/upload?name='+encodeURIComponent(file.name));
   x.setRequestHeader('X-CSRF',{json.dumps(csrf)});
   x.upload.onprogress=function(e){{if(e.lengthComputable)p.value=100*e.loaded/e.total;}};
   x.onload=function(){{var r={{}};try{{r=JSON.parse(x.responseText);}}catch(e){{}}
-    if(x.status===200){{p.style.display='none';m.textContent='Uploaded. Comparing cards…';poll(r.upload_id);}}
+    if(x.status===200){{p.style.display='none';m.textContent='Uploaded. Comparing cards.';poll(r.upload_id);}}
     else{{m.textContent=r.error||('Upload failed ('+x.status+').');b.disabled=false;}}}};
   x.onerror=function(){{m.textContent='Upload failed (connection).';b.disabled=false;}};
   x.send(file);
 }});}})();
 </script>"""
     else:
-        form = '<p class="small">Only administrators can upload a deck file.</p>'
-    deck_rows = "".join(
-        f'<tr><td><b>{esc(d["name"])}</b></td><td><code>{esc(d["slug"])}</code></td><td>{d["cards"]:,} cards</td>'
-        f'<td></td></tr>'
-        for d in decks)
-    add_deck = ""
-    if user["role"] == "admin":
-        add_deck = f"""
-<form method="post" action="/deck/new" class="create-form">
-  <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="name" placeholder="New deck name, e.g. Pathoma companion" required>
-  <button type="submit" class="secondary">Add deck</button>
-</form>
-<p class="small">Each deck has its own cards, releases and download. The add-on is pinned to one deck, so
-students of one deck never see another. Release versions must be unique across decks (e.g. <code>pathoma-1.0</code>).</p>"""
+        upload = '<p class="small">Only administrators can upload a deck file.</p>'
+    up_rows = "".join(
+        f'<tr><td class="num">#{u["id"]}</td><td>{esc(u["label"] or "")}</td><td>{esc(u["status"])}</td>'
+        f'<td>{ui.human_time(u["created_at"])}</td><td><a href="/uploads/{u["id"]}">Open</a></td></tr>' for u in ups) or \
+        '<tr><td colspan="5" class="empty-row">No uploads yet.</td></tr>'
+    msg = f'<p class="notice">{esc(notice)}</p>' if notice else ""
     body = f"""
 <h1>Deck</h1>
 <p class="sub">The online deck is the master copy every release is cut from.</p>
+{msg}
 <h2>Decks</h2>
-<table class="tbl"><tr><th>Name</th><th>Add-on id</th><th>Cards</th><th></th></tr>{deck_rows}</table>
-{add_deck}
+{ui.infobox("About decks", "<p>Each deck has its own cards, releases and download. The add-on is pinned to one deck, so students of one deck never see another. Choose a deck below to work on it. The whole workspace follows your choice. Release versions must be unique across decks, for example <code>pathoma-1.0</code>.</p>")}
+<table class="tbl"><thead><tr><th class="num">#</th><th>Deck</th><th>Add-on id</th><th class="num">Cards</th><th>Current release</th><th></th></tr></thead>
+<tbody>{rows}</tbody></table>
+{add}
+<h2 style="margin-top:32px">{esc(cur["name"])}</h2>
 <div class="card"><div class="proposal">
-  <p style="margin:0"><b>Doctorine</b> &middot; {n:,} active cards{f' &middot; {retired:,} retired' if retired else ''}
-  &middot; {media:,} media files &middot; current release {esc(cur or '—')}</p>
+  <p style="margin:0"><b>{st["cards"]:,}</b> active cards{f' &middot; {st["retired"]:,} retired' if st["retired"] else ''}
+  &middot; <b>{media:,}</b> media files &middot; current release <b>{esc(st["release"] or "none yet")}</b></p>
 </div></div>
-{form}
+{upload}
 <h2>Recent uploads</h2>
-<table class="tbl"><tr><th>#</th><th>File</th><th>Status</th><th>When</th><th></th></tr>{rows}</table>"""
+<table class="tbl"><thead><tr><th class="num">#</th><th>File</th><th>Status</th><th>When</th><th></th></tr></thead><tbody>{up_rows}</tbody></table>
+{dialogs}
+<script>
+document.querySelectorAll('input[data-confirm]').forEach(function (i) {{
+  var btn = i.closest('form').querySelector('button[type=submit]');
+  i.addEventListener('input', function () {{ btn.disabled = i.value.trim() !== i.dataset.confirm; }});
+}});
+</script>"""
     return page("Deck", body, "deck", user, csrf)
 
 
@@ -2978,7 +3302,7 @@ def apply_upload(upload_id, form, user_id):
         for key, vals in form.items():
             if key.startswith("d:"):
                 decisions[key[2:]] = vals[0]
-        reupload.apply(conn, diff, incoming, decisions, user_id, up["id"])
+        reupload.apply(conn, diff, incoming, decisions, user_id, up["id"], up.get("platform_deck") or 1)
         conn.execute("UPDATE uploads SET status='applied', applied_at=?, applied_by=? WHERE id=?",
                      (now(), user_id, up["id"]))
     return True
@@ -2986,10 +3310,10 @@ def apply_upload(upload_id, form, user_id):
 
 # ---------------------------------------------------------------- releases
 
-def _previous_published(conn, before_version):
+def _previous_published(conn, before_version, deck_id=1):
     r = conn.execute(
-        "SELECT * FROM releases WHERE status='published' AND version != ? "
-        "ORDER BY published_at DESC, created_at DESC LIMIT 1", (before_version,)).fetchone()
+        "SELECT * FROM releases WHERE status='published' AND version != ? AND COALESCE(platform_deck,1)=? "
+        "ORDER BY published_at DESC, created_at DESC LIMIT 1", (before_version, deck_id)).fetchone()
     return dict(r) if r else None
 
 
@@ -3000,10 +3324,12 @@ def _selected_guids(form):
 def changelog_for(conn, guids):
     lines = []
     for g in revisions.pending_by_kind(conn, set(guids)):
-        lines.append(f"## {g['label']} ({len(g['notes'])})")
+        lines.append(f"{g['label']} ({len(g['notes'])})")
         for n in g["notes"]:
-            fields = sorted({rv["field"] for rv in n["revisions"]})
-            lines.append(f"- {n['guid']}: {', '.join(fields)}  [{', '.join(n['sources'])}]")
+            fields = sorted({rv["field"] for rv in n["revisions"] if rv["field"] in revisions.EDITABLE_FIELDS})
+            row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (n["guid"],)).fetchone()
+            text = ui.plain_text((json.loads(row["fields_json"] or "{}") if row else {}).get("Text", ""), 90) or n["guid"]
+            lines.append(f"- {text} ({', '.join(fields) or 'new card'}) by {', '.join(n['users'])}")
     return "\n".join(lines)
 
 
@@ -3017,7 +3343,10 @@ def cut_release(version, user_id, guids, notes="", visibility="public"):
     with db() as conn:
         if conn.execute("SELECT 1 FROM releases WHERE version=?", (version,)).fetchone():
             return False, f"Release {version} already exists."
-        groups = [g for g in revisions.pending(conn) if g["guid"] in set(guids)]
+        first = conn.execute("SELECT COALESCE(platform_deck,1) AS d FROM notes WHERE doctrine_id=?",
+                             (next(iter(guids)),)).fetchone()
+        deck_id = first["d"] if first else 1
+        groups = [g for g in revisions.pending(conn, deck_id) if g["guid"] in set(guids)]
         if not groups:
             return False, "Nothing is pending for the selected notes."
         changelog = changelog_for(conn, guids)
@@ -3027,10 +3356,10 @@ def cut_release(version, user_id, guids, notes="", visibility="public"):
                      "WHERE release=? AND source LIKE 'suggestion:%')", (version, version))
         conn.execute(
             "INSERT INTO releases (version, status, note_count, changelog, created_at, built_by, "
-            "public_notes, visibility) "
-            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0), ?, ?, ?, ?, ?)",
-            (version, changelog, now(), user_id, (notes or "").strip() or None,
-             "silent" if visibility == "silent" else "public"))
+            "public_notes, visibility, platform_deck) "
+            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0 AND COALESCE(platform_deck,1)=?), ?, ?, ?, ?, ?, ?)",
+            (version, deck_id, changelog, now(), user_id, (notes or "").strip() or None,
+             "silent" if visibility == "silent" else "public", deck_id))
     return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
 
 
@@ -3047,10 +3376,17 @@ def discard_release(version):
 
 
 def render_next_release(user, csrf):
+    deck_id = active_deck_id(user)
     with db() as conn:
-        groups = revisions.pending_by_kind(conn)
-        current = releases.current_release(conn)
+        groups = revisions.pending_by_kind(conn, None, deck_id)
+        current = releases.current_release(conn, deck_id)
     total = sum(len(g["notes"]) for g in groups)
+    edits = sum(len(n["revisions"]) for g in groups for n in g["notes"])
+    with db() as conn:
+        snippets = {n["guid"]: ui.plain_text(((json.loads(row["fields_json"] or "{}")).get("Text", "")), 100)
+                    for g in groups for n in g["notes"]
+                    for row in [conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (n["guid"],)).fetchone()]
+                    if row}
     sections = []
     for g in groups:
         rows = ""
@@ -3066,16 +3402,18 @@ def render_next_release(user, csrf):
             src = ", ".join(s.replace("suggestion:", "#") for s in n["sources"])
             rows += f"""
 <div class="card nr-note"><div class="card-head">
-  <label class="chk"><input type="checkbox" name="rev:{esc(n['guid'])}" value="1" checked data-group="{esc(g['kind'])}"> <code>{esc(n['guid'])}</code></label>
-  <span class="meta">{esc(', '.join(n['users']))} &middot; {esc(src)}</span>
+  <label class="chk"><input type="checkbox" name="rev:{esc(n['guid'])}" value="1" checked data-group="{esc(g['kind'])}"> <b>{esc(snippets.get(n['guid']) or n['guid'])}</b></label>
+  <span class="badge dim">{len(n['revisions'])} edit{'s' if len(n['revisions']) != 1 else ''}</span>
+  <span class="meta">by {esc(', '.join(n['users']))} &middot; from {esc(src or 'direct edit')} &middot; <code>{esc(n['guid'])}</code></span>
 </div><div class="proposal"><dl class="fields">{parts}</dl></div></div>"""
         sections.append(f"""
 <h2 class="nr-head"><label class="chk"><input type="checkbox" checked data-toggle="{esc(g['kind'])}"> {esc(g['label'])}</label>
 <span class="count">{len(g['notes'])}</span></h2>{rows}""")
     body = f"""
 <h1>Next release</h1>
-<p class="sub">Accepted changes waiting to ship, since release <b>{esc(current or '—')}</b>:
-<b>{total} note{'s' if total != 1 else ''}</b>. Untick anything that should wait. Nothing is built from this page.</p>
+<p class="sub">Changes waiting to ship since release <b>{esc(current or 'none')}</b>.</p>
+{ui.infobox("How this page works", "<p>Everything accepted since the last release is listed here and ticked. Untick a card to hold it back for a later release. A card with two edits ships both or neither. Nothing is built from this page. Review selection is the next step.</p>")}
+<p class="queue-count"><b>{edits}</b> edit{'s' if edits != 1 else ''} on <b>{total}</b> card{'s' if total != 1 else ''}</p>
 {'<form method="post" action="/releases/confirm"><input type="hidden" name="csrf" value="' + csrf + '">' if groups else ''}
 {''.join(sections) or '<div class="empty"><b>Nothing waiting</b>Accepted suggestions, direct edits and new notes appear here.</div>'}
 {'<div class="actions"><button type="submit">Review selection</button></div></form>' if groups else ''}
@@ -3092,9 +3430,10 @@ document.querySelectorAll('input[data-toggle]').forEach(function (t) {{
 
 
 def render_confirm_selection(user, csrf, guids, error=None):
+    deck_id = active_deck_id(user)
     with db() as conn:
-        groups = revisions.pending_by_kind(conn, set(guids))
-        cur = releases.current_release(conn)
+        groups = revisions.pending_by_kind(conn, set(guids), deck_id)
+        cur = releases.current_release(conn, deck_id)
     total = sum(len(g["notes"]) for g in groups)
     hidden = "".join(f'<input type="hidden" name="rev:{esc(n["guid"])}" value="1">' for g in groups for n in g["notes"])
     lines = "".join(f'<h3>{esc(g["label"])} <span class="count">{len(g["notes"])}</span></h3><ul>'
@@ -3104,7 +3443,7 @@ def render_confirm_selection(user, csrf, guids, error=None):
     body = f"""
 <h1>Confirm release contents</h1>
 <p class="sub"><b>{total} note{'s' if total != 1 else ''}</b> will be stamped with the new version. Everything else stays in Next release.
-Cutting only drafts the release; building it is a separate confirmed step.</p>
+Cutting only drafts the release. Building it is a separate confirmed step.</p>
 {msg}
 <div class="card"><div class="proposal">{lines or '<p>Nothing selected.</p>'}</div></div>
 <form method="post" action="/releases/cut" class="create-form" style="display:grid;gap:14px;max-width:640px">
@@ -3117,7 +3456,7 @@ Cutting only drafts the release; building it is a separate confirmed step.</p>
   <div><b>Who sees this release</b><br>
     <label class="chk"><input type="radio" name="visibility" value="public" checked> Public: listed on the Updates page with the notes below</label><br>
     <label class="chk"><input type="radio" name="visibility" value="silent"> Silent: students get it through the add-on, nothing is announced</label></div>
-  <div><label for="notes"><b>Release notes</b> (shown on the Updates page; blank line starts a new paragraph)</label><br>
+  <div><label for="notes"><b>Release notes</b> (shown on the Updates page, a blank line starts a new paragraph)</label><br>
     <textarea id="notes" name="notes" rows="6" style="width:100%;box-sizing:border-box"></textarea></div>
   <div><button type="submit" {'disabled' if not total else ''}>Cut release</button>
   <a class="btn-link" href="/releases/next">Back</a></div>
@@ -3184,7 +3523,8 @@ def _build_release(version):
     try:
         with db() as conn:
             rel = dict(conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone())
-            prev = _previous_published(conn, version)
+            deck_id = rel.get("platform_deck") or 1
+            prev = _previous_published(conn, version, deck_id)
             if prev is None or not prev.get("collection_path"):
                 raise RuntimeError("no previous published release with a collection file")
             revs = [dict(r) for r in conn.execute(
@@ -3223,8 +3563,9 @@ def _build_release(version):
                 "UPDATE releases SET status='published', collection_path=?, package_path=NULL, "
                 "published_at=?, build_log=? WHERE version=?",
                 (col_path, now(), json.dumps({"patch": counts, "package": info}), version))
-            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('current_release', ?)", (version,))
-        _prune_collections()
+            conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                         (releases.current_release_key(deck_id), version))
+        _prune_collections(deck_id)
         _official_cache.clear()
     except Exception as e:  # recorded, never raised into the thread
         import traceback
@@ -3233,12 +3574,13 @@ def _build_release(version):
                          (f"{e}\n{traceback.format_exc()}", version))
 
 
-def _prune_collections(keep=2):
+def _prune_collections(deck_id=1, keep=2):
     """Keep the newest `keep` release collections on disk; older ones are not
     needed to build the next release or to serve downloads."""
     with db() as conn:
         rows = conn.execute("SELECT version, collection_path FROM releases WHERE status='published' "
-                            "AND collection_path IS NOT NULL ORDER BY published_at DESC, rowid DESC").fetchall()
+                            "AND collection_path IS NOT NULL AND COALESCE(platform_deck,1)=? "
+                            "ORDER BY published_at DESC, rowid DESC", (deck_id,)).fetchall()
         for r in rows[keep:]:
             try:
                 if os.path.exists(r["collection_path"]):
@@ -3258,74 +3600,138 @@ def start_build(version, user_id):
     return True
 
 
+def release_changes(conn, version):
+    """Readable lines for what a release changed: [{kind, label, snippet, fields, who, guid}]."""
+    out, seen = [], {}
+    for rv in conn.execute(
+            "SELECT r.*, u.username FROM revisions r LEFT JOIN users u ON u.id=r.user_id "
+            "WHERE r.release=? ORDER BY r.id", (version,)):
+        rv = dict(rv)
+        e = seen.get(rv["guid"])
+        if e is None:
+            row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (rv["guid"],)).fetchone()
+            text = ui.plain_text((json.loads(row["fields_json"] or "{}") if row else {}).get("Text", ""), 90)
+            kind = revisions.kind_of(conn, rv)
+            e = {"kind": kind, "label": revisions.KIND_LABELS.get(kind, kind), "snippet": text or rv["guid"],
+                 "fields": set(), "who": set(), "guid": rv["guid"]}
+            seen[rv["guid"]] = e
+            out.append(e)
+        if rv["field"] in revisions.EDITABLE_FIELDS:
+            e["fields"].add(rv["field"])
+        if rv["username"]:
+            e["who"].add(rv["username"])
+    for e in out:
+        e["fields"], e["who"] = sorted(e["fields"]), sorted(e["who"])
+    return out
+
+
+def _changes_html(changes):
+    if not changes:
+        return ""
+    lis = "".join(
+        f'<li><span class="k">{esc(c["label"])}</span>{esc(c["snippet"])}'
+        f'<span class="by">{esc(", ".join(c["fields"]))}{" by " + esc(", ".join(c["who"])) if c["who"] else ""}</span></li>'
+        for c in changes[:200])
+    more = f'<li class="by">and {len(changes) - 200} more</li>' if len(changes) > 200 else ""
+    return f'<ul class="chg">{lis}{more}</ul>'
+
+
 def render_releases(user, csrf, notice=None, token_link=None):
+    deck_id = active_deck_id(user)
     with db() as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM releases ORDER BY created_at DESC")]
-        cur = releases.current_release(conn)
-        pending_n = len(revisions.pending(conn))
+        deck = conn.execute("SELECT * FROM decks WHERE id=?", (deck_id,)).fetchone()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM releases WHERE COALESCE(platform_deck,1)=? ORDER BY rowid DESC", (deck_id,))]
+        cur = releases.current_release(conn, deck_id)
+        pending_n = len(revisions.pending(conn, deck_id))
+        changes = {r["version"]: release_changes(conn, r["version"]) for r in rows}
         tokens = [dict(r) for r in conn.execute(
-            "SELECT * FROM download_tokens ORDER BY created_at DESC LIMIT 20")] if user["role"] == "admin" else []
+            "SELECT * FROM download_tokens WHERE COALESCE(platform_deck,1)=? ORDER BY created_at DESC LIMIT 30",
+            (deck_id,))] if user["role"] == "admin" else []
+    deck_name = deck["name"] if deck else "Doctorine"
     items = []
     for r in rows:
-        act = ""
+        v = r["version"]
+        is_cur = v == cur
+        when = ui.human_time(r.get("published_at") or r["created_at"])
+        badge = {"draft": '<span class="badge warn">Draft</span>', "failed": '<span class="badge bad">Failed</span>',
+                 "building": '<span class="badge warn">Building</span>',
+                 "published": '<span class="badge current">Current</span>' if is_cur
+                 else '<span class="badge dim">Published</span>'}.get(r["status"], "")
+        public = '<span class="badge dim">Silent</span>' if r.get("visibility") == "silent" else ""
+        acts = ""
         if r["status"] in ("draft", "failed"):
-            act = (f'<a class="btn-link-primary" href="/releases/{esc(r["version"])}/confirm">Build and publish…</a> '
-                   f'<form method="post" action="/releases/{esc(r["version"])}/discard" class="inline">'
-                   f'<input type="hidden" name="csrf" value="{csrf}"><button class="ghost">Discard draft</button></form>')
+            acts = (f'<a class="btn-link-primary" href="/releases/{esc(v)}/confirm">Build and publish</a>'
+                    f'<form method="post" action="/releases/{esc(v)}/discard" class="inline">'
+                    f'<input type="hidden" name="csrf" value="{csrf}"><button class="btn-text">Discard draft</button></form>')
         elif r["status"] == "building":
-            act = '<span class="badge warn">Building</span> <span class="small">This page updates itself when the build finishes.</span>'
+            acts = '<span class="small">Building now. This page updates itself when it is done.</span>'
         elif r["status"] == "published":
             if r.get("collection_path") and os.path.exists(r["collection_path"]):
-                act = f'<span class="badge ok">Published</span> <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>'
+                acts = f'<a class="btn-link-primary" href="/download/release/{esc(v)}">Download</a>'
             else:
-                act = '<span class="badge ok">Published</span> <span class="small">older release, no longer downloadable</span>'
-        log = f'<details class="trace"><summary>Build log</summary><pre>{esc(r["build_log"] or "")}</pre></details>' if r.get("build_log") else ""
+                acts = '<span class="small">An older release. It can no longer be downloaded.</span>'
+        n_changes = len(changes.get(v, []))
+        summary = (f'<span class="small">{n_changes} card{"s" if n_changes != 1 else ""} changed</span>'
+                   if n_changes else '<span class="small">The original deck</span>')
+        notes = (f'<p class="small" style="margin:10px 0 0">{esc(r["public_notes"])}</p>'
+                 if r.get("public_notes") else "")
+        log = (f'<details><summary>Build log</summary><pre class="small">{esc(r["build_log"])}</pre></details>'
+               if r.get("build_log") else "")
+        cls = "rel current" if is_cur else ("rel" if r["status"] in ("draft", "building", "failed") else "rel muted")
         items.append(f"""
-<div class="card"><div class="card-head">
-  <span class="meta"><b>Release {esc(r['version'])}</b> &middot; {esc(r['status'])} &middot; {r['note_count'] or 0} notes
-  {"&middot; current" if r['version'] == cur else ""}</span>
-  <span class="row-actions">{act}</span>
-  <time>{esc(r.get('published_at') or r['created_at'] or '')}</time>
-</div>
-{('<div class="proposal"><pre class="small" style="white-space:pre-wrap;margin:0">' + esc(r['changelog']) + '</pre>' + log + '</div>') if (r['changelog'] or log) else ''}</div>""")
+<div class="{cls}">
+  <div class="rh"><span class="v">Release {esc(v)}</span>{badge}{public}{summary}<span class="when">{when}</span></div>
+  {notes}{_changes_html(changes.get(v, []))}
+  <div class="acts">{acts}</div>{log}
+</div>""")
     msg = f'<p class="notice">{esc(notice)}</p>' if notice else ""
     if token_link:
-        msg += (f'<div class="pw-reveal"><p><strong>New download link</strong></p>'
-                f'<div class="copyrow"><input type="text" readonly value="{esc(token_link)}" class="copyable">'
-                f'<button type="button" class="copy-btn ghost" data-copy="{esc(token_link)}">Copy</button></div>'
-                f'<p class="pw-note">Give this to the buyer. It serves the latest published release until it expires.</p></div>')
-    cut = (f'<p><a class="btn-link-primary" href="/releases/next">Next release: {pending_n} note(s) waiting</a></p>'
-           if pending_n else '<p class="small">Nothing is waiting for the next release.</p>')
+        msg += (f'<div class="rel current"><b>New download link</b>'
+                f'<div class="copyblock" style="margin-top:8px"><code>{esc(token_link)}</code>'
+                f'<button type="button" data-copy="{esc(token_link)}">Copy</button></div>'
+                f'<p class="small" style="margin:8px 0 0">Give this to the buyer. It always serves the newest '
+                f'release of {esc(deck_name)}.</p></div>')
+    cut = (f'<p><a class="btn-link-primary" href="/releases/next">{pending_n} card{"s" if pending_n != 1 else ""} '
+           f'waiting in Next release</a></p>' if pending_n else
+           '<p class="small">Nothing is waiting for the next release.</p>')
     tok = ""
     if user["role"] == "admin":
+        def tlink(t):
+            return f'{CFG.public_base_url}/dl/{t["token"]}'
         rows_t = "".join(
-            f'<tr><td class="linkcell"><input type="text" readonly value="{esc(CFG.public_base_url)}/dl/{esc(t["token"])}" class="copyable">'
-            f'<button type="button" class="copy-btn ghost" data-copy="{esc(CFG.public_base_url)}/dl/{esc(t["token"])}">Copy</button></td>'
-            f'<td>{esc(t["note"] or "")}</td><td>{esc(t["expires_at"])}</td><td>{t["downloads"]}</td>'
-            f'<td><form method="post" action="/releases/token/revoke" class="inline"><input type="hidden" name="csrf" value="{csrf}">'
-            f'<input type="hidden" name="token" value="{esc(t["token"])}"><button class="ghost">Revoke</button></form></td></tr>'
-            for t in tokens)
+            f'<tr><td>{esc(t["note"] or "No name")}</td>'
+            f'<td>{esc(deck_name)}</td>'
+            f'<td>Newest, now {esc(cur or "none")}</td>'
+            f'<td><div class="copyblock"><code>{esc(tlink(t))}</code>'
+            f'<button type="button" class="btn-quiet" data-copy="{esc(tlink(t))}">Copy</button></div></td>'
+            f'<td>{ui.human_time(t["expires_at"], False)}</td><td class="num">{t["downloads"]}</td>'
+            f'<td><form method="post" action="/releases/token/revoke" class="inline">'
+            f'<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="token" value="{esc(t["token"])}">'
+            f'<button class="btn-text">Revoke</button></form></td></tr>'
+            for t in tokens) or '<tr><td colspan="7" class="empty-row">No download links yet. Create one above.</td></tr>'
         tok = f"""
-<h2>Download links for buyers</h2>
-<form method="post" action="/releases/token" class="create-form">
+<h2 style="margin-top:34px">Download links for buyers</h2>
+{ui.infobox("How buyer links work", f"<p>A link always serves the <b>newest published release</b> of {esc(deck_name)}. "
+            "If you publish a new release later, the same link downloads the new one. Revoking a link stops new "
+            "downloads but does not remove a deck already imported. Each download carries a hidden license id so "
+            "sharing can be spotted on the Detection page.</p>")}
+<form method="post" action="/releases/token" class="row" style="margin:0 0 16px">
   <input type="hidden" name="csrf" value="{csrf}">
-  <input type="text" name="note" placeholder="Who is this for (optional)">
-  <input type="text" name="days" value="7" style="width:70px"> days
-  <button type="submit">Create link</button>
+  <div><label class="field-label" for="tn">Who is it for</label>
+    <input id="tn" type="text" name="note" placeholder="Optional, e.g. a buyer's name" style="min-width:260px"></div>
+  <div><label class="field-label" for="td">Valid for (days)</label>
+    <input id="td" type="text" name="days" value="7" style="width:80px"></div>
+  <div style="align-self:flex-end"><button type="submit">Create link</button></div>
 </form>
-<table class="users"><thead><tr><th>Link</th><th>For</th><th>Expires</th><th>Downloads</th><th></th></tr></thead><tbody>{rows_t}</tbody></table>
-<p class="admin-note">A link always serves the <em>current</em> published release. Stripe can mint these automatically once a webhook secret is configured.</p>
-<script>
-document.querySelectorAll('.copy-btn[data-copy]').forEach(function (b) {{
-  b.addEventListener('click', function () {{
-    navigator.clipboard.writeText(b.dataset.copy).then(function () {{ b.textContent = 'Copied'; setTimeout(function () {{ b.textContent = 'Copy'; }}, 1500); }});
-  }});
-}});
-</script>"""
-    body = (f'<h1>Releases</h1><p class="sub">Current release: <b>{esc(cur or "—")}</b>. A release is cut from '
-            f'<a href="/releases/next">Next release</a>, then built and published here in a separate, confirmed step.</p>'
-            + msg + cut + '<h2 style="margin-top:28px">All releases</h2>' + "".join(items)
-            + ('<hr style="border:0;border-top:1px solid var(--line);margin:34px 0 10px">' + tok if tok else ''))
+<table class="tbl"><thead><tr><th>Buyer</th><th>Deck</th><th>Serves</th><th>Link</th><th>Expires</th>
+<th class="num">Downloads</th><th></th></tr></thead><tbody>{rows_t}</tbody></table>"""
+    body = (f'<h1>Releases</h1><p class="sub">{esc(deck_name)}. Current release: <b>{esc(cur or "none")}</b>.</p>'
+            + ui.infobox("How releases work",
+                         "<p>A release is cut from <a href=\"/releases/next\">Next release</a>, then built and published here "
+                         "as a separate, confirmed step. The current release is what the add-on offers to students and what "
+                         "buyer links download. Older releases stay listed for the record.</p>")
+            + msg + cut + '<h2 style="margin-top:26px">All releases</h2>' + "".join(items) + tok)
     if any(r["status"] == "building" for r in rows):
         body += """<script>
 (function poll(){
@@ -3337,20 +3743,22 @@ document.querySelectorAll('.copy-btn[data-copy]').forEach(function (b) {{
     return page("Releases", body, "releases", user, csrf)
 
 
-def mint_download_token(note, days, user_id):
+def mint_download_token(note, days, user_id, deck_id=1):
     token = auth.new_token()
     expires = (datetime.now(timezone.utc) + __import__("datetime").timedelta(days=max(1, min(int(days or 7), 90))))
     with db() as conn:
-        conn.execute("INSERT INTO download_tokens (token, note, created_by, created_at, expires_at) VALUES (?,?,?,?,?)",
-                     (token, (note or "").strip(), user_id, now(), expires.strftime("%Y-%m-%d %H:%M UTC")))
+        conn.execute("INSERT INTO download_tokens (token, note, created_by, created_at, expires_at, platform_deck) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (token, (note or "").strip(), user_id, now(), expires.strftime("%Y-%m-%d %H:%M UTC"), deck_id))
     return token
 
 
-def latest_package(conn):
+def latest_package(conn, deck_id=1):
     """(version, collection_path) of the current release, or (None, None).
     Packages are never stored; they are built from this file on download."""
     r = conn.execute("SELECT version, collection_path FROM releases WHERE status='published' "
-                     "AND collection_path IS NOT NULL ORDER BY published_at DESC, rowid DESC LIMIT 1").fetchone()
+                     "AND collection_path IS NOT NULL AND COALESCE(platform_deck,1)=? "
+                     "ORDER BY published_at DESC, rowid DESC LIMIT 1", (deck_id,)).fetchone()
     return (r["version"], r["collection_path"]) if r and os.path.exists(r["collection_path"]) else (None, None)
 
 
@@ -3441,57 +3849,163 @@ def sync_payload(conn, since, deck_id=1):
 CARDS_LIMIT = 50
 
 
-def search_cards(conn, q):
+def search_cards_page(conn, q, deck_id, limit):
+    """Up to `limit` matches for the Cards page."""
     q = (q or "").strip()
     if not q:
         return []
-    exact = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (q,)).fetchone()
+    D = "COALESCE(platform_deck,1)=?"
+    exact = conn.execute(f"SELECT * FROM notes WHERE doctrine_id=? AND retired=0 AND {D}", (q, deck_id)).fetchone()
     if exact:
         return [exact]
     if q.isdigit():
-        rows = conn.execute("SELECT * FROM notes WHERE anki_note_id=? AND retired=0", (int(q),)).fetchall()
+        rows = conn.execute(f"SELECT * FROM notes WHERE anki_note_id=? AND retired=0 AND {D} LIMIT ?",
+                            (int(q), deck_id, limit)).fetchall()
+        if rows:
+            return rows
+    if q.lower().startswith("tag:"):
+        return conn.execute(
+            f"SELECT * FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
+            (deck_id, f"%{q[4:].strip()}%", limit)).fetchall()
+    like = f"%{q}%"
+    return conn.execute(
+        f"SELECT * FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?) "
+        "ORDER BY doctrine_id LIMIT ?", (deck_id, like, like, limit)).fetchall()
+
+
+def search_cards(conn, q, deck_id=1):
+    q = (q or "").strip()
+    if not q:
+        return []
+    D = "COALESCE(platform_deck,1)=?"
+    exact = conn.execute(f"SELECT * FROM notes WHERE doctrine_id=? AND retired=0 AND {D}", (q, deck_id)).fetchone()
+    if exact:
+        return [exact]
+    if q.isdigit():
+        rows = conn.execute(f"SELECT * FROM notes WHERE anki_note_id=? AND retired=0 AND {D}",
+                            (int(q), deck_id)).fetchall()
         if rows:
             return rows
     if q.lower().startswith("tag:"):
         like = f"%{q[4:].strip()}%"
         return conn.execute(
-            "SELECT * FROM notes WHERE retired=0 AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
-            (like, CARDS_LIMIT + 1)).fetchall()
+            f"SELECT * FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
+            (deck_id, like, CARDS_LIMIT + 1)).fetchall()
     like = f"%{q}%"
     return conn.execute(
-        "SELECT * FROM notes WHERE retired=0 AND (fields_json LIKE ? OR tags_json LIKE ?) "
-        "ORDER BY doctrine_id LIMIT ?", (like, like, CARDS_LIMIT + 1)).fetchall()
+        f"SELECT * FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?) "
+        "ORDER BY doctrine_id LIMIT ?", (deck_id, like, like, CARDS_LIMIT + 1)).fetchall()
 
 
-def render_cards(user, csrf, q):
+CARDS_PAGE = 48
+
+
+def count_cards(conn, q, deck_id):
+    """How many official cards a search matches in total."""
+    q = (q or "").strip()
+    if not q:
+        return 0
+    D = "COALESCE(platform_deck,1)=?"
+    if conn.execute(f"SELECT 1 FROM notes WHERE doctrine_id=? AND retired=0 AND {D}", (q, deck_id)).fetchone():
+        return 1
+    if q.isdigit():
+        n = conn.execute(f"SELECT COUNT(*) FROM notes WHERE anki_note_id=? AND retired=0 AND {D}",
+                         (int(q), deck_id)).fetchone()[0]
+        if n:
+            return n
+    if q.lower().startswith("tag:"):
+        return conn.execute(f"SELECT COUNT(*) FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ?",
+                            (deck_id, f"%{q[4:].strip()}%")).fetchone()[0]
+    like = f"%{q}%"
+    return conn.execute(f"SELECT COUNT(*) FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?)",
+                        (deck_id, like, like)).fetchone()[0]
+
+
+def _tag_label(t):
+    parts = [x for x in t.split("::") if x]
+    if parts and parts[0].lower() in ("doctorine", "doctrine"):
+        parts = parts[1:]
+    return " · ".join(parts[-2:]) if parts else t
+
+
+def tile_tags(tags_json, uid, show=3):
+    try:
+        tags = json.loads(tags_json or "[]")
+    except ValueError:
+        tags = []
+    if not tags:
+        return ""
+    chip = lambda t: f'<span class="chip" title="{esc(t)}">{esc(_tag_label(t))}</span>'
+    out = "".join(chip(t) for t in tags[:show])
+    if len(tags) > show:
+        out += (f'<button type="button" class="chip btn-quiet" data-pop="tp{uid}">+{len(tags) - show} more</button>'
+                f'<div class="pop" id="tp{uid}" hidden>{"".join(chip(t) for t in tags)}</div>')
+    return f'<div class="tg">{out}</div>'
+
+
+def render_cards(user, csrf, q, n=CARDS_PAGE):
+    deck_id = active_deck_id(user)
+    try:
+        n = max(CARDS_PAGE, min(int(n or CARDS_PAGE), 960))
+    except ValueError:
+        n = CARDS_PAGE
     with db() as conn:
-        rows = search_cards(conn, q)
-    capped = len(rows) > CARDS_LIMIT
-    rows = rows[:CARDS_LIMIT]
-    items = []
-    for r in rows:
+        total = count_cards(conn, q, deck_id)
+        rows = search_cards_page(conn, q, deck_id, n)
+    tiles, fulls = [], []
+    for i, r in enumerate(rows):
         fields = json.loads(r["fields_json"] or "{}")
-        text = re.sub(r"<[^>]+>", "", fields.get("Text", ""))[:160]
-        extra = re.sub(r"<[^>]+>", "", fields.get("Extra", ""))[:120]
-        items.append(f"""
-<div class="card"><div class="card-head">
-  <span class="meta"><code>{esc(r['doctrine_id'])}</code> &middot; nid {r['anki_note_id'] or '—'} &middot; v{r['version']}</span>
-  <span class="row-actions"><a class="btn-link-primary" href="/cards/edit?guid={quote(r['doctrine_id'], safe='')}">Edit</a></span>
-</div><div class="proposal"><p style="margin:0 0 4px"><b>{esc(text)}</b></p>
-<p class="small" style="margin:0">{esc(extra)}</p>{tag_chips(r['tags_json'])}</div></div>""")
-    note = ""
-    if capped:
-        note = f'<p class="small">Showing the first {CARDS_LIMIT} matches; narrow the search.</p>'
-    elif q and not rows:
-        note = '<p class="small">No official card matches.</p>'
+        f = cardview.faces(fields)
+        guid = quote(r["doctrine_id"], safe="")
+
+        def sec(kind, label, content):
+            if not content.strip():
+                return ""
+            long_ = len(ui.plain_text(content)) > 240
+            more = (f'<button type="button" class="more" data-full="full{i}">Show all</button>' if long_ else "")
+            return (f'<div class="sec {kind}"><div class="lab">{label}</div>'
+                    f'<div class="txt{" clamp" if long_ else ""}">{content}</div>{more}</div>')
+        tiles.append(f"""
+<div class="tile">
+  <div class="th"><code>{esc(r['doctrine_id'])}</code><span>nid {r['anki_note_id'] or 'none'}</span><span>v{r['version']}</span>
+    <span class="sp"><a class="btn-link-primary" href="/cards/edit?guid={guid}">Edit</a></span></div>
+  {sec("front", "Front", f["front"])}{sec("back", "Back", f["back"])}{sec("extra", "Extra", f["extra"])}
+  {tile_tags(r['tags_json'], i)}
+  <template id="full{i}"><h3>{esc(ui.plain_text(fields.get("Text", ""), 80))}</h3>
+    <div class="sec front"><div class="lab">Front</div><div class="txt">{f["front"]}</div></div>
+    <div class="sec back"><div class="lab">Back</div><div class="txt">{f["back"]}</div></div>
+    <div class="sec extra"><div class="lab">Extra</div><div class="txt">{f["extra"]}</div></div></template>
+</div>""")
+    shown = len(rows)
+    if not (q or "").strip():
+        status = ""
+    elif total == 0:
+        status = '<p class="small">No official card matches.</p>'
+    else:
+        status = f'<p class="queue-count">Showing <b>{shown}</b> of <b>{total}</b> matches</p>'
+    more_link = ""
+    if shown < total:
+        more_link = (f'<p style="margin-top:18px"><a class="btn-link-primary" href="/cards?q={quote(q or "")}'
+                     f'&n={n + CARDS_PAGE}">Show {min(CARDS_PAGE, total - shown)} more</a></p>')
     body = f"""
 <h1>Cards</h1>
-<p class="sub">Find any card in the online deck and edit it directly. Edits go to Next release like accepted suggestions.</p>
-<form method="get" action="/cards" class="create-form">
-  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, tag:Doctorine::Yield…, note id or guid" style="min-width:360px" autofocus>
+{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, a note id, or a card id. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
+<form method="get" action="/cards" class="row" style="margin:0 0 14px">
+  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, a note id or a card id" style="min-width:380px" autofocus>
   <button type="submit">Search</button>
 </form>
-{note}{''.join(items)}"""
+{status}
+<div class="tiles">{"".join(tiles)}</div>{more_link}
+<div class="dlg-back" id="fulldlg"><div class="dlg wide"><div id="fullbody"></div>
+  <div class="foot"><button type="button" class="btn-quiet" data-close>Close</button></div></div></div>
+<script>
+document.querySelectorAll('.more[data-full]').forEach(function (b) {{
+  b.addEventListener('click', function () {{
+    document.getElementById('fullbody').innerHTML = document.getElementById(b.dataset.full).innerHTML;
+    document.getElementById('fulldlg').classList.add('on');
+  }});
+}});
+</script>"""
     return page("Cards", body, "cards", user, csrf)
 
 
@@ -3530,43 +4044,17 @@ def card_history_html(conn, guid):
     return "".join(e[2] for e in events)
 
 
-def render_card_edit(user, csrf, guid, error=None):
-    with db() as conn:
-        master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
-        history = card_history_html(conn, guid) if master else ""
-        pend = conn.execute("SELECT COUNT(*) FROM revisions WHERE guid=? AND release IS NULL",
-                            (guid,)).fetchone()[0] if master else 0
-    if master is None:
-        return None
-    notice = (f'<p class="notice">This card already has {pend} pending edit(s) waiting for the next '
-              'release. The fields below show them; saving builds on top.</p>') if pend else ""
-    values = json.loads(master["fields_json"] or "{}")
-    msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
-    tags = tag_chips(master["tags_json"])
-    body = f"""
-<h1>Edit card</h1>
-<p class="sub"><code>{esc(guid)}</code> &middot; {esc(master['note_type'])} &middot; v{master['version']}.
-Saving changes the card in the online deck and queues it for the next release.</p>
-{tags}{notice}{msg}
-<div class="ed-grid">
-  <div class="ed-left">
-    <div class="pane-label">Current card</div>
-    {fields_pane(master['fields_json'], 'Current master')}
-  </div>
-  <div>{editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save")}</div>
-</div>
-<h2 style="margin-top:28px">History</h2>
-<div class="ledger">{history}</div>{EDITOR_CSS}{EDITOR_SCRIPT}"""
-    return page("Edit card", body, "cards", user, csrf)
 
 
 # ---------------------------------------------------------------- outbox
 
-def pending_thank_yous():
+def pending_thank_yous(deck_id=None):
     with db() as conn:
+        if deck_id is None:
+            return conn.execute("SELECT COUNT(*) c FROM notifications WHERE status='pending'").fetchone()["c"]
         return conn.execute(
-            "SELECT COUNT(*) c FROM notifications WHERE status='pending'"
-        ).fetchone()["c"]
+            "SELECT COUNT(*) c FROM notifications n JOIN suggestions s ON s.id=n.suggestion_id "
+            "WHERE n.status='pending' AND COALESCE(s.platform_deck,1)=?", (deck_id,)).fetchone()["c"]
 
 
 def render_outbox(user, csrf):
@@ -3575,8 +4063,8 @@ def render_outbox(user, csrf):
             """SELECT n.*, s.text AS suggestion_text, s.deck, s.token,
                       s.doctrine_id, s.suggestion_type
                FROM notifications n JOIN suggestions s ON s.id = n.suggestion_id
-               WHERE n.status='pending' ORDER BY n.id"""
-        ).fetchall()
+               WHERE n.status='pending' AND COALESCE(s.platform_deck,1)=? ORDER BY n.id""",
+            (active_deck_id(user),)).fetchall()
 
     if not rows:
         body = ('<h1>Thank-you outbox</h1><p class="sub">Accepted suggestions '
@@ -3707,7 +4195,7 @@ def user_for_token(token):
         return None
     with db() as conn:
         row = conn.execute(
-            """SELECT s.token, s.expires_at, u.id, u.username, u.role, u.active
+            """SELECT s.token, s.expires_at, u.id, u.username, u.role, u.active, u.active_deck
                FROM sessions s JOIN users u ON u.id = s.user_id
                WHERE s.token=?""", (token,)).fetchone()
         if row is None:
@@ -3718,7 +4206,8 @@ def user_for_token(token):
         if not row["active"]:
             conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
             return None
-    return {"id": row["id"], "username": row["username"], "role": row["role"]}
+    return {"id": row["id"], "username": row["username"], "role": row["role"],
+            "active_deck": row["active_deck"] or 1}
 
 
 def record_attempt(username, ok):

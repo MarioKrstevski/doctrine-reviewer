@@ -59,7 +59,11 @@ class SearchTest(unittest.TestCase):
                 register_note(base, f"guid{i:06d}", fields={"Text": f"common word {i}", "Extra": ""})
             user, pw = make_user(); _, cookie = login(base, user, pw)
             _, _, html = request(base, "GET", "/cards?q=common+word", cookie=cookie)
-        self.assertIn("first 50", html)
+            _, _, more = request(base, "GET", "/cards?q=common+word&n=96", cookie=cookie)
+        self.assertIn("Showing <b>48</b> of <b>60</b> matches", html)
+        self.assertIn("Show 12 more", html)
+        self.assertIn("Showing <b>60</b> of <b>60</b> matches", more)
+        self.assertNotIn("more</a>", more)
 
 
 class DirectEditTest(unittest.TestCase):

@@ -34,8 +34,14 @@ class InstallPageTest(unittest.TestCase):
             user, pw = make_user()
             _, cookie = login(base, user, pw)
             _, _, html = request(base, "GET", "/install", cookie=cookie)
-        self.assertIn("Testing the full loop", html)
-        self.assertIn("Known gaps", html)
+            _, _, staff_html = request(base, "GET", "/addon", cookie=cookie)
+        # The public page stays public even when signed in, with a way back.
+        self.assertNotIn("The full loop", html)
+        self.assertNotIn('class="sidebar"', html)
+        self.assertIn("Back to workspace", html)
+        # The reviewer walkthrough lives in the workspace menu.
+        self.assertIn("The full loop", staff_html)
+        self.assertIn('class="sidebar"', staff_html)
 
     def test_download_serves_a_valid_addon_package(self):
         with tempfile.TemporaryDirectory() as tmp:

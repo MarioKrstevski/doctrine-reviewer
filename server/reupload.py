@@ -20,10 +20,11 @@ class IdMismatch(ValueError):
     pass
 
 
-def snapshot(conn):
-    """The online deck as a comparison map (active notes only)."""
+def snapshot(conn, deck_id=1):
+    """One deck as a comparison map (active notes only)."""
     out = {}
-    for r in conn.execute("SELECT doctrine_id, fields_json, tags_json FROM notes WHERE retired=0"):
+    for r in conn.execute("SELECT doctrine_id, fields_json, tags_json FROM notes "
+                          "WHERE retired=0 AND COALESCE(platform_deck,1)=?", (deck_id,)):
         out[r["doctrine_id"]] = {"fields": json.loads(r["fields_json"] or "{}"),
                                  "tags": json.loads(r["tags_json"] or "[]")}
     return out
@@ -77,7 +78,7 @@ def compare(current, incoming, pending_guids=frozenset(), max_unknown_ratio=0.5)
             "tag_changes": tag_changes, "other_field_changes": other, "unchanged": unchanged}
 
 
-def apply(conn, diff, incoming, decisions, user_id, upload_id):
+def apply(conn, diff, incoming, decisions, user_id, upload_id, deck_id=1):
     """Apply confirmed parts of a diff.
 
     decisions: {guid: "file" | "platform" | "add" | "retire"}. Changed notes
@@ -98,9 +99,9 @@ def apply(conn, diff, incoming, decisions, user_id, upload_id):
         if decisions.get(guid) == "add":
             inc = incoming[guid]
             fields = {k: v for k, v in (inc.get("fields") or {}).items()}
-            row = conn.execute("SELECT note_type FROM notes LIMIT 1").fetchone()
+            row = conn.execute("SELECT note_type FROM notes WHERE COALESCE(platform_deck,1)=? LIMIT 1", (deck_id,)).fetchone()
             note_type = inc.get("note_type") or (row["note_type"] if row else "AnKingOverhaul++++++")
-            _add_with_guid(conn, guid, note_type, fields, inc.get("tags") or [], user_id, source)
+            _add_with_guid(conn, guid, note_type, fields, inc.get("tags") or [], user_id, source, deck_id)
             out["added"] += 1
     for guid in diff["missing"]:
         if decisions.get(guid) == "retire":
@@ -111,15 +112,15 @@ def apply(conn, diff, incoming, decisions, user_id, upload_id):
     return out
 
 
-def _add_with_guid(conn, guid, note_type, fields, tags, user_id, source):
+def _add_with_guid(conn, guid, note_type, fields, tags, user_id, source, deck_id=1):
     """A new note whose guid comes from the file (so students' future imports match)."""
     import server
     conn.execute(
         """INSERT INTO notes (doctrine_id, guid, doctorine_id, note_type, deck, fields_json,
-                              tags_json, content_hash, version, updated_at, retired)
-           VALUES (?,?,?,?,?,?,?,?,1,?,0)""",
+                              tags_json, content_hash, version, updated_at, retired, platform_deck)
+           VALUES (?,?,?,?,?,?,?,?,1,?,0,?)""",
         (guid, guid, "", note_type, "Doctorine v2", json.dumps(fields), json.dumps(list(tags)),
-         server.content_hash(fields), server.now()))
+         server.content_hash(fields), server.now(), deck_id))
     conn.execute(
         "INSERT INTO revisions (guid, field, before, after, user_id, source, created_at) VALUES (?,?,?,?,?,?,?)",
         (guid, "added", None, json.dumps(fields), user_id, source, server.now()))

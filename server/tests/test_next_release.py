@@ -61,7 +61,7 @@ class PageTest(unittest.TestCase):
         for label in ("Typo / spelling", "Direct edits", "New notes", "Review selection"):
             self.assertIn(label, html)
         self.assertEqual(3, html.count('name="rev:'))
-        self.assertIn("3 notes", html)
+        self.assertIn("<b>3</b> cards", html)
 
     def test_old_pending_url_redirects(self):
         with running_server() as base:

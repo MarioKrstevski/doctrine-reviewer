@@ -69,3 +69,8 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
 - 2026-10-13: T4, T2, T3, T11 done and deployed. Next: T5, T6, T8, T9, T10, then T7 (last).
 - 2026-10-13: T5, T6, T8, T9, T10 done and deployed. Only T7 (add-on update prompt, last by Mario's choice) remains.
 - 2026-10-13: T7 done. All of T1-T11 shipped. Remaining ideas: per-deck release UI, student-facing real-device test of 1.7.0.
+- 2026-10-14: UI feedback round shipped. New: ui.py (shared components), cardview.py (Anki-like rendering with sanitizer),
+  shadcn-style sidebar with deck switcher and user menu, global active deck scoping every page, public pages always public,
+  Add-on and testing staff page, Inbox with Rendered/HTML/Differences panes and stale-proposal rule, Cards tiles,
+  Edit page tabs (Edit, History, Anki view), Releases redesign, Deck page picker with triple-confirm delete,
+  Detection info box, auto-refresh while building, add-on 1.7.1 (stale card fix, check on open, add-on self-update).

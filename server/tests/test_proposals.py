@@ -82,3 +82,17 @@ class DiffRenderTest(unittest.TestCase):
     def test_unit_diff_marks_unchanged_fields_as_such(self):
         out = server.diff_fields({"Text": "a b c", "Extra": "same"}, {"Text": "a X c", "Extra": "same"})
         self.assertEqual(["Text"], [f for f, _ in out])
+
+
+class StaleProposalTest(unittest.TestCase):
+    def test_proposal_on_an_older_card_cannot_be_accepted_directly(self):
+        with running_server() as base:
+            register_note(base, GUID, fields={"Text": "HPV11 has {{c1::low}} cancer risk", "Extra": "e"})
+            suggest(base, {"Text": "HPV11 has {{c1::low}} malignancy risk"})
+            with server.db() as conn:
+                import revisions
+                revisions.apply_edit(conn, GUID, {"Text": "HPV11 changed since {{c1::low}}"}, 1, "staff")
+            html = queue()
+        self.assertIn("older version of the card", html)
+        self.assertNotIn('value="accept_proposal"', html)
+        self.assertIn("Edit proposal", html)

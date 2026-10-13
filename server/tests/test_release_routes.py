@@ -53,7 +53,9 @@ class CutTest(unittest.TestCase):
         self.assertEqual(303, status)
         self.assertEqual("draft", rel["status"])
         self.assertEqual(1, stamped)
-        self.assertIn("guidAAAAAA", rel["changelog"])
+        self.assertIn("Direct edits (1)", rel["changelog"])
+        self.assertIn("(Text)", rel["changelog"])
+        self.assertNotIn("guidAAAAAA", rel["changelog"])
         self.assertEqual("1.0", cur, "current release moves only on publish")
 
     def test_cut_with_nothing_pending_is_refused(self):
