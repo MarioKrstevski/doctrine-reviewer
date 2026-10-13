@@ -251,6 +251,21 @@ tr.inactive { opacity:.5; }
 .infobox .b ul { margin:4px 0 0; padding-left:18px; }
 
 /* ---- inbox panes ---- */
+.ask { border-top:1px solid var(--line); }
+.ask .pane-label { display:flex; align-items:center; }
+.ask-body { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.5fr); gap:20px; padding:14px 16px; font-size:14.5px; }
+.ask-body .lab, .viewbar .lab { font-size:10.5px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--faint);
+  margin-bottom:4px; }
+.viewbar { display:flex; align-items:center; gap:12px; padding:10px 16px; border-top:1px solid var(--line); background:var(--panel); }
+.viewbar .lab { margin:0; }
+.panes.two { display:grid; grid-template-columns:1fr 1fr; align-items:stretch; border-top:1px solid var(--line); }
+.panes.two .pane { display:flex; flex-direction:column; border-right:1px solid var(--line); min-width:0; }
+.panes.two .pane:last-child { border-right:0; }
+.panes.two .pane-label { height:40px; box-sizing:border-box; display:flex; align-items:center; }
+.viewpane { height:340px; box-sizing:border-box; }
+.viewpane[hidden] { display:none; }
+.viewpane.scroll { overflow:auto; padding:14px 16px; font-size:14px; }
+.anki-frame { width:100%; height:100%; border:0; display:block; background:#fff; }
 .panes.eq { align-items:stretch; }
 .panes.eq .pane { display:flex; flex-direction:column; }
 .panes.eq .pane-label { min-height:42px; }
@@ -390,7 +405,9 @@ button[disabled] { opacity:.45; cursor:not-allowed; }
   .staff main .wrap, .wrap { padding:18px 16px 56px; }
   h1 { font-size:26px; margin-top:8px; }
   .tiles { grid-template-columns:1fr; }
-  .panes, .panes.eq { grid-template-columns:1fr; }
+  .panes, .panes.eq, .panes.two { grid-template-columns:1fr; }
+  .ask-body { grid-template-columns:1fr; }
+  .viewpane { height:300px; }
   .pane { border-right:0; border-bottom:1px solid var(--line); }
   .pane-body { max-height:300px; }
   table.tbl, table.users { display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; }

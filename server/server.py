@@ -495,10 +495,9 @@ def rewrite_media(html):
     return _SRC.sub(lambda m: m.group(1) + "/media/" + quote(m.group(2)) + m.group(3), html)
 
 
-def card_iframe(q_html, a_html, css, label):
-    """Render a card snapshot inside a sandboxed iframe via srcdoc."""
+def _card_doc(q_html, a_html, css):
     q_html, a_html = rewrite_media(q_html), rewrite_media(a_html)
-    doc = f"""<!doctype html><html><head><meta charset="utf-8">
+    return f"""<!doctype html><html><head><meta charset="utf-8">
 <style>body{{font-family:system-ui,sans-serif;padding:18px;margin:0;
 background:#fff;color:#122031;font-size:15px;line-height:1.5}}
 hr{{border:none;border-top:1px solid #E4E1D8;margin:16px 0}}
@@ -510,8 +509,18 @@ border:2px solid #fff}}
 {css or ""}</style></head><body>
 {q_html or "<i>(empty)</i>"}<hr>{a_html or "<i>(empty)</i>"}
 </body></html>"""
+
+
+def card_iframe(q_html, a_html, css, label):
+    """Render a card snapshot inside a sandboxed iframe via srcdoc."""
+    doc = _card_doc(q_html, a_html, css)
     return (f'<div class="pane"><div class="pane-label">{esc(label)}</div>'
             f'<iframe sandbox="" srcdoc="{esc(doc)}"></iframe></div>')
+
+
+def anki_frame(q_html, a_html, css=""):
+    """Just the sandboxed iframe: question, a rule, then the answer side, the way Anki shows it."""
+    return f'<iframe class="anki-frame" sandbox="" srcdoc="{esc(_card_doc(q_html, a_html, css))}"></iframe>'
 
 
 BASE_CSS = """
@@ -886,30 +895,29 @@ def _rendered(fields):
             f'{extra}')
 
 
-def _card_pane(label, badge, fields, other=None, group="", anki_iframe=""):
-    """A pane with Rendered | HTML (| Differences | As Anki showed it) views of one card's fields."""
-    views = [("rendered", "Rendered"), ("html", "HTML")]
-    diff_html = ""
-    if other is not None:
-        diffs = diff_fields(other, fields)
-        diff_html = ("".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
-                     or '<p class="small">No difference in Text or Extra.</p>')
-        views.append(("diff", "Differences"))
-    if anki_iframe:
-        views.append(("anki", "As Anki showed it"))
-    buttons = "".join(f'<button type="button" data-show="{v}"{" class=\"on\"" if i == 0 else ""}>{t}</button>'
-                      for i, (v, t) in enumerate(views))
-    panes = (f'<div data-group="{group}" data-value="rendered" class="rendered">{_rendered(fields)}</div>'
-             f'<div data-group="{group}" data-value="html" hidden><dl class="fields" style="height:auto;border:0;padding:0">'
-             f'{_field_rows(fields)}</dl></div>')
-    if other is not None:
-        panes += (f'<div data-group="{group}" data-value="diff" hidden><dl class="fields" '
-                  f'style="height:auto;border:0;padding:0">{diff_html}</dl></div>')
-    if anki_iframe:
-        panes += f'<div data-group="{group}" data-value="anki" hidden style="margin:-14px -16px">{anki_iframe}</div>'
-    return (f'<div class="pane"><div class="pane-label">{label}{badge}'
-            f'<span class="seg" data-for="{group}">{buttons}</span></div>'
-            f'<div class="pane-body">{panes}</div></div>')
+def _faces_frame(fields, css=""):
+    """A card built from fields, shown as Anki's answer side: front, rule, back, extra."""
+    f = cardview.faces(fields)
+    extra = f'<br><br>{f["extra"]}' if f["extra"].strip() else ""
+    return anki_frame(f["front"], f["back"] + extra, css)
+
+
+def _diff_rows(base, fields):
+    diffs = diff_fields(base, fields)
+    return ("".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
+            or '<p class="small">No difference in Text or Extra.</p>')
+
+
+def _card_pane(label, fields, other, group, rendered_html):
+    """One column. Three views, switched by the shared control above: Rendered, HTML, Differences."""
+    return (f'<div class="pane"><div class="pane-label">{label}</div>'
+            f'<div class="viewpane" data-group="{group}" data-value="rendered">{rendered_html}</div>'
+            f'<div class="viewpane scroll" data-group="{group}" data-value="html" hidden>'
+            f'<dl class="fields" style="height:auto;border:0;padding:0">{_field_rows(fields)}</dl></div>'
+            f'<div class="viewpane scroll" data-group="{group}" data-value="diff" hidden>'
+            f'<dl class="fields" style="height:auto;border:0;padding:0">'
+            f'{_diff_rows(other, fields) if other is not None else "<p class=small>Nothing to compare with.</p>"}'
+            f'</dl></div></div>')
 
 
 def render_inbox_item(r, master, csrf):
@@ -938,15 +946,20 @@ def render_inbox_item(r, master, csrf):
     else:
         state_badge = '<span class="badge ok">Same as the current card</span>'
 
-    ours = (_card_pane(f'Current card (v{master["version"]})', "", current, None, f"c{sid}") if master is not None else
-            '<div class="pane"><div class="pane-label">Current card</div><div class="pane-body">'
-            '<p class="small">No copy of this card is on file. Compare the student\'s copy yourself.</p></div></div>')
-    anki_frame = (card_iframe(r["snap_question"], r["snap_answer"], r["snap_css"], "What the student saw")
-                  if (r["snap_question"] or r["snap_answer"]) else "")
-    student = _card_pane("What the student has", "", theirs, current if master is not None else None, f"s{sid}",
-                         anki_frame)
+    css = r["snap_css"] or ""
+    group = f"v{sid}"
+    if r["snap_question"] or r["snap_answer"]:
+        student_view = anki_frame(r["snap_question"], r["snap_answer"], css)
+    else:
+        student_view = _faces_frame(theirs, css)
+    student = _card_pane("What the student has", theirs, current if master is not None else None, group, student_view)
+    if master is not None:
+        ours = _card_pane(f'Current card, v{master["version"]}', current, theirs, group, _faces_frame(current, css))
+    else:
+        ours = ('<div class="pane"><div class="pane-label">Current card</div><div class="viewpane scroll">'
+                '<p class="small">No copy of this card is on file. Compare the student\'s copy yourself.</p></div></div>')
 
-    # the suggestion and the proposed change
+    # the suggestion and the proposed change, shown across the top
     proposal = ""
     proposed = None
     if r["proposed_fields_json"]:
@@ -957,15 +970,17 @@ def render_inbox_item(r, master, csrf):
     if proposed is not None and master is not None:
         diffs = diff_fields(current, proposed)
         rows_ = "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
-        proposal = (f'<div class="pane-label" style="margin:12px -16px 0">Proposed change</div>'
-                    f'<dl class="fields" style="height:auto;border:0;padding:8px 0 0">'
+        proposal = (f'<div><div class="lab">Proposed change</div>'
+                    f'<dl class="fields" style="height:auto;border:0;padding:0">'
                     f'{rows_ or "<p class=small>Identical to the current card.</p>"}</dl>')
         if stale:
             proposal += ('<p class="stale-hint" style="margin-top:8px">The student wrote this against an older '
                          'version of the card, so it cannot be accepted as is. Use Edit proposal.</p>')
-    sugg = (f'<div class="pane suggestion"><div class="pane-label">Suggestion<span class="badge dim">'
+        proposal += "</div>"
+    sugg = (f'<div class="ask"><div class="pane-label">What the student asked<span class="badge dim" style="margin-left:auto">'
             f'{esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))}</span></div>'
-            f'<div class="pane-body"><div class="sugg-body" style="padding:0">{esc(r["text"])}</div>{proposal}</div></div>')
+            f'<div class="ask-body"><div><div class="lab">Their words</div>'
+            f'<div class="sugg-body" style="padding:0">{esc(r["text"])}</div></div>{proposal}</div></div>')
 
     # details drawer
     contact = f'<dt>email</dt><dd>{esc(r["email"])}</dd>' if r["email"] else ""
@@ -1019,7 +1034,11 @@ def render_inbox_item(r, master, csrf):
   </div>
   {tag_chips(r["tags_json"])}
   <div style="padding:0 16px">{details}</div>
-  <div class="panes eq">{student}{ours}{sugg}</div>
+  {sugg}
+  <div class="viewbar"><span class="lab">View both as</span>
+    <span class="seg" data-for="{group}"><button type="button" data-show="rendered" class="on">Rendered</button>
+    <button type="button" data-show="html">HTML</button><button type="button" data-show="diff">Differences</button></span></div>
+  <div class="panes two">{student}{ours}</div>
   {actions}
 </div>"""
 
