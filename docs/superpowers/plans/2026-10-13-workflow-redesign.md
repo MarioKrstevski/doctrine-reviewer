@@ -74,3 +74,6 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
   Add-on and testing staff page, Inbox with Rendered/HTML/Differences panes and stale-proposal rule, Cards tiles,
   Edit page tabs (Edit, History, Anki view), Releases redesign, Deck page picker with triple-confirm delete,
   Detection info box, auto-refresh while building, add-on 1.7.1 (stale card fix, check on open, add-on self-update).
+- 2026-10-14: Labels (per card, per deck, created on the fly; Inbox New/Triaged/Closed; Cards label: search; Next release filter)
+  and release approval (admin only, not the preparer unless Users setting allows; build locked until approved; remove card from
+  draft resets approval) shipped. Release detail page lists what changed, who, source, student words, thank-you status.

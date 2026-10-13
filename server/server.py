@@ -37,6 +37,7 @@ import releases
 import release_build
 import apkgfile
 import cardview
+import labels
 import ui
 import reupload
 import revisions
@@ -193,6 +194,21 @@ def init_db():
             actioned_by INTEGER
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform_deck INTEGER DEFAULT 1,
+            name TEXT NOT NULL,
+            created_at TEXT,
+            UNIQUE(platform_deck, name)
+        );
+        CREATE TABLE IF NOT EXISTS card_labels (
+            guid TEXT NOT NULL,
+            label_id INTEGER NOT NULL,
+            added_by INTEGER,
+            added_at TEXT,
+            PRIMARY KEY (guid, label_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_card_labels_label ON card_labels(label_id);
         CREATE TABLE IF NOT EXISTS releases (
             version TEXT PRIMARY KEY,
             status TEXT NOT NULL DEFAULT 'draft',   -- draft|published
@@ -248,7 +264,9 @@ def init_db():
                                         "retired": "INTEGER DEFAULT 0"})
         _ensure_columns(conn, "releases", {"package_path": "TEXT", "build_log": "TEXT",
                                            "published_at": "TEXT", "built_by": "INTEGER",
-                                           "public_notes": "TEXT", "visibility": "TEXT"})
+                                           "public_notes": "TEXT", "visibility": "TEXT",
+                                           "prepared_by": "INTEGER", "approved_by": "INTEGER",
+                                           "approved_at": "TEXT"})
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS decks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -918,6 +936,34 @@ def _seg(group, options):
     return f'<span class="seg" data-for="{group}">{buttons}</span>'
 
 
+def label_chips(names, href=None):
+    return "".join(ui.label_chip(n, href.format(label=quote(n)) if href else None) for n in names)
+
+
+def label_button(guid, names, title, text="Label"):
+    return (f'<button type="button" class="btn-quiet label-btn" data-label-open data-guid="{esc(guid)}" '
+            f'data-title="{esc(title)}" data-labels="{esc(json.dumps(names))}">{text}</button>')
+
+
+def label_dialog(all_labels, csrf, next_path):
+    boxes = "".join(
+        f'<label class="chk" style="display:flex;margin:4px 0"><input type="checkbox" name="label" value="{esc(x["name"])}"> '
+        f'{ui.label_chip(x["name"])} <span class="small">{x["cards"]} card{"s" if x["cards"] != 1 else ""}</span></label>'
+        for x in all_labels) or '<p class="small">No labels yet. Create the first one below.</p>'
+    return f"""
+<div class="dlg-back" id="labeldlg"><div class="dlg"><h3>Labels</h3>
+  <p class="small ld-title" style="margin:0 0 10px"></p>
+  <form method="post" action="/labels/set">
+    <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="guid" value="">
+    <input type="hidden" name="next" value="{esc(next_path)}">
+    <div style="max-height:220px;overflow:auto">{boxes}</div>
+    <label class="field-label" style="margin-top:12px" for="ldnew">New label (separate several with commas)</label>
+    <input id="ldnew" type="text" name="new" placeholder="for example ask anna" style="width:100%">
+    <p class="small">A label belongs to the card. Every report and edit on the card shares it.</p>
+    <div class="foot"><button type="button" class="btn-quiet" data-close>Cancel</button><button type="submit">Save labels</button></div>
+  </form></div></div>"""
+
+
 def _est_height(*parts):
     """Pixel height for a card pane, from how much text it holds, so short cards do not leave a big blank frame."""
     text = " ".join(ui.plain_text(p) for p in parts if p)
@@ -1009,7 +1055,7 @@ def _ask_section(r, current, master, theirs, stale, css):
     return f'<section class="ask"><div class="askgrid two">{words}{want}</div></section>', True
 
 
-def render_inbox_item(r, master, csrf):
+def render_inbox_item(r, master, csrf, card_labels=()):
     """One report, top to bottom: header, what they wrote and want, what they saw, then the actions."""
     sid = r["id"]
     status = r["status"]
@@ -1032,7 +1078,7 @@ def render_inbox_item(r, master, csrf):
     ask, has_proposal = _ask_section(r, current, master, theirs, stale, css)
     saw = _saw_section(r, theirs, current, master, stale, css)
 
-    note_id = f'Note {r["anki_note_id"]}' if r["anki_note_id"] else "Note"
+    note_id = f'Note {r["anki_note_id"]}' if r["anki_note_id"] else f'Card {r["doctrine_id"]}'
     contact = f'<dt>email</dt><dd>{esc(r["email"])}</dd>' if r["email"] else ""
     details = (f'<details class="trace"><summary>Details</summary><dl>'
                f'<dt>deck</dt><dd>{esc(r["deck"])}</dd><dt>note type</dt><dd>{esc(r["note_type"])}</dd>'
@@ -1048,7 +1094,6 @@ def render_inbox_item(r, master, csrf):
 <div class="actions">
 <form method="post" action="/reviewer/action">
   <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{sid}">
-  <span class="hint">Accepting changes the card in the online deck and queues it for the next release.</span>
   <span class="btns">
     {accept}
     <a class="btn-link-primary" href="/edit/{sid}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
@@ -1079,6 +1124,7 @@ def render_inbox_item(r, master, csrf):
   <div class="card-head">
     {status_badge} {email_chip}
     <span class="meta"><b>{note_id}</b> &middot; report #{sid}</span>
+    <span class="labelrow">{label_chips(card_labels)}{label_button(r["doctrine_id"], list(card_labels), note_id, "Edit labels" if card_labels else "Label")}</span>
     <time>{ui.human_time(r["created_at"])}</time>
   </div>
   {tag_chips(r["tags_json"])}
@@ -1089,7 +1135,7 @@ def render_inbox_item(r, master, csrf):
 </div>"""
 
 
-def render_reviewer(user=None, secret=None, session_token=None):
+def render_reviewer(user=None, secret=None, session_token=None, label_filter=()):
     csrf = auth.csrf_token(session_token, secret) if session_token and secret else ""
     deck_id = active_deck_id(user) if user else 1
     with db() as conn:
@@ -1105,14 +1151,18 @@ def render_reviewer(user=None, secret=None, session_token=None):
         closed_total = conn.execute(
             "SELECT COUNT(*) FROM suggestions WHERE status!='open' AND COALESCE(platform_deck,1)=?", (deck_id,)).fetchone()[0]
         masters = fetch_masters(conn, {r["doctrine_id"] for r in rows})
+        card_labels = labels.labels_for(conn, {r["doctrine_id"] for r in rows})
+        all_lab = labels.all_labels(conn, deck_id)
 
+    label_filter = [labels.normalize(x) for x in label_filter if labels.normalize(x)]
     items = []
     item_card = []
     for r in rows:
         item_card.append((r["doctrine_id"], r["status"], r["id"]))
-        items.append(render_inbox_item(r, masters.get(r["doctrine_id"]), csrf))
+        items.append(render_inbox_item(r, masters.get(r["doctrine_id"]), csrf, card_labels.get(r["doctrine_id"], [])))
 
     # Group open items by card. A card with several open reports gets a header.
+    # Open reports on a labeled card are triaged: they leave New but stay open.
     order, groups, closed = [], {}, []
     for html, (did, st, sid) in zip(items, item_card):
         if st == "open":
@@ -1121,36 +1171,56 @@ def render_reviewer(user=None, secret=None, session_token=None):
             groups[did].append((sid, html))
         else:
             closed.append(html)
-    parts = []
-    for did in order:
+
+    def group_html(did):
         members = groups[did]
         if len(members) > 1:
-            parts.append(f'''<section class="card-group"><div class="group-head">
+            return f'''<section class="card-group"><div class="group-head">
 <b>{len(members)} reports on this card</b> <code>{esc(did)}</code>
 <form method="post" action="/reviewer/action" style="display:inline">
 <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{members[0][0]}">
 <button name="do" value="resolve_card" class="secondary" title="Resolve every open report on this card as fixed (each student with an email gets a thank-you)">Card fixed, resolve all</button>
-</form></div>''' + "".join(h for _, h in members) + "</section>")
-        else:
-            parts.append(members[0][1])
-    n_open = len(order) and sum(len(m) for m in groups.values())
+</form></div>''' + "".join(h for _, h in members) + "</section>"
+        return members[0][1]
+
+    new_parts = [group_html(d) for d in order if not card_labels.get(d)]
+    triaged_order = [d for d in order if card_labels.get(d)
+                     and (not label_filter or set(label_filter) & set(card_labels[d]))]
+    triaged_parts = [group_html(d) for d in triaged_order]
+    n_new = sum(len(groups[d]) for d in order if not card_labels.get(d))
+    n_triaged = sum(len(groups[d]) for d in order if card_labels.get(d))
+    n_open = n_new + n_triaged
     nxt = _next_version_hint()
     banner = ui.infobox("How to read this page", (
         "<p>Each report opens with <b>what the student wrote</b> and, if they proposed an exact change, <b>what they want</b>. "
         "Below that is <b>what the student saw</b>. If our card has changed since, you see ours next to it. "
         "A proposal can only be accepted directly when the student saw the same card we have now.</p>"
+        "<p><b>Label</b> a card to park it. It leaves New but stays open, under Triaged, so you can group things and come back.</p>"
         f"<p>Accepting adds the change to the next release ({esc(nxt)}). You choose what ships on the Next release page.</p>"))
     new_empty = ('<div class="empty"><b>Nothing new</b>When a student clicks Suggest an edit inside Anki, their report '
                  'arrives here with the card they were looking at.</div>')
+    tri_empty = ('<div class="empty"><b>Nothing triaged</b>Give a card a label from New and it moves here, still open, '
+                 'so you can group things and come back to them.</div>')
     closed_empty = '<div class="empty"><b>Nothing closed yet</b>Accepted, declined and expired reports are kept here.</div>'
     closed_note = (f'<p class="small">Showing the latest {RECENT_CLOSED_SHOWN} of {closed_total} closed reports.</p>'
                    if closed_total > len(closed) else "")
+    used = collections.Counter(l for d in order for l in card_labels.get(d, []))
+    chips = "".join(
+        f'<a class="chip-link{" on" if x["name"] in label_filter else ""}" href="/reviewer?'
+        + "&".join("label=" + quote(n) for n in (sorted(set(label_filter) ^ {x["name"]})))
+        + f'#triaged-pane">{ui.label_chip(x["name"])} <span class="small">{used[x["name"]]}</span></a>'
+        for x in all_lab if used.get(x["name"]))
+    chipbar = (f'<div class="chipbar"><span class="lab">Filter by label</span>{chips}'
+               + (' <a class="small" href="/reviewer#triaged-pane">Clear</a>' if label_filter else "") + "</div>") if chips else ""
     tabs = (f'<div class="tabs" data-tabs><button type="button" data-tab="new-pane">New '
-            f'<span class="count">{n_open}</span></button>'
+            f'<span class="count">{n_new}</span></button>'
+            f'<button type="button" data-tab="triaged-pane">Triaged <span class="count">{n_triaged}</span></button>'
             f'<button type="button" data-tab="closed-pane">Closed <span class="count dim">{closed_total}</span></button></div>')
     body = ('<h1>Inbox</h1>' + banner + tabs
-            + f'<div class="tabpane" id="new-pane">{"".join(parts) or new_empty}</div>'
-            + f'<div class="tabpane" id="closed-pane" hidden>{closed_note}{"".join(closed) or closed_empty}</div>')
+            + f'<div class="tabpane" id="new-pane">{"".join(new_parts) or new_empty}</div>'
+            + f'<div class="tabpane" id="triaged-pane" hidden>{chipbar}{"".join(triaged_parts) or tri_empty}</div>'
+            + f'<div class="tabpane" id="closed-pane" hidden>{closed_note}{"".join(closed) or closed_empty}</div>'
+            + label_dialog(all_lab, csrf, "/reviewer"))
     return page("Inbox", body, "reviewer", user, csrf)
 
 
@@ -1965,7 +2035,7 @@ class Handler(BaseHTTPRequestHandler):
                 if path == "/notes/new":
                     self._send(200, render_new_note(user, csrf))
                 elif path == "/releases/next":
-                    self._send(200, render_next_release(user, csrf))
+                    self._send(200, render_next_release(user, csrf, parse_qs(urlparse(self.path).query).get("label", [])))
                 elif path.endswith("/confirm"):
                     self._send(200, render_build_confirm(user, csrf, path[len("/releases/"):-len("/confirm")]))
                 else:
@@ -2001,8 +2071,8 @@ class Handler(BaseHTTPRequestHandler):
             if user is None:
                 self._redirect("/login")
             else:
-                self._send(200, render_reviewer(user, session_secret(),
-                                                self._cookie_token()))
+                self._send(200, render_reviewer(user, session_secret(), self._cookie_token(),
+                                                parse_qs(urlparse(self.path).query).get("label", [])))
         elif path == "/updates":
             self._send(200, render_updates(self._current_user()))
         elif path.startswith("/s/"):
@@ -2064,7 +2134,8 @@ class Handler(BaseHTTPRequestHandler):
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
         elif path in ("/releases/cut", "/releases/token", "/releases/token/revoke", "/releases/confirm") or \
-                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard"))):
+                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard")
+                 or path.endswith("/approve") or path.endswith("/unapprove") or path.endswith("/remove"))):
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
             if user is None:
@@ -2086,6 +2157,17 @@ class Handler(BaseHTTPRequestHandler):
             elif path.endswith("/discard"):
                 discard_release(path[len("/releases/"):-len("/discard")])
                 self._redirect("/releases/next")
+            elif path.endswith("/approve") or path.endswith("/unapprove") or path.endswith("/remove"):
+                action = path.rsplit("/", 1)[1]
+                version = unquote(path[len("/releases/"):-len("/" + action)])
+                if action == "approve":
+                    ok, message = approve_release(version, user)
+                elif action == "unapprove":
+                    ok, message = unapprove_release(version, user)
+                else:
+                    ok, message = remove_from_draft(version, form.get("guid", [""])[0], user)
+                html_ = render_release_detail(user, auth.csrf_token(self._cookie_token(), session_secret()), version, message, ok)
+                self._send(200 if html_ else 404, html_ or page("Not found", "<h1>No such release</h1>"))
             elif path == "/releases/token/revoke":
                 if user["role"] != "admin":
                     self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
@@ -2107,15 +2189,46 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, render_build_confirm(
                         user, auth.csrf_token(self._cookie_token(), session_secret()), version,
                         "Type the version exactly to confirm."))
+                elif not start_build(version, user["id"]):
+                    self._send(200, render_build_confirm(
+                        user, auth.csrf_token(self._cookie_token(), session_secret()), version,
+                        "This release cannot be built yet. It needs an administrator's approval first."))
                 else:
-                    start_build(version, user["id"])
                     self._redirect("/releases")
+        elif path == "/admin/self-approval":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin" or not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+            else:
+                with db() as conn:
+                    conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('allow_self_approval', ?)",
+                                 ("1" if form.get("allow") else "0",))
+                self._redirect("/admin/users")
         elif path == "/api/ping":
             try:
                 ok = record_ping(json.loads(raw or b"{}"))
                 self._json(200 if ok else 400, {"ok": ok})
             except (json.JSONDecodeError, AttributeError):
                 self._json(400, {"ok": False})
+        elif path == "/labels/set":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            else:
+                guid = form.get("guid", [""])[0]
+                names = form.get("label", []) + labels.parse_new(form.get("new", [""])[0])
+                with db() as conn:
+                    note = conn.execute("SELECT COALESCE(platform_deck,1) AS d FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+                    if note:
+                        labels.set_card_labels(conn, guid, names, user["id"], now(), note["d"])
+                back = form.get("next", ["/reviewer"])[0]
+                self._redirect(back if back.startswith("/") and not back.startswith("//") else "/reviewer")
         elif path == "/deck/select":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -2381,6 +2494,15 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
         rows = conn.execute(
             "SELECT id, username, role, active, created_at FROM users"
             " ORDER BY role='reviewer', username").fetchall()
+        self_ok = self_approval_allowed(conn)
+    self_approval_form = f"""
+<form method="post" action="/admin/self-approval" style="margin:22px 0">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <label class="chk"><input type="checkbox" name="allow" value="1"{" checked" if self_ok else ""} onchange="this.form.submit()">
+  Let an administrator approve a release they prepared themselves</label>
+  <p class="small" style="margin:4px 0 0">Off by default. A release needs another administrator's approval before it can be built.
+  Turn this on only when there is just one administrator.</p>
+</form>"""
 
     banner = ""
     if new_password:
@@ -2432,6 +2554,7 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
   <thead><tr><th>User</th><th>Role</th><th>Status</th><th></th></tr></thead>
   <tbody>{''.join(items)}</tbody>
 </table>
+{self_approval_form}
 <p class="admin-note">Deactivating keeps a person's review history intact
 and signs them out immediately. Resetting a password also signs them out.
 There is no email in this system, so hand credentials over directly.</p>
@@ -2899,6 +3022,13 @@ def render_edit(user, csrf, sid, use_proposal=False, error=None):
     return page("Edit card", body, "reviewer", user, csrf)
 
 
+def values_text(master):
+    try:
+        return json.loads(master["fields_json"] or "{}").get("Text", "")
+    except ValueError:
+        return ""
+
+
 def render_card_edit(user, csrf, guid, error=None):
     with db() as conn:
         master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
@@ -2911,11 +3041,17 @@ def render_card_edit(user, csrf, guid, error=None):
               'release. The fields below show them, and saving builds on top.</p>') if pend else ""
     values = json.loads(master["fields_json"] or "{}")
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
-    edit = (notice + msg + _EDITOR_HINT + tag_chips(master["tags_json"])
+    with db() as conn:
+        my_labels = labels.labels_for(conn, [guid])[guid]
+        all_lab = labels.all_labels(conn, master["platform_deck"] or 1)
+    label_row = (f'<p class="labelrow" style="margin:0 0 10px"><span class="small">Labels</span>{label_chips(my_labels)}'
+                 f'{label_button(guid, my_labels, ui.plain_text(values_text(master), 80), "Edit labels" if my_labels else "Add a label")}</p>')
+    edit = (notice + msg + label_row + _EDITOR_HINT + tag_chips(master["tags_json"])
             + editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save"))
     body = (f'<h1>Edit card</h1><p class="sub"><code>{esc(guid)}</code> &middot; version {master["version"]}. '
             'Saving changes the card in the online deck and queues it for the next release.</p>'
-            + _editor_tabs(edit, history) + EDITOR_CSS + EDITOR_SCRIPT)
+            + _editor_tabs(edit, history) + label_dialog(all_lab, csrf, f"/cards/edit?guid={quote(guid, safe='')}")
+            + EDITOR_CSS + EDITOR_SCRIPT)
     return page("Edit card", body, "cards", user, csrf)
 
 
@@ -3114,6 +3250,8 @@ def delete_deck(deck_id, typed_name):
             conn.execute(f"DELETE FROM revisions WHERE guid IN ({marks})", chunk)
         conn.execute("DELETE FROM notifications WHERE suggestion_id IN (SELECT id FROM suggestions WHERE platform_deck=?)",
                      (deck_id,))
+        conn.execute("DELETE FROM card_labels WHERE guid IN (SELECT doctrine_id FROM notes WHERE platform_deck=?)", (deck_id,))
+        conn.execute("DELETE FROM labels WHERE platform_deck=?", (deck_id,))
         for table in ("suggestions", "uploads", "download_tokens", "releases", "notes"):
             conn.execute(f"DELETE FROM {table} WHERE platform_deck=?", (deck_id,))
         conn.execute("DELETE FROM settings WHERE key=?", (releases.current_release_key(deck_id),))
@@ -3384,10 +3522,10 @@ def cut_release(version, user_id, guids, notes="", visibility="public"):
                      "WHERE release=? AND source LIKE 'suggestion:%')", (version, version))
         conn.execute(
             "INSERT INTO releases (version, status, note_count, changelog, created_at, built_by, "
-            "public_notes, visibility, platform_deck) "
-            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0 AND COALESCE(platform_deck,1)=?), ?, ?, ?, ?, ?, ?)",
+            "public_notes, visibility, platform_deck, prepared_by) "
+            "VALUES (?, 'draft', (SELECT COUNT(*) FROM notes WHERE retired=0 AND COALESCE(platform_deck,1)=?), ?, ?, ?, ?, ?, ?, ?)",
             (version, deck_id, changelog, now(), user_id, (notes or "").strip() or None,
-             "silent" if visibility == "silent" else "public", deck_id))
+             "silent" if visibility == "silent" else "public", deck_id, user_id))
     return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
 
 
@@ -3403,11 +3541,78 @@ def discard_release(version):
     return True
 
 
-def render_next_release(user, csrf):
+def self_approval_allowed(conn):
+    row = conn.execute("SELECT value FROM settings WHERE key='allow_self_approval'").fetchone()
+    return bool(row and row["value"] == "1")
+
+
+def approve_release(version, user):
+    """An administrator signs off a draft. Returns (ok, message)."""
+    if user["role"] != "admin":
+        return False, "Only administrators can approve a release."
+    with db() as conn:
+        rel = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None or rel["status"] != "draft":
+            return False, "Only a draft release can be approved."
+        if rel["prepared_by"] == user["id"] and not self_approval_allowed(conn):
+            return False, ("You prepared this draft, so another administrator has to approve it. "
+                           "An administrator can allow self-approval on the Users page.")
+        conn.execute("UPDATE releases SET approved_by=?, approved_at=? WHERE version=?", (user["id"], now(), version))
+    return True, f"Release {version} approved. It can now be built."
+
+
+def unapprove_release(version, user):
+    if user["role"] != "admin":
+        return False, "Only administrators can withdraw an approval."
+    with db() as conn:
+        conn.execute("UPDATE releases SET approved_by=NULL, approved_at=NULL WHERE version=? AND status='draft'", (version,))
+    return True, "Approval withdrawn."
+
+
+def remove_from_draft(version, guid, user):
+    """Send one card back to Next release. Any change to a draft resets its approval."""
+    with db() as conn:
+        rel = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None or rel["status"] != "draft":
+            return False, "Only a draft release can be changed."
+        if user["role"] != "admin" and rel["prepared_by"] != user["id"]:
+            return False, "Only an administrator or the person who prepared it can change a draft."
+        n = conn.execute("UPDATE revisions SET release=NULL WHERE release=? AND guid=?", (version, guid)).rowcount
+        if not n:
+            return False, "That card is not in this draft."
+        conn.execute("UPDATE suggestions SET release=NULL WHERE release=? AND id IN ("
+                     "SELECT CAST(substr(source, 12) AS INTEGER) FROM revisions WHERE guid=? AND source LIKE 'suggestion:%')",
+                     (version, guid))
+        remaining = [r["guid"] for r in conn.execute("SELECT DISTINCT guid FROM revisions WHERE release=?", (version,))]
+        conn.execute("UPDATE releases SET changelog=?, approved_by=NULL, approved_at=NULL WHERE version=?",
+                     (changelog_for_release(conn, version, remaining), version))
+    return True, "Card sent back to Next release. The approval was reset."
+
+
+def changelog_for_release(conn, version, guids):
+    """Changelog text for the revisions already stamped to a draft."""
+    lines = []
+    for ch in release_changes(conn, version):
+        lines.append(f"{ch['label']}: {ch['snippet']} ({', '.join(ch['fields']) or 'new card'})")
+    return "\n".join(lines)
+
+
+def render_next_release(user, csrf, label_filter=()):
     deck_id = active_deck_id(user)
+    label_filter = [labels.normalize(x) for x in label_filter if labels.normalize(x)]
     with db() as conn:
         groups = revisions.pending_by_kind(conn, None, deck_id)
         current = releases.current_release(conn, deck_id)
+        pending_guids = [n["guid"] for g in groups for n in g["notes"]]
+        card_labels = labels.labels_for(conn, pending_guids)
+        all_lab = labels.all_labels(conn, deck_id)
+        if label_filter:
+            allowed = labels.guids_with(conn, label_filter, deck_id)
+            for g in groups:
+                g["notes"] = [n for n in g["notes"] if n["guid"] in allowed]
+            groups = [g for g in groups if g["notes"]]
+    used = collections.Counter(l for g_ in card_labels.values() for l in g_)
+    shown_total = sum(len(g["notes"]) for g in groups)
     total = sum(len(g["notes"]) for g in groups)
     edits = sum(len(n["revisions"]) for g in groups for n in g["notes"])
     with db() as conn:
@@ -3432,19 +3637,29 @@ def render_next_release(user, csrf):
 <div class="card nr-note"><div class="card-head">
   <label class="chk"><input type="checkbox" name="rev:{esc(n['guid'])}" value="1" checked data-group="{esc(g['kind'])}"> <b>{esc(snippets.get(n['guid']) or n['guid'])}</b></label>
   <span class="badge dim">{len(n['revisions'])} edit{'s' if len(n['revisions']) != 1 else ''}</span>
+  <span class="labelrow">{label_chips(card_labels.get(n['guid'], []))}{label_button(n['guid'], card_labels.get(n['guid'], []), snippets.get(n['guid']) or n['guid'])}</span>
   <span class="meta">by {esc(', '.join(n['users']))} &middot; from {esc(src or 'direct edit')} &middot; <code>{esc(n['guid'])}</code></span>
 </div><div class="proposal"><dl class="fields">{parts}</dl></div></div>"""
         sections.append(f"""
 <h2 class="nr-head"><label class="chk"><input type="checkbox" checked data-toggle="{esc(g['kind'])}"> {esc(g['label'])}</label>
 <span class="count">{len(g['notes'])}</span></h2>{rows}""")
+    chips_next = "".join(
+        f'<a class="chip-link{" on" if x["name"] in label_filter else ""}" href="/releases/next'
+        + ("?" + "&".join("label=" + quote(n) for n in sorted(set(label_filter) ^ {x["name"]})) if set(label_filter) ^ {x["name"]} else "")
+        + f'">{ui.label_chip(x["name"])} <span class="small">{used[x["name"]]}</span></a>'
+        for x in all_lab if used.get(x["name"]))
+    chipbar_next = (f'<div class="chipbar"><span class="lab">Show only</span>{chips_next}'
+                    + (f' <a class="small" href="/releases/next">Show everything</a>' if label_filter else "") + "</div>") if chips_next else ""
     body = f"""
 <h1>Next release</h1>
 <p class="sub">Changes waiting to ship since release <b>{esc(current or 'none')}</b>.</p>
-{ui.infobox("How this page works", "<p>Everything accepted since the last release is listed here and ticked. Untick a card to hold it back for a later release. A card with two edits ships both or neither. Nothing is built from this page. Review selection is the next step.</p>")}
+{ui.infobox("How this page works", "<p>Everything accepted since the last release is listed here and ticked. Untick a card to hold it back for a later release. A card with two edits ships both or neither.</p><p>Use <b>Show only</b> to filter by your labels, so you can pick one group of cards at a time. Review selection prepares a draft release. Someone else, an administrator, then approves it before it can be built.</p>")}
 <p class="queue-count"><b>{edits}</b> edit{'s' if edits != 1 else ''} on <b>{total}</b> card{'s' if total != 1 else ''}</p>
+{chipbar_next}
 {'<form method="post" action="/releases/confirm"><input type="hidden" name="csrf" value="' + csrf + '">' if groups else ''}
 {''.join(sections) or '<div class="empty"><b>Nothing waiting</b>Accepted suggestions, direct edits and new notes appear here.</div>'}
 {'<div class="actions"><button type="submit">Review selection</button></div></form>' if groups else ''}
+{label_dialog(all_lab, csrf, "/releases/next")}
 <script>
 document.querySelectorAll('input[data-toggle]').forEach(function (t) {{
   t.addEventListener('change', function () {{
@@ -3518,6 +3733,11 @@ def render_build_confirm(user, csrf, version, error=None):
     if rel is None:
         return page("Not found", "<h1>No such release</h1>", "releases", user, csrf)
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
+    if rel["status"] == "draft" and not rel["approved_by"]:
+        body = (f'<h1>Build and publish release {esc(version)}</h1>{msg}'
+                f'<p class="notice">This draft is waiting for an administrator to approve it, so building is locked.</p>'
+                f'<p><a class="btn-link-primary" href="/releases/{esc(version)}">Open the draft to review and approve</a></p>')
+        return page("Build release", body, "releases", user, csrf)
     body = f"""
 <h1>Build and publish release {esc(version)}</h1>
 <p class="sub">This writes the new deck package, makes {esc(version)} the current release, and starts offering it
@@ -3622,6 +3842,9 @@ def start_build(version, user_id):
         rel = conn.execute("SELECT status FROM releases WHERE version=?", (version,)).fetchone()
         if rel is None or rel["status"] not in ("draft", "failed"):
             return False
+        appr = conn.execute("SELECT approved_by FROM releases WHERE version=?", (version,)).fetchone()
+        if rel["status"] == "draft" and not appr["approved_by"]:
+            return False
         conn.execute("UPDATE releases SET status='building', built_by=? WHERE version=?", (user_id, version))
     threading.Thread(target=_build_release, args=(version,), daemon=True).start()
     return True
@@ -3699,7 +3922,38 @@ def release_detail_rows(conn, version):
     return out
 
 
-def render_release_detail(user, csrf, version):
+def _approval_panel(user, csrf, rel, preparer, approver, self_ok):
+    v = quote(rel["version"], safe="")
+    if rel["status"] != "draft":
+        if approver:
+            return f'<p class="small">Approved by <b>{esc(approver)}</b> {ui.human_time(rel.get("approved_at"))}.</p>'
+        return ""
+    prepared = f"Prepared by <b>{esc(preparer)}</b>." if preparer else ""
+    is_admin = user["role"] == "admin"
+    if rel.get("approved_by"):
+        withdraw = (f'<form method="post" action="/releases/{v}/unapprove" class="inline"><input type="hidden" name="csrf" value="{csrf}">'
+                    f'<button class="btn-text">Withdraw approval</button></form>') if is_admin else ""
+        return (f'<div class="rel current" style="margin:12px 0"><span class="badge current">Approved</span> '
+                f'by <b>{esc(approver)}</b> {ui.human_time(rel.get("approved_at"))}. {prepared}'
+                f'<div class="acts"><a class="btn-link-primary" href="/releases/{v}/confirm">Build and publish</a>{withdraw}</div></div>')
+    can = is_admin and (rel.get("prepared_by") != user["id"] or self_ok)
+    if can:
+        action = (f'<form method="post" action="/releases/{v}/approve" class="inline"><input type="hidden" name="csrf" value="{csrf}">'
+                  f'<button type="submit">Approve this release</button></form>')
+        hint = "Look through the table below. When you agree with every change, approve it."
+    elif is_admin:
+        action = ""
+        hint = ("You prepared this draft, so another administrator has to approve it. "
+                "Self-approval can be allowed on the Users page.")
+    else:
+        action = ""
+        hint = "Only an administrator can approve a release."
+    return (f'<div class="rel" style="margin:12px 0"><span class="badge warn">Waiting for approval</span> {prepared}'
+            f'<p class="small" style="margin:8px 0 0">{hint} Building is locked until it is approved.</p>'
+            f'<div class="acts">{action}</div></div>')
+
+
+def render_release_detail(user, csrf, version, message=None, ok=True):
     with db() as conn:
         rel = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
         if rel is None:
@@ -3707,6 +3961,9 @@ def render_release_detail(user, csrf, version):
         rel = dict(rel)
         rows = release_detail_rows(conn, version)
         builder = conn.execute("SELECT username FROM users WHERE id=?", (rel["built_by"],)).fetchone() if rel.get("built_by") else None
+        preparer = (conn.execute("SELECT username FROM users WHERE id=?", (rel["prepared_by"],)).fetchone() or {"username": None})["username"] if rel.get("prepared_by") else None
+        approver = (conn.execute("SELECT username FROM users WHERE id=?", (rel["approved_by"],)).fetchone() or {"username": None})["username"] if rel.get("approved_by") else None
+        self_ok = self_approval_allowed(conn)
         deck = conn.execute("SELECT name FROM decks WHERE id=?", (rel.get("platform_deck") or 1,)).fetchone()
     n_edits = sum(len(c["changes"]) for c in rows)
     from_students = sum(1 for c in rows if c["reports"])
@@ -3737,10 +3994,20 @@ def render_release_detail(user, csrf, version):
                 bits.append('<div class="rpt"><b>Direct edit</b> by staff</div>')
         return "".join(bits)
 
+    can_edit_draft = rel["status"] == "draft" and (user["role"] == "admin" or rel.get("prepared_by") == user["id"])
+
+    def remove_form(guid):
+        if not can_edit_draft:
+            return ""
+        return (f'<form method="post" action="/releases/{quote(version, safe="")}/remove" class="inline" style="display:block;margin-top:6px">'
+                f'<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="guid" value="{esc(guid)}">'
+                f'<button class="btn-text" title="Send this card back to Next release. This resets the approval.">Remove from draft</button></form>')
+
     body_rows = "".join(
         f'<tr><td><b>{esc(c["snippet"])}</b><br><span class="small">Note {c["nid"] or esc(c["guid"])}</span><br>'
         f'<a href="/cards/edit?guid={quote(c["guid"], safe="")}#edit-pane">Open card</a> &middot; '
-        f'<a href="/cards/edit?guid={quote(c["guid"], safe="")}#history-pane">History</a></td>'
+        f'<a href="/cards/edit?guid={quote(c["guid"], safe="")}#history-pane">History</a>'
+        f'{remove_form(c["guid"])}</td>'
         f'<td>{kind_badge(c["kind"])}</td><td class="wide">{"".join(change_html(ch) for ch in c["changes"])}</td>'
         f'<td>{esc(", ".join(sorted(c["who"])))}</td><td class="wide">{source_html(c)}</td>'
         f'<td>{ui.human_time(c["when"])}</td></tr>' for c in rows) or \
@@ -3756,7 +4023,8 @@ def render_release_detail(user, csrf, version):
     body = f"""
 <p><a href="/releases">&larr; All releases</a></p>
 <h1>Release {esc(version)}</h1>
-{summary}{notes}
+{summary}{('<p class="' + ('notice' if ok else 'login-error') + '">' + esc(message) + '</p>') if message else ''}
+{_approval_panel(user, csrf, rel, preparer, approver, self_ok)}{notes}
 <p class="queue-count"><b>{len(rows)}</b> card{'s' if len(rows) != 1 else ''} changed &middot; <b>{n_edits}</b> edit{'s' if n_edits != 1 else ''}
 &middot; <b>{from_students}</b> from student reports{(' &middot; ' + mail_bits) if mail_bits else ''}</p>
 {ui.infobox("What this page is for", "<p>A record of what went into this release, for anyone double checking the work. Each row shows what changed, who did it, and where it came from. For a student report you can see their words, whether they proposed an exact change, and whether they were thanked. Open card goes to the card itself, and History shows every change it has ever had.</p>")}
@@ -3783,14 +4051,21 @@ def render_releases(user, csrf, notice=None, token_link=None):
         v = r["version"]
         is_cur = v == cur
         when = ui.human_time(r.get("published_at") or r["created_at"])
-        badge = {"draft": '<span class="badge warn">Draft</span>', "failed": '<span class="badge bad">Failed</span>',
+        badge = {"draft": ('<span class="badge ok">Approved draft</span>' if r.get("approved_by")
+                           else '<span class="badge warn">Draft, waiting for approval</span>'), "failed": '<span class="badge bad">Failed</span>',
                  "building": '<span class="badge warn">Building</span>',
                  "published": '<span class="badge current">Current</span>' if is_cur
                  else '<span class="badge dim">Published</span>'}.get(r["status"], "")
         public = '<span class="badge dim">Silent</span>' if r.get("visibility") == "silent" else ""
         acts = ""
-        if r["status"] in ("draft", "failed"):
+        if r["status"] == "draft" and not r.get("approved_by"):
+            acts = (f'<a class="btn-link-primary" href="/releases/{esc(v)}">Review and approve</a>'
+                    f'<form method="post" action="/releases/{esc(v)}/discard" class="inline">'
+                    f'<input type="hidden" name="csrf" value="{csrf}"><button class="btn-text">Discard draft</button></form>'
+                    f'<span class="small">Building unlocks after an administrator approves it.</span>')
+        elif r["status"] in ("draft", "failed"):
             acts = (f'<a class="btn-link-primary" href="/releases/{esc(v)}/confirm">Build and publish</a>'
+                    f'<a class="btn-link" href="/releases/{esc(v)}">Review</a>'
                     f'<form method="post" action="/releases/{esc(v)}/discard" class="inline">'
                     f'<input type="hidden" name="csrf" value="{csrf}"><button class="btn-text">Discard draft</button></form>')
         elif r["status"] == "building":
@@ -4026,6 +4301,9 @@ def _card_filter(q, deck_id):
     D = "retired=0 AND COALESCE(platform_deck,1)=?"
     if q.lower().startswith("tag:"):
         return f"{D} AND tags_json LIKE ?", (deck_id, f"%{q[4:].strip()}%")
+    if q.lower().startswith("label:"):
+        return (f"{D} AND doctrine_id IN (SELECT cl.guid FROM card_labels cl JOIN labels l ON l.id=cl.label_id "
+                f"WHERE l.platform_deck=? AND l.name=?)", (deck_id, deck_id, labels.normalize(q[6:])))
     bare = re.sub(r"^(note\s*id|note|nid|id|#)[\s:#]*", "", q, flags=re.I).strip()
     if bare.isdigit() and len(bare) >= 5:
         return f"{D} AND (anki_note_id=? OR CAST(anki_note_id AS TEXT) LIKE ? OR doctrine_id LIKE ?)", \
@@ -4075,6 +4353,9 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
         total = count_cards(conn, q, deck_id)
         rows = search_cards_page(conn, q, deck_id, n)
     tiles, fulls = [], []
+    with db() as conn:
+        card_labels = labels.labels_for(conn, [r["doctrine_id"] for r in rows])
+        all_lab = labels.all_labels(conn, deck_id)
     for i, r in enumerate(rows):
         fields = json.loads(r["fields_json"] or "{}")
         f = cardview.faces(fields)
@@ -4092,6 +4373,7 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
   <div class="th"><code>{esc(r['doctrine_id'])}</code><span>nid {r['anki_note_id'] or 'none'}</span><span>v{r['version']}</span>
     <span class="sp"><a class="btn-link-primary" href="/cards/edit?guid={guid}">Edit</a></span></div>
   {sec("front", "Front", f["front"])}{sec("back", "Back", f["back"])}{sec("extra", "Extra", f["extra"])}
+  <div class="labelrow" style="padding:10px 14px 0">{label_chips(card_labels.get(r["doctrine_id"], []), "/cards?q=label:{label}")}{label_button(r["doctrine_id"], card_labels.get(r["doctrine_id"], []), ui.plain_text(fields.get("Text", ""), 80), "Edit labels" if card_labels.get(r["doctrine_id"]) else "Label")}</div>
   {tile_tags(r['tags_json'], i)}
   <template id="full{i}"><h3>{esc(ui.plain_text(fields.get("Text", ""), 80))}</h3>
     <div class="sec front"><div class="lab">Front</div><div class="txt">{f["front"]}</div></div>
@@ -4111,13 +4393,14 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
                      f'&n={n + CARDS_PAGE}">Show {min(CARDS_PAGE, total - shown)} more</a></p>')
     body = f"""
 <h1>Cards</h1>
-{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, or an ID. An ID can be the Anki note ID or the internal one, whole or partial. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
+{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, a label with <code>label:ask anna</code>, or an ID. An ID can be the Anki note ID or the internal one, whole or partial. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
 <form method="get" action="/cards" class="row" style="margin:0 0 14px">
   <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, or an ID" style="min-width:380px" autofocus>
   <button type="submit">Search</button>
 </form>
 {status}
 <div class="tiles">{"".join(tiles)}</div>{more_link}
+{label_dialog(all_lab, csrf, "/cards?q=" + quote(q or ""))}
 <div class="dlg-back" id="fulldlg"><div class="dlg wide"><div id="fullbody"></div>
   <div class="foot"><button type="button" class="btn-quiet" data-close>Close</button></div></div></div>
 <script>

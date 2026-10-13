@@ -48,6 +48,13 @@ def plain_text(s, limit=0):
     return text
 
 
+def label_chip(name, href=None):
+    import labels as _labels
+    bg, fg = _labels.color_for(name)
+    inner = f'<span class="lbl" style="background:{bg};color:{fg}">{_esc(name)}</span>'
+    return f'<a href="{_esc(href)}" style="text-decoration:none">{inner}</a>' if href else inner
+
+
 def infobox(title, body_html, open_=False):
     """A small collapsible tip box with an info icon."""
     return (f'<details class="infobox"{" open" if open_ else ""}><summary>'
@@ -241,6 +248,14 @@ tr.inactive { opacity:.5; }
 .btn-primary:hover { background:var(--navy-soft); }
 .steps li { margin:6px 0; }
 
+.lbl { display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; white-space:nowrap; }
+.labelrow { display:inline-flex; gap:6px; align-items:center; flex-wrap:wrap; }
+.label-btn { padding:3px 9px !important; font-size:12px !important; }
+.chipbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:0 0 14px; }
+.chipbar .lab { font-size:10.5px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); }
+.chip-link { display:inline-flex; gap:6px; align-items:center; text-decoration:none; padding:2px 4px; border-radius:999px;
+  border:1px solid transparent; }
+.chip-link.on { border-color:var(--accent); background:#fff; }
 /* ---- info box ---- */
 .infobox { border:1px solid var(--accent-border); background:var(--accent-soft); border-radius:12px;
   margin:14px 0 18px; font-size:13px; color:var(--muted); max-width:78ch; }
@@ -483,6 +498,19 @@ UI_JS = """
     var o = {day: 'numeric', month: 'short', year: 'numeric'};
     if (t.dataset.time === '1') { o.hour = '2-digit'; o.minute = '2-digit'; }
     t.textContent = d.toLocaleString(undefined, o);
+  });
+  // label dialog
+  var labelDlg = document.getElementById('labeldlg');
+  document.querySelectorAll('[data-label-open]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      if (!labelDlg) return;
+      labelDlg.querySelector('[name=guid]').value = b.dataset.guid;
+      labelDlg.querySelector('.ld-title').textContent = b.dataset.title || '';
+      var have = []; try { have = JSON.parse(b.dataset.labels || '[]'); } catch (e) {}
+      labelDlg.querySelectorAll('input[name=label]').forEach(function (i) { i.checked = have.indexOf(i.value) >= 0; });
+      labelDlg.querySelector('[name=new]').value = '';
+      labelDlg.classList.add('on');
+    });
   });
   // phone navigation
   var navBtn = document.getElementById('navbtn');

@@ -131,6 +131,8 @@ class BuildConfirmTest(unittest.TestCase):
             seed(base)
             user, pw = make_user(); _, cookie = login(base, user, pw)
             request(base, "POST", "/releases/cut", {"csrf": csrf_for(cookie), "version": "1.1", f"rev:{A}": "1"}, cookie=cookie)
+            from tests.test_release_routes import approve
+            approve(base, "1.1")
             status, _, html = request(base, "GET", "/releases/1.1/confirm", cookie=cookie)
             self.assertEqual(200, status); self.assertIn("type the version", html.lower())
             status, _, _ = request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "nope"}, cookie=cookie)

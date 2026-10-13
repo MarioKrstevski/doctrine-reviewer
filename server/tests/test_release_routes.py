@@ -32,8 +32,17 @@ def seed_baseline(version="1.0"):
 
 
 def staff(base, role="reviewer"):
-    user, pw = make_user("staff_" + role, "staffpassword1", role)
-    return login(base, user, pw)[1]
+    """A signed-in staff member of that role. Reuses the account when it already exists."""
+    name = "staff_" + role
+    if server.create_user(name, "staffpassword1", role)[0] is False:
+        pass   # already created earlier in this test
+    return login(base, name, "staffpassword1")[1]
+
+
+def approve(base, version):
+    """An administrator other than the preparer signs the draft off, as the workflow requires."""
+    admin = staff(base, "admin")
+    request(base, "POST", f"/releases/{version}/approve", {"csrf": csrf_for(admin)}, cookie=admin)
 
 
 class CutTest(unittest.TestCase):
@@ -94,6 +103,7 @@ class BuildTest(unittest.TestCase):
     def test_build_publishes_and_writes_a_valid_package(self):
         with running_server() as base:
             cookie = self._cut(base)
+            approve(base, "1.1")
             status, _, _ = request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
             self.assertEqual(303, status)
             for _ in range(100):
@@ -125,6 +135,7 @@ class BuildTest(unittest.TestCase):
     def test_a_second_publish_keeps_both_collections(self):
         with running_server() as base:
             cookie = self._cut(base)
+            approve(base, "1.1")
             request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
             for _ in range(100):
                 with server.db() as conn:
@@ -134,6 +145,7 @@ class BuildTest(unittest.TestCase):
             with server.db() as conn:
                 revisions.apply_edit(conn, "guidAAAAAA", {"Text": "again"}, 1, "staff")
             request(base, "POST", "/releases/cut", {"version": "1.2", "csrf": csrf_for(cookie), "rev:guidAAAAAA": "1"}, cookie=cookie)
+            approve(base, "1.2")
             request(base, "POST", "/releases/1.2/build", {"csrf": csrf_for(cookie), "confirm": "1.2"}, cookie=cookie)
             for _ in range(100):
                 with server.db() as conn:
@@ -199,6 +211,7 @@ class BuildTest(unittest.TestCase):
 class DownloadTest(unittest.TestCase):
     def _published(self, base):
         cookie = BuildTest._cut(self, base)
+        approve(base, "1.1")
         request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
         for _ in range(100):
             with server.db() as conn:
