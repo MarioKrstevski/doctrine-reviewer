@@ -1727,6 +1727,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 lic = hashlib.sha256(token.encode()).hexdigest()[:16]
                 self._send_package(pkg, version, lic)
+        elif path == "/releases/status":
+            if self._current_user() is None:
+                self._json(401, {"error": "Sign in."})
+            else:
+                with db() as conn:
+                    n = conn.execute("SELECT COUNT(*) FROM releases WHERE status='building'").fetchone()[0]
+                self._json(200, {"building": n})
         elif path == "/releases" or path.startswith("/download/release/"):
             user = self._current_user()
             if user is None:
@@ -3266,7 +3273,7 @@ def render_releases(user, csrf, notice=None, token_link=None):
                    f'<form method="post" action="/releases/{esc(r["version"])}/discard" class="inline">'
                    f'<input type="hidden" name="csrf" value="{csrf}"><button class="ghost">Discard draft</button></form>')
         elif r["status"] == "building":
-            act = '<span class="badge warn">Building…</span>'
+            act = '<span class="badge warn">Building</span> <span class="small">This page updates itself when the build finishes.</span>'
         elif r["status"] == "published":
             if r.get("collection_path") and os.path.exists(r["collection_path"]):
                 act = f'<span class="badge ok">Published</span> <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>'
@@ -3319,6 +3326,14 @@ document.querySelectorAll('.copy-btn[data-copy]').forEach(function (b) {{
             f'<a href="/releases/next">Next release</a>, then built and published here in a separate, confirmed step.</p>'
             + msg + cut + '<h2 style="margin-top:28px">All releases</h2>' + "".join(items)
             + ('<hr style="border:0;border-top:1px solid var(--line);margin:34px 0 10px">' + tok if tok else ''))
+    if any(r["status"] == "building" for r in rows):
+        body += """<script>
+(function poll(){
+  fetch('/releases/status').then(function(r){return r.json();}).then(function(s){
+    if (s.building) { setTimeout(poll, 3000); } else { location.reload(); }
+  }).catch(function(){ setTimeout(poll, 6000); });
+})();
+</script>"""
     return page("Releases", body, "releases", user, csrf)
 
 

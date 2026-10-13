@@ -144,6 +144,21 @@ class BuildTest(unittest.TestCase):
                     self.assertTrue(os.path.exists(conn.execute(
                         "SELECT collection_path FROM releases WHERE version=?", (v,)).fetchone()[0]))
 
+    def test_building_page_polls_and_status_endpoint_reports(self):
+        with running_server() as base:
+            cookie = self._cut(base)
+            self.assertEqual(401, request(base, "GET", "/releases/status")[0])
+            with server.db() as conn:
+                conn.execute("UPDATE releases SET status='building' WHERE version='1.1'")
+            _, _, html = request(base, "GET", "/releases", cookie=cookie)
+            self.assertIn("/releases/status", html)
+            status, _, body = request(base, "GET", "/releases/status", cookie=cookie)
+            self.assertEqual((200, 1), (status, json.loads(body)["building"]))
+            with server.db() as conn:
+                conn.execute("UPDATE releases SET status='published' WHERE version='1.1'")
+            _, _, html = request(base, "GET", "/releases", cookie=cookie)
+            self.assertNotIn("/releases/status", html)
+
     def test_updates_page_groups_by_release(self):
         with running_server() as base:
             cookie = self._cut(base)
