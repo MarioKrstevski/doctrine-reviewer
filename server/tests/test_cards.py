@@ -2,6 +2,7 @@
 
 import json
 import unittest
+import urllib.parse
 
 import auth
 import server
@@ -97,6 +98,19 @@ class DirectEditTest(unittest.TestCase):
             import urllib.parse
             status, _, _ = request(base, "POST", "/cards/edit?guid=" + urllib.parse.quote(A, safe=""), {"Text": "x"}, cookie=cookie)
         self.assertEqual(403, status)
+
+
+class IdSearchTest(unittest.TestCase):
+    def test_partial_and_pasted_ids_find_the_card(self):
+        with running_server() as base:
+            seed(base)   # A has nid 1368292407340
+            user, pw = make_user(); _, cookie = login(base, user, pw)
+            for q in ("1368292407340", "136829240", "Note 1368292407340", "nid:1368292407340", "#1368292407340"):
+                _, _, html = request(base, "GET", "/cards?q=" + q.replace(" ", "+").replace("#", "%23"), cookie=cookie)
+                self.assertIn("Vulvar carcinoma", html, q)
+                self.assertNotIn("p53 blocks", html, q)
+            _, _, html = request(base, "GET", "/cards?q=" + urllib.parse.quote(B[:6]), cookie=cookie)
+            self.assertIn("p53 blocks", html)
 
 
 class HistoryAndTagsTest(unittest.TestCase):

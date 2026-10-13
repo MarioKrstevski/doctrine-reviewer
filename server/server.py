@@ -17,6 +17,7 @@ API:
   POST /reviewer/action    resolve / decline / expire (+ optional publish)
 """
 
+import collections
 import hashlib
 import shutil
 import html
@@ -909,20 +910,107 @@ def _diff_rows(base, fields):
             or '<p class="small">No difference in Text or Extra.</p>')
 
 
-def _card_pane(label, fields, other, group, rendered_html):
-    """One column. Three views, switched by the shared control above: Rendered, HTML, Differences."""
-    return (f'<div class="pane"><div class="pane-label">{label}</div>'
-            f'<div class="viewpane" data-group="{group}" data-value="rendered">{rendered_html}</div>'
-            f'<div class="viewpane scroll" data-group="{group}" data-value="html" hidden>'
-            f'<dl class="fields" style="height:auto;border:0;padding:0">{_field_rows(fields)}</dl></div>'
-            f'<div class="viewpane scroll" data-group="{group}" data-value="diff" hidden>'
-            f'<dl class="fields" style="height:auto;border:0;padding:0">'
-            f'{_diff_rows(other, fields) if other is not None else "<p class=small>Nothing to compare with.</p>"}'
-            f'</dl></div></div>')
+def _seg(group, options):
+    """A small switch. Buttons show/hide the elements with data-group=group and data-value=<value>."""
+    buttons = "".join(
+        '<button type="button" data-show="%s"%s>%s</button>' % (v, ' class="on"' if i == 0 else "", t)
+        for i, (v, t) in enumerate(options))
+    return f'<span class="seg" data-for="{group}">{buttons}</span>'
+
+
+def _est_height(*parts):
+    """Pixel height for a card pane, from how much text it holds, so short cards do not leave a big blank frame."""
+    text = " ".join(ui.plain_text(p) for p in parts if p)
+    breaks = sum((p or "").lower().count(t) for p in parts for t in ("<br", "</p>", "</li>", "</div>"))
+    lines = -(-len(text) // 48) + breaks
+    return max(150, min(380, 90 + 24 * lines))
+
+
+def _view(group, value, inner, cls="", hidden=False, height=None):
+    style = f' style="height:{height}px"' if height else ""
+    return (f'<div class="viewpane {cls}" data-group="{group}" data-value="{value}"{style}{" hidden" if hidden else ""}>'
+            f'{inner}</div>')
+
+
+def _html_view(fields):
+    return f'<dl class="fields" style="height:auto;border:0;padding:0">{_field_rows(fields)}</dl>'
+
+
+def _diff_view(base, fields):
+    return f'<dl class="fields" style="height:auto;border:0;padding:0">{_diff_rows(base, fields)}</dl>'
+
+
+def _saw_section(r, theirs, current, master, stale, css):
+    """What the student saw. One card when ours is the same, two columns when ours has moved on."""
+    sid = r["id"]
+    g = f"s{sid}"
+    if r["snap_question"] or r["snap_answer"]:
+        saw_rendered = anki_frame(r["snap_question"], r["snap_answer"], css)
+    else:
+        saw_rendered = _faces_frame(theirs, css)
+    if master is None:
+        badge = '<span class="badge">No copy of this card on file</span>'
+    elif stale:
+        badge = '<span class="badge warn">Card changed since submission</span>'
+    else:
+        badge = f'<span class="badge ok">Same as the current card (v{master["version"]})</span>'
+    options = [("rendered", "Rendered"), ("html", "HTML")] + ([("diff", "Differences")] if stale else [])
+    if r["snap_question"] or r["snap_answer"]:
+        parts = [r["snap_question"], r["snap_answer"]]
+    else:
+        f_ = cardview.faces(theirs)
+        parts = [f_["front"], f_["back"], f_["extra"]]
+    if stale:
+        f2 = cardview.faces(current)
+        parts += [f2["front"], f2["back"], f2["extra"]]
+    h = _est_height(*parts)
+
+    def col(label, rendered, fields, base):
+        diff = _view(g, "diff", _diff_view(base, fields), "scroll", True, h) if base is not None else ""
+        return (f'<div class="col"><div class="collab">{label}</div>'
+                f'{_view(g, "rendered", rendered, "", False, h)}'
+                f'{_view(g, "html", _html_view(fields), "scroll", True, h)}{diff}</div>')
+
+    if stale:
+        cols = (col("What the student saw", saw_rendered, theirs, current)
+                + col(f'What we have now, v{master["version"]}', _faces_frame(current, css), current, theirs))
+        layout = "two"
+    else:
+        cols = col("", saw_rendered, theirs, None)
+        layout = "one"
+    return (f'<section class="saw" data-scope><div class="sechead"><span class="t">What the student saw</span>{badge}'
+            f'<span class="sp">{_seg(g, options)}</span></div><div class="cols {layout}">{cols}</div></section>')
+
+
+def _ask_section(r, current, master, theirs, stale, css):
+    """Their words, and on the right what they want when they proposed an exact change."""
+    sid = r["id"]
+    proposed = None
+    if r["proposed_fields_json"]:
+        try:
+            proposed = json.loads(r["proposed_fields_json"])
+        except ValueError:
+            proposed = None
+    has_proposal = bool(proposed) and master is not None and bool(diff_fields(current, proposed))
+    kind = esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))
+    words = (f'<div><div class="lab">What they wrote <span class="badge dim">{kind}</span></div>'
+             f'<div class="words">{esc(r["text"])}</div></div>')
+    if not has_proposal:
+        return f'<section class="ask"><div class="askgrid one">{words}</div></section>', False
+    g = f"w{sid}"
+    wanted = _faces_frame({**current, **proposed}, css)
+    pf = cardview.faces({**current, **proposed})
+    wh = _est_height(pf["front"], pf["back"], pf["extra"])
+    stale_note = ('<p class="stale-hint" style="margin:8px 0 0">The student wrote this against an older version of '
+                  'the card, so it cannot be accepted as is. Use Edit proposal.</p>') if stale else ""
+    want = (f'<div data-scope><div class="lab">What they want {_seg(g, [("card", "Card"), ("diff", "Show differences")])}</div>'
+            f'{_view(g, "card", wanted, "", False, wh)}{_view(g, "diff", _diff_view(current, proposed), "scroll", True, wh)}'
+            f'{stale_note}</div>')
+    return f'<section class="ask"><div class="askgrid two">{words}{want}</div></section>', True
 
 
 def render_inbox_item(r, master, csrf):
-    """One suggestion: the student's own copy, our current card, and what they asked for."""
+    """One report, top to bottom: header, what they wrote and want, what they saw, then the actions."""
     sid = r["id"]
     status = r["status"]
     current = json.loads(master["fields_json"]) if master is not None else {}
@@ -940,76 +1028,36 @@ def render_inbox_item(r, master, csrf):
     status_badge = {"open": '<span class="badge ok">Open</span>', "resolved": '<span class="badge dim">Resolved</span>',
                     "declined": '<span class="badge dim">Declined</span>',
                     "expired": '<span class="badge dim">Expired</span>'}[status]
-    if master is None:
-        state_badge = '<span class="badge">No master on file</span>'
-    elif stale:
-        state_badge = f'<span class="badge warn">Card changed since submission</span>'
-    else:
-        state_badge = '<span class="badge ok">Same as the current card</span>'
-
     css = r["snap_css"] or ""
-    group = f"v{sid}"
-    if r["snap_question"] or r["snap_answer"]:
-        student_view = anki_frame(r["snap_question"], r["snap_answer"], css)
-    else:
-        student_view = _faces_frame(theirs, css)
-    student = _card_pane("What the student has", theirs, current if master is not None else None, group, student_view)
-    if master is not None:
-        ours = _card_pane(f'Current card, v{master["version"]}', current, theirs, group, _faces_frame(current, css))
-    else:
-        ours = ('<div class="pane"><div class="pane-label">Current card</div><div class="viewpane scroll">'
-                '<p class="small">No copy of this card is on file. Compare the student\'s copy yourself.</p></div></div>')
+    ask, has_proposal = _ask_section(r, current, master, theirs, stale, css)
+    saw = _saw_section(r, theirs, current, master, stale, css)
 
-    # the suggestion and the proposed change, shown across the top
-    proposal = ""
-    proposed = None
-    if r["proposed_fields_json"]:
-        try:
-            proposed = json.loads(r["proposed_fields_json"])
-        except ValueError:
-            proposed = None
-    if proposed is not None and master is not None:
-        diffs = diff_fields(current, proposed)
-        rows_ = "".join(f'<dt>{esc(f)}</dt><dd class="diff">{h}</dd>' for f, h in diffs)
-        proposal = (f'<div><div class="lab">Proposed change</div>'
-                    f'<dl class="fields" style="height:auto;border:0;padding:0">'
-                    f'{rows_ or "<p class=small>Identical to the current card.</p>"}</dl>')
-        if stale:
-            proposal += ('<p class="stale-hint" style="margin-top:8px">The student wrote this against an older '
-                         'version of the card, so it cannot be accepted as is. Use Edit proposal.</p>')
-        proposal += "</div>"
-    sugg = (f'<div class="ask"><div class="pane-label">What the student asked<span class="badge dim" style="margin-left:auto">'
-            f'{esc(TYPE_LABELS.get(r["suggestion_type"], r["suggestion_type"]))}</span></div>'
-            f'<div class="ask-body"><div><div class="lab">Their words</div>'
-            f'<div class="sugg-body" style="padding:0">{esc(r["text"])}</div></div>{proposal}</div></div>')
-
-    # details drawer
+    note_id = f'Note {r["anki_note_id"]}' if r["anki_note_id"] else "Note"
     contact = f'<dt>email</dt><dd>{esc(r["email"])}</dd>' if r["email"] else ""
     details = (f'<details class="trace"><summary>Details</summary><dl>'
                f'<dt>deck</dt><dd>{esc(r["deck"])}</dd><dt>note type</dt><dd>{esc(r["note_type"])}</dd>'
-               f'<dt>card id</dt><dd><code>{esc(r["doctrine_id"])}</code></dd>'
-               f'{f"<dt>nid</dt><dd>{r["anki_note_id"]}</dd>" if r["anki_note_id"] else ""}{contact}</dl>'
+               f'<dt>internal id</dt><dd><code>{esc(r["doctrine_id"])}</code></dd>{contact}</dl>'
                f'{trace_block(r)}</details>')
     email_chip = '<span class="badge dim">Email left</span>' if r["email"] else ""
 
     if status == "open":
-        has_proposal = bool(proposed) and master is not None and bool(diff_fields(current, proposed))
         can_accept = has_proposal and not stale
-        accept = ('<button name="do" value="accept_proposal">Accept proposal</button>' if can_accept else "")
+        accept = '<button name="do" value="accept_proposal">Accept proposal</button>' if can_accept else ""
         edit_label = "Edit proposal" if has_proposal else "Edit card"
-        expire_hint = ('<p class="stale-hint">The card already changed. If the issue is gone, mark it expired.</p>'
-                       if stale else "")
         actions = f"""
-<div class="actions">{expire_hint}
+<div class="actions">
 <form method="post" action="/reviewer/action">
   <input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="id" value="{sid}">
   <span class="hint">Accepting changes the card in the online deck and queues it for the next release.</span>
   <span class="btns">
     {accept}
     <a class="btn-link-primary" href="/edit/{sid}{'?from=proposal' if has_proposal else ''}">{edit_label}</a>
-    <button name="do" value="duplicate" class="secondary" title="Same issue as another report on this card. The student still gets a thank-you.">Duplicate</button>
-    <button name="do" value="decline" class="secondary">Decline</button>
-    <button name="do" value="expire" class="ghost">Mark expired</button>
+    <span class="menu-wrap"><button type="button" class="secondary" data-menu="mo{sid}">Close without changing</button>
+      <div class="menu up" id="mo{sid}" hidden>
+        <button name="do" value="duplicate" class="menu-item" title="Same issue as another report on this card. The student still gets a thank-you.">Duplicate</button>
+        <button name="do" value="decline" class="menu-item">Decline</button>
+        <button name="do" value="expire" class="menu-item">Mark expired</button>
+      </div></span>
   </span>
 </form></div>"""
     else:
@@ -1027,19 +1075,16 @@ def render_inbox_item(r, master, csrf):
         actions = f'<div class="actions">{" &middot; ".join(bits) or "Closed."}</div>'
 
     return f"""
-<div class="card" data-scope>
+<div class="card">
   <div class="card-head">
-    {status_badge} {state_badge} {email_chip}
-    <span class="meta"><b>#{sid}</b></span>
+    {status_badge} {email_chip}
+    <span class="meta"><b>{note_id}</b> &middot; report #{sid}</span>
     <time>{ui.human_time(r["created_at"])}</time>
   </div>
   {tag_chips(r["tags_json"])}
   <div style="padding:0 16px">{details}</div>
-  {sugg}
-  <div class="viewbar"><span class="lab">View both as</span>
-    <span class="seg" data-for="{group}"><button type="button" data-show="rendered" class="on">Rendered</button>
-    <button type="button" data-show="html">HTML</button><button type="button" data-show="diff">Differences</button></span></div>
-  <div class="panes two">{student}{ours}</div>
+  {ask}
+  {saw}
   {actions}
 </div>"""
 
@@ -1057,15 +1102,9 @@ def render_reviewer(user=None, secret=None, session_token=None):
             "SELECT * FROM suggestions WHERE status!='open' AND COALESCE(platform_deck,1)=? "
             "ORDER BY id DESC LIMIT ?", (deck_id, RECENT_CLOSED_SHOWN)
         ).fetchall()
+        closed_total = conn.execute(
+            "SELECT COUNT(*) FROM suggestions WHERE status!='open' AND COALESCE(platform_deck,1)=?", (deck_id,)).fetchone()[0]
         masters = fetch_masters(conn, {r["doctrine_id"] for r in rows})
-
-    if not rows:
-        body = ('<h1>Inbox</h1><p class="sub">Suggestions from students '
-                'land here, next to the card they saw and its current master '
-                'version.</p><div class="empty"><b>The queue is clear</b>'
-                'When a student clicks &#9998; Suggest inside Anki, their note '
-                'arrives here with the exact card they were looking at.</div>')
-        return page("Inbox", body, "reviewer", user, csrf)
 
     items = []
     item_card = []
@@ -1073,7 +1112,7 @@ def render_reviewer(user=None, secret=None, session_token=None):
         item_card.append((r["doctrine_id"], r["status"], r["id"]))
         items.append(render_inbox_item(r, masters.get(r["doctrine_id"]), csrf))
 
-    # Group open items by card; a card with several open reports gets a header.
+    # Group open items by card. A card with several open reports gets a header.
     order, groups, closed = [], {}, []
     for html, (did, st, sid) in zip(items, item_card):
         if st == "open":
@@ -1094,17 +1133,24 @@ def render_reviewer(user=None, secret=None, session_token=None):
 </form></div>''' + "".join(h for _, h in members) + "</section>")
         else:
             parts.append(members[0][1])
-    items = parts + (['<h2 class="closed-h">Recently closed</h2>'] + closed if closed else [])
-    n_open = sum(1 for r in rows if r["status"] == "open")
+    n_open = len(order) and sum(len(m) for m in groups.values())
     nxt = _next_version_hint()
     banner = ui.infobox("How to read this page", (
-        "<p>Each report shows <b>what the student has</b> on their computer next to <b>our current card</b> and what they "
-        "asked for. Switch a pane between Rendered, HTML and Differences. A proposal can only be accepted directly "
-        "when the student's copy matches our current card.</p>"
+        "<p>Each report opens with <b>what the student wrote</b> and, if they proposed an exact change, <b>what they want</b>. "
+        "Below that is <b>what the student saw</b>. If our card has changed since, you see ours next to it. "
+        "A proposal can only be accepted directly when the student saw the same card we have now.</p>"
         f"<p>Accepting adds the change to the next release ({esc(nxt)}). You choose what ships on the Next release page.</p>"))
-    body = ('<h1>Inbox</h1>' + banner
-            + f'<p class="queue-count"><b>{n_open} open</b> &middot; {len(rows) - n_open} closed</p>'
-            + "".join(items))
+    new_empty = ('<div class="empty"><b>Nothing new</b>When a student clicks Suggest an edit inside Anki, their report '
+                 'arrives here with the card they were looking at.</div>')
+    closed_empty = '<div class="empty"><b>Nothing closed yet</b>Accepted, declined and expired reports are kept here.</div>'
+    closed_note = (f'<p class="small">Showing the latest {RECENT_CLOSED_SHOWN} of {closed_total} closed reports.</p>'
+                   if closed_total > len(closed) else "")
+    tabs = (f'<div class="tabs" data-tabs><button type="button" data-tab="new-pane">New '
+            f'<span class="count">{n_open}</span></button>'
+            f'<button type="button" data-tab="closed-pane">Closed <span class="count dim">{closed_total}</span></button></div>')
+    body = ('<h1>Inbox</h1>' + banner + tabs
+            + f'<div class="tabpane" id="new-pane">{"".join(parts) or new_empty}</div>'
+            + f'<div class="tabpane" id="closed-pane" hidden>{closed_note}{"".join(closed) or closed_empty}</div>')
     return page("Inbox", body, "reviewer", user, csrf)
 
 
@@ -1826,6 +1872,15 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 lic = hashlib.sha256(token.encode()).hexdigest()[:16]
                 self._send_package(pkg, version, lic)
+        elif (path.startswith("/releases/") and path.count("/") == 2
+              and path[len("/releases/"):] not in ("next", "status", "pending", "token", "confirm", "cut")):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            else:
+                html_ = render_release_detail(user, auth.csrf_token(self._cookie_token(), session_secret()),
+                                              unquote(path[len("/releases/"):]))
+                self._send(200 if html_ else 404, html_ or page("Not found", "<h1>No such release</h1>"))
         elif path == "/releases/status":
             if self._current_user() is None:
                 self._json(401, {"error": "Sign in."})
@@ -3608,6 +3663,108 @@ def _changes_html(changes):
     return f'<ul class="chg">{lis}{more}</ul>'
 
 
+def release_detail_rows(conn, version):
+    """One row per card changed in a release, with who, why and what the student said."""
+    order, cards = [], {}
+    for rv in conn.execute(
+            "SELECT r.*, u.username FROM revisions r LEFT JOIN users u ON u.id=r.user_id "
+            "WHERE r.release=? ORDER BY r.id", (version,)):
+        rv = dict(rv)
+        c = cards.get(rv["guid"])
+        if c is None:
+            note = conn.execute("SELECT anki_note_id, fields_json FROM notes WHERE doctrine_id=?", (rv["guid"],)).fetchone()
+            fields = json.loads(note["fields_json"] or "{}") if note else {}
+            c = {"guid": rv["guid"], "nid": note["anki_note_id"] if note else None,
+                 "snippet": ui.plain_text(fields.get("Text", ""), 90) or rv["guid"],
+                 "kind": revisions.kind_of(conn, rv), "changes": [], "who": set(), "sources": [], "when": rv["created_at"]}
+            cards[rv["guid"]] = c
+            order.append(rv["guid"])
+        c["who"].add(rv["username"] or "unknown")
+        if rv["source"] and rv["source"] not in c["sources"]:
+            c["sources"].append(rv["source"])
+        c["changes"].append({"field": rv["field"], "before": rv["before"] or "", "after": rv["after"] or ""})
+    out = []
+    for g in order:
+        c = cards[g]
+        c["reports"] = []
+        for src in c["sources"]:
+            if src.startswith("suggestion:"):
+                sg = conn.execute("SELECT * FROM suggestions WHERE id=?", (src.split(":", 1)[1],)).fetchone()
+                if sg:
+                    nt = conn.execute("SELECT status, actioned_at FROM notifications WHERE suggestion_id=?", (sg["id"],)).fetchone()
+                    c["reports"].append({"id": sg["id"], "text": sg["text"], "email": sg["email"],
+                                         "proposed": bool(sg["proposed_fields_json"]), "when": sg["created_at"],
+                                         "thanks": (nt["status"] if nt else ("none" if not (sg["email"] or "").strip() else "pending"))})
+        out.append(c)
+    return out
+
+
+def render_release_detail(user, csrf, version):
+    with db() as conn:
+        rel = conn.execute("SELECT * FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is None:
+            return None
+        rel = dict(rel)
+        rows = release_detail_rows(conn, version)
+        builder = conn.execute("SELECT username FROM users WHERE id=?", (rel["built_by"],)).fetchone() if rel.get("built_by") else None
+        deck = conn.execute("SELECT name FROM decks WHERE id=?", (rel.get("platform_deck") or 1,)).fetchone()
+    n_edits = sum(len(c["changes"]) for c in rows)
+    from_students = sum(1 for c in rows if c["reports"])
+    thanks = collections.Counter(rp["thanks"] for c in rows for rp in c["reports"])
+    kind_badge = lambda k: f'<span class="badge dim">{esc(revisions.KIND_LABELS.get(k, k))}</span>'
+
+    def change_html(ch):
+        if ch["field"] == "added":
+            return '<div class="chgline"><span class="k">New card</span></div>'
+        if ch["field"] == "retired":
+            return '<div class="chgline"><span class="k">Retired</span> removed from the deck</div>'
+        return f'<div class="chgline"><span class="k">{esc(ch["field"])}</span> <span class="diff">{diff_words(ch["before"], ch["after"])}</span></div>'
+
+    def source_html(c):
+        bits = []
+        for rp in c["reports"]:
+            mail = {"thanked": '<span class="badge ok">Thank-you sent</span>',
+                    "pending": '<span class="badge warn">Thank-you waiting in Outbox</span>',
+                    "skipped": '<span class="badge dim">Thank-you skipped</span>',
+                    "none": '<span class="badge dim">No email left</span>'}[rp["thanks"]]
+            bits.append(f'<div class="rpt"><b>Student report #{rp["id"]}</b>'
+                        f'{" with an exact proposal" if rp["proposed"] else ""}<br>'
+                        f'<span class="small">&ldquo;{esc((rp["text"] or "")[:200])}&rdquo;</span><br>{mail}</div>')
+        for src in c["sources"]:
+            if src.startswith("upload:"):
+                bits.append(f'<div class="rpt"><b>Deck re-upload #{esc(src.split(":", 1)[1])}</b></div>')
+            elif src == "staff":
+                bits.append('<div class="rpt"><b>Direct edit</b> by staff</div>')
+        return "".join(bits)
+
+    body_rows = "".join(
+        f'<tr><td><b>{esc(c["snippet"])}</b><br><span class="small">Note {c["nid"] or esc(c["guid"])}</span><br>'
+        f'<a href="/cards/edit?guid={quote(c["guid"], safe="")}#edit-pane">Open card</a> &middot; '
+        f'<a href="/cards/edit?guid={quote(c["guid"], safe="")}#history-pane">History</a></td>'
+        f'<td>{kind_badge(c["kind"])}</td><td class="wide">{"".join(change_html(ch) for ch in c["changes"])}</td>'
+        f'<td>{esc(", ".join(sorted(c["who"])))}</td><td class="wide">{source_html(c)}</td>'
+        f'<td>{ui.human_time(c["when"])}</td></tr>' for c in rows) or \
+        '<tr><td colspan="6" class="empty-row">This release has no recorded card changes. It is the original deck.</td></tr>'
+    mail_bits = ", ".join(f"{n} {label}" for key, label in (("thanked", "thanked"), ("pending", "waiting in the Outbox"),
+                          ("skipped", "skipped"), ("none", "without an email")) for n in [thanks.get(key, 0)] if n)
+    summary = (f'<p class="sub">{esc(deck["name"] if deck else "Doctorine")} &middot; '
+               f'{"published" if rel["status"] == "published" else esc(rel["status"])} {ui.human_time(rel.get("published_at") or rel["created_at"])}'
+               f'{" by " + esc(builder["username"]) if builder else ""} &middot; '
+               f'{"announced on the Updates page" if rel.get("visibility") != "silent" else "silent release"}</p>')
+    notes = (f'<div class="infobox" style="display:block;padding:10px 14px"><b>Public notes</b><br>{esc(rel["public_notes"])}</div>'
+             if rel.get("public_notes") else "")
+    body = f"""
+<p><a href="/releases">&larr; All releases</a></p>
+<h1>Release {esc(version)}</h1>
+{summary}{notes}
+<p class="queue-count"><b>{len(rows)}</b> card{'s' if len(rows) != 1 else ''} changed &middot; <b>{n_edits}</b> edit{'s' if n_edits != 1 else ''}
+&middot; <b>{from_students}</b> from student reports{(' &middot; ' + mail_bits) if mail_bits else ''}</p>
+{ui.infobox("What this page is for", "<p>A record of what went into this release, for anyone double checking the work. Each row shows what changed, who did it, and where it came from. For a student report you can see their words, whether they proposed an exact change, and whether they were thanked. Open card goes to the card itself, and History shows every change it has ever had.</p>")}
+<table class="tbl wrap"><thead><tr><th>Card</th><th>Type</th><th>What changed</th><th>Who</th><th>Where it came from</th><th>When</th></tr></thead>
+<tbody>{body_rows}</tbody></table>"""
+    return page(f"Release {version}", body, "releases", user, csrf)
+
+
 def render_releases(user, csrf, notice=None, token_link=None):
     deck_id = active_deck_id(user)
     with db() as conn:
@@ -3644,7 +3801,7 @@ def render_releases(user, csrf, notice=None, token_link=None):
             else:
                 acts = '<span class="small">An older release. It can no longer be downloaded.</span>'
         n_changes = len(changes.get(v, []))
-        summary = (f'<span class="small">{n_changes} card{"s" if n_changes != 1 else ""} changed</span>'
+        summary = (f'<a class="small" href="/releases/{quote(v, safe="")}">{n_changes} card{"s" if n_changes != 1 else ""} changed, see details</a>'
                    if n_changes else '<span class="small">The original deck</span>')
         notes = (f'<p class="small" style="margin:10px 0 0">{esc(r["public_notes"])}</p>'
                  if r.get("public_notes") else "")
@@ -3653,7 +3810,7 @@ def render_releases(user, csrf, notice=None, token_link=None):
         cls = "rel current" if is_cur else ("rel" if r["status"] in ("draft", "building", "failed") else "rel muted")
         items.append(f"""
 <div class="{cls}">
-  <div class="rh"><span class="v">Release {esc(v)}</span>{badge}{public}{summary}<span class="when">{when}</span></div>
+  <div class="rh"><a class="v" href="/releases/{quote(v, safe="")}" style="text-decoration:none">Release {esc(v)}</a>{badge}{public}{summary}<span class="when">{when}</span></div>
   {notes}{_changes_html(changes.get(v, []))}
   <div class="acts">{acts}</div>{log}
 </div>""")
@@ -3824,27 +3981,13 @@ CARDS_LIMIT = 50
 
 
 def search_cards_page(conn, q, deck_id, limit):
-    """Up to `limit` matches for the Cards page."""
-    q = (q or "").strip()
-    if not q:
+    """Up to `limit` matches for the Cards page. An exact internal id or note id comes first."""
+    if not (q or "").strip():
         return []
-    D = "COALESCE(platform_deck,1)=?"
-    exact = conn.execute(f"SELECT * FROM notes WHERE doctrine_id=? AND retired=0 AND {D}", (q, deck_id)).fetchone()
-    if exact:
-        return [exact]
-    if q.isdigit():
-        rows = conn.execute(f"SELECT * FROM notes WHERE anki_note_id=? AND retired=0 AND {D} LIMIT ?",
-                            (int(q), deck_id, limit)).fetchall()
-        if rows:
-            return rows
-    if q.lower().startswith("tag:"):
-        return conn.execute(
-            f"SELECT * FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
-            (deck_id, f"%{q[4:].strip()}%", limit)).fetchall()
-    like = f"%{q}%"
+    where, args = _card_filter(q, deck_id)
     return conn.execute(
-        f"SELECT * FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?) "
-        "ORDER BY doctrine_id LIMIT ?", (deck_id, like, like, limit)).fetchall()
+        f"SELECT * FROM notes WHERE {where} ORDER BY (doctrine_id=? OR CAST(anki_note_id AS TEXT)=?) DESC, doctrine_id LIMIT ?",
+        (*args, (q or "").strip(), re.sub(r"\D", "", q or ""), limit)).fetchall()
 
 
 def search_cards(conn, q, deck_id=1):
@@ -3874,25 +4017,30 @@ def search_cards(conn, q, deck_id=1):
 CARDS_PAGE = 48
 
 
+def _card_filter(q, deck_id):
+    """(where_sql, args) for a Cards search. Accepts text, tag:..., a note id, an internal id, or part of one.
+
+    Pasted forms like 'Note 1788834703288', 'nid:1788834703288' and '#1788834703288' work too.
+    """
+    q = (q or "").strip()
+    D = "retired=0 AND COALESCE(platform_deck,1)=?"
+    if q.lower().startswith("tag:"):
+        return f"{D} AND tags_json LIKE ?", (deck_id, f"%{q[4:].strip()}%")
+    bare = re.sub(r"^(note\s*id|note|nid|id|#)[\s:#]*", "", q, flags=re.I).strip()
+    if bare.isdigit() and len(bare) >= 5:
+        return f"{D} AND (anki_note_id=? OR CAST(anki_note_id AS TEXT) LIKE ? OR doctrine_id LIKE ?)", \
+               (deck_id, int(bare), f"{bare}%", f"%{bare}%")
+    like = f"%{q}%"
+    return (f"{D} AND (doctrine_id=? OR doctrine_id LIKE ? OR fields_json LIKE ? OR tags_json LIKE ?)",
+            (deck_id, bare or q, f"%{bare or q}%" if len(bare or q) >= 4 else "\x00", like, like))
+
+
 def count_cards(conn, q, deck_id):
     """How many official cards a search matches in total."""
-    q = (q or "").strip()
-    if not q:
+    if not (q or "").strip():
         return 0
-    D = "COALESCE(platform_deck,1)=?"
-    if conn.execute(f"SELECT 1 FROM notes WHERE doctrine_id=? AND retired=0 AND {D}", (q, deck_id)).fetchone():
-        return 1
-    if q.isdigit():
-        n = conn.execute(f"SELECT COUNT(*) FROM notes WHERE anki_note_id=? AND retired=0 AND {D}",
-                         (int(q), deck_id)).fetchone()[0]
-        if n:
-            return n
-    if q.lower().startswith("tag:"):
-        return conn.execute(f"SELECT COUNT(*) FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ?",
-                            (deck_id, f"%{q[4:].strip()}%")).fetchone()[0]
-    like = f"%{q}%"
-    return conn.execute(f"SELECT COUNT(*) FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?)",
-                        (deck_id, like, like)).fetchone()[0]
+    where, args = _card_filter(q, deck_id)
+    return conn.execute(f"SELECT COUNT(*) FROM notes WHERE {where}", args).fetchone()[0]
 
 
 def _tag_label(t):
@@ -3963,9 +4111,9 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
                      f'&n={n + CARDS_PAGE}">Show {min(CARDS_PAGE, total - shown)} more</a></p>')
     body = f"""
 <h1>Cards</h1>
-{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, a note id, or a card id. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
+{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, or an ID. An ID can be the Anki note ID or the internal one, whole or partial. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
 <form method="get" action="/cards" class="row" style="margin:0 0 14px">
-  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, a note id or a card id" style="min-width:380px" autofocus>
+  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, or an ID" style="min-width:380px" autofocus>
   <button type="submit">Search</button>
 </form>
 {status}

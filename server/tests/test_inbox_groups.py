@@ -77,5 +77,27 @@ class GroupTest(unittest.TestCase):
         self.assertIn('name="also" value="2" checked', html)
 
 
+class InboxTabsTest(unittest.TestCase):
+    def test_new_is_the_default_tab_and_closed_reports_live_on_their_own_tab(self):
+        with running_server() as base:
+            register_note(base, GUID, fields={"Text": "HPV11 {{c1::low}}", "Extra": "e"})
+            suggest(base, "still open one"); suggest(base, "to be declined")
+            server.reviewer_action({"id": ["2"], "do": ["decline"]}, 1)
+            html = queue()
+        new_pane = html.split('id="new-pane"')[1].split('id="closed-pane"')[0]
+        closed_pane = html.split('id="closed-pane"')[1]
+        self.assertIn("still open one", new_pane)
+        self.assertNotIn("to be declined", new_pane)
+        self.assertIn("to be declined", closed_pane)
+        self.assertIn('data-tab="new-pane"', html)
+        self.assertRegex(html, r'Closed <span class="count dim">1</span>')
+
+    def test_empty_states(self):
+        with running_server() as base:
+            html = queue()
+        self.assertIn("Nothing new", html)
+        self.assertIn("Nothing closed yet", html)
+
+
 if __name__ == "__main__":
     unittest.main()

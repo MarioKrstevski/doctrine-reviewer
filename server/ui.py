@@ -253,7 +253,27 @@ tr.inactive { opacity:.5; }
 .infobox .b p { margin:0 0 6px; }
 .infobox .b ul { margin:4px 0 0; padding-left:18px; }
 
-/* ---- inbox panes ---- */
+/* ---- inbox card (header, ask, saw, actions) ---- */
+.ask { border-top:1px solid var(--line); padding:14px 16px; }
+.askgrid { display:grid; gap:22px; }
+.askgrid.two { grid-template-columns:minmax(0,1fr) minmax(0,1.3fr); }
+.askgrid .lab, .collab { font-size:10.5px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--faint);
+  margin-bottom:6px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.askgrid .lab .seg { margin-left:auto; }
+.words { font-size:16.5px; line-height:1.5; font-family:var(--serif); color:var(--ink); }
+.saw { border-top:1px solid var(--line); }
+.sechead { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 16px; background:var(--panel);
+  border-bottom:1px solid var(--line); }
+.sechead .t { font-size:11px; font-weight:700; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); }
+.sechead .sp { margin-left:auto; }
+.cols { display:grid; }
+.cols.two { grid-template-columns:1fr 1fr; }
+.cols .col { min-width:0; border-right:1px solid var(--line); }
+.cols .col:last-child { border-right:0; }
+.cols .collab { padding:8px 16px 0; margin:0; min-height:14px; }
+.cols.one .collab { display:none; }
+.viewpane.short { height:230px; }
+/* ---- legacy inbox panes ---- */
 .ask { border-top:1px solid var(--line); }
 .ask .pane-label { display:flex; align-items:center; }
 .ask-body { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.5fr); gap:20px; padding:14px 16px; font-size:14.5px; }
@@ -265,7 +285,7 @@ tr.inactive { opacity:.5; }
 .panes.two .pane { display:flex; flex-direction:column; border-right:1px solid var(--line); min-width:0; }
 .panes.two .pane:last-child { border-right:0; }
 .panes.two .pane-label { height:40px; box-sizing:border-box; display:flex; align-items:center; }
-.viewpane { height:340px; box-sizing:border-box; }
+.viewpane { height:260px; box-sizing:border-box; }
 .viewpane[hidden] { display:none; }
 .viewpane.scroll { overflow:auto; padding:14px 16px; font-size:14px; }
 .anki-frame { width:100%; height:100%; border:0; display:block; background:#fff; }
@@ -287,6 +307,13 @@ tr.inactive { opacity:.5; }
 .deck-pick:hover { color:var(--accent) !important; background:transparent !important; }
 table.tbl tr.sel td { background:var(--accent-soft); }
 table.tbl tr.sel td:first-child { box-shadow:inset 3px 0 0 var(--accent); }
+
+table.tbl.wrap { white-space:normal; }
+table.tbl.wrap td { vertical-align:top; }
+table.tbl.wrap td.wide { min-width:260px; max-width:440px; }
+.chgline { margin:0 0 8px; font-size:13.5px; max-height:150px; overflow:auto; }
+.chgline .k { font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-ink); margin-right:6px; }
+.rpt { margin:0 0 10px; font-size:13.5px; }
 
 /* ---- tables ---- */
 table.tbl { width:100%; border-collapse:collapse; font-size:14px; background:var(--card); border:1px solid var(--line);
@@ -345,6 +372,8 @@ table.tbl td.empty-row { text-align:center; color:var(--muted); padding:26px 14p
 .tabs button:hover { color:var(--ink); background:transparent; }
 .tabs button.on { color:var(--accent-ink); border-bottom-color:var(--accent); background:transparent; }
 .tabpane[hidden] { display:none; }
+.tabs .count { background:var(--accent); margin-left:4px; }
+.tabs .count.dim { background:var(--dim-soft); color:var(--muted); }
 .seg { display:inline-flex; background:var(--dim-soft); border-radius:8px; padding:2px; gap:2px; }
 .seg button { background:transparent; color:var(--muted); border:0; border-radius:6px; padding:3px 10px; font-size:12px;
   font-weight:600; cursor:pointer; }
@@ -409,7 +438,9 @@ button[disabled] { opacity:.45; cursor:not-allowed; }
   h1 { font-size:26px; margin-top:8px; }
   .tiles { grid-template-columns:1fr; }
   .panes, .panes.eq, .panes.two { grid-template-columns:1fr; }
-  .ask-body { grid-template-columns:1fr; }
+  .ask-body, .askgrid.two { grid-template-columns:1fr; }
+  .cols.two { grid-template-columns:1fr; }
+  .cols .col { border-right:0; border-bottom:1px solid var(--line); }
   .viewpane { height:300px; }
   .pane { border-right:0; border-bottom:1px solid var(--line); }
   .pane-body { max-height:300px; }

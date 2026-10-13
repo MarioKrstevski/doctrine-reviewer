@@ -90,7 +90,7 @@ class ReviewerWithoutMasterTest(unittest.TestCase):
             with server.db() as conn:          # master vanishes after filing
                 conn.execute("DELETE FROM notes WHERE doctrine_id=?", (GUID,))
             html = self._html(base)
-        self.assertIn("No master on file", html)
+        self.assertIn("No copy of this card on file", html)
         self.assertNotIn("Card changed since", html)
 
     def test_registered_master_still_compares(self):
