@@ -53,7 +53,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       queries filter by active deck; `/where` returns deck slug; add-on pinned to it.
 - [ ] **T10 Detection.** Licenses table; per-download license token; installs table
       from pings; page listing licenses by install count with thresholds.
-- [ ] **T11 Clean slate.** Wipe test data on production, re-import v2 as 1.0 (media
+- [x] **T11 Clean slate.** (done 2026-10-13: test data wiped in place; v2 deck and 1.0 baseline kept, so no re-import and no media/claim needed) Wipe test data on production, re-import v2 as 1.0 (media
       claimed, not re-uploaded), deploy, verify end to end.
 
 ## Progress log
@@ -66,3 +66,4 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
   volume stays 4.6 GB unless more is needed, detection thresholds 20/100.
 - 2026-10-13: Mario: the add-on automatic update prompt (T7) goes last (hardest). Order now:
   T4, T2+T3, T11, T5, T6, T8, T9, T10, T7. Deploy each task separately so he sees changes early.
+- 2026-10-13: T4, T2, T3, T11 done and deployed. Next: T5, T6, T8, T9, T10, then T7 (last).
