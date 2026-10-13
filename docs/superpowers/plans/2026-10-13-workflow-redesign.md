@@ -45,7 +45,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
 - [ ] **T7 Add-on.** Prompt: "Your deck: 1.0 · Newest: 1.3 (3 releases behind)" side by
       side; ping `/api/ping` with install_id, add-on version, deck release, license id
       (read from `_doctrine_license.json` in collection.media); install page warning.
-- [ ] **T8 Deck page.** Streamed browser upload to disk with free-space guard; choose
+- [x] **T8 Deck page.** (done: raw-body upload with progress, admin only; media/claim not needed) Streamed browser upload to disk with free-space guard; choose
       "replace this deck (re-upload)" or "new deck"; id-overlap check refuses a
       replacement whose ids mostly differ; re-upload → diff review (existing);
       `/api/media/claim` so the CLI skips uploading blobs already on disk.

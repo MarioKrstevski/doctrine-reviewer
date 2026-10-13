@@ -18,6 +18,7 @@ API:
 """
 
 import hashlib
+import shutil
 import html
 import json
 import sqlite3
@@ -33,6 +34,7 @@ import auth
 import email_out
 import releases
 import release_build
+import apkgfile
 import reupload
 import revisions
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1641,6 +1643,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, render_upload(user, csrf, path[len("/uploads/"):].split("/")[0]))
         elif path == "/releases/pending":
             self._redirect("/releases/next")
+        elif path == "/deck" or path.startswith("/deck/status/"):
+            user = self._current_user()
+            if user is None:
+                self._redirect("/login")
+            elif path == "/deck":
+                self._send(200, render_deck(user, auth.csrf_token(self._cookie_token(), session_secret())))
+            else:
+                with db() as conn:
+                    up = _upload_row(conn, path[len("/deck/status/"):])
+                if up is None:
+                    self._json(404, {"error": "No such upload."})
+                else:
+                    self._json(200, {"status": up["status"],
+                                     "error": json.loads(up["summary_json"] or "{}").get("error", "")})
         elif path in ("/cards", "/cards/edit"):
             user = self._current_user()
             if user is None:
@@ -1711,7 +1727,49 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, page("Not found", "<h1>Not found</h1>"))
 
+    def _deck_upload(self):
+        user = self._current_user()
+        if user is None or user["role"] != "admin":
+            return self._json(403, {"error": "Administrators only."})
+        token = self._cookie_token()
+        if not token or not auth.csrf_ok(self.headers.get("X-CSRF", ""), token, session_secret()):
+            return self._json(403, {"error": "Invalid form token. Reload the page."})
+        size = int(self.headers.get("Content-Length", 0))
+        if size <= 0 or size > DECK_MAX:
+            return self._json(400, {"error": "Missing or oversized file."})
+        ok, free, need = deck_space(size)
+        if not ok:
+            return self._json(507, {"error": f"Not enough free space: {free / 1e9:.1f} GB free, "
+                                             f"{need / 1e9:.1f} GB needed. Grow the volume or free space first."})
+        label = unquote(parse_qs(urlparse(self.path).query).get("name", ["deck.apkg"])[0])[:200]
+        with db() as conn:
+            upload_id = conn.execute(
+                "INSERT INTO uploads (label, status, incoming_json, diff_json, created_at) VALUES (?,?,?,?,?)",
+                (label, "processing", "{}", "{}", now())).lastrowid
+        tmp_dir = os.path.join(releases.blob_root(), "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, f"deck-{upload_id}.apkg")
+        try:
+            left = size
+            with open(path, "wb") as out:
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ConnectionError("upload ended early")
+                    out.write(chunk); left -= len(chunk)
+        except Exception as e:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            _set_upload(upload_id, "failed", error=f"Upload interrupted: {e}")
+            return
+        threading.Thread(target=process_deck_upload, args=(upload_id, path), daemon=True).start()
+        self._json(200, {"upload_id": upload_id})
+
     def _do_POST(self):
+        if urlparse(self.path).path == "/deck/upload":
+            return self._deck_upload()
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
         path = urlparse(self.path).path
@@ -2503,11 +2561,7 @@ def new_note_from_form(form, user_id):
 
 # ---------------------------------------------------------------- re-upload
 
-def create_upload(label, notes):
-    """Compare the submitted notes against the online deck and store the result.
-
-    Raises reupload.IdMismatch / ValueError; nothing is stored in that case.
-    """
+def _incoming_map(notes):
     incoming = {}
     for n in notes:
         guid = (n.get("guid") or n.get("doctrine_id") or "").strip()
@@ -2515,6 +2569,15 @@ def create_upload(label, notes):
             continue
         incoming[guid] = {"fields": n.get("fields") or {}, "tags": list(n.get("tags") or []),
                           "note_type": n.get("note_type") or ""}
+    return incoming
+
+
+def create_upload(label, notes):
+    """Compare the submitted notes against the online deck and store the result.
+
+    Raises reupload.IdMismatch / ValueError; nothing is stored in that case.
+    """
+    incoming = _incoming_map(notes)
     with db() as conn:
         diff = reupload.compare(reupload.snapshot(conn), incoming,
                                 pending_guids=reupload.pending_guids(conn))
@@ -2524,6 +2587,138 @@ def create_upload(label, notes):
                VALUES (?,?,?,?,?)""",
             (label, json.dumps(incoming), json.dumps(diff), json.dumps(summary), now()))
         return cur.lastrowid, summary
+
+
+DECK_MARGIN = 400 * 1024 * 1024   # headroom beyond the file itself
+DECK_MAX = 6 * 1024 ** 3
+
+
+def deck_space(size):
+    """(ok, free, needed) for accepting an upload of `size` bytes."""
+    root = releases.blob_root()
+    os.makedirs(root, exist_ok=True)
+    free = shutil.disk_usage(root).free
+    need = int(size * 1.3) + DECK_MARGIN
+    return free >= need, free, need
+
+
+def _set_upload(upload_id, status, **summary):
+    with db() as conn:
+        conn.execute("UPDATE uploads SET status=?, summary_json=COALESCE(?, summary_json) WHERE id=?",
+                     (status, json.dumps(summary) if summary else None, upload_id))
+
+
+def process_deck_upload(upload_id, path):
+    """Background: read the .apkg, store its media (renaming a changed image that
+    reuses a filename), compare notes with the online deck, hand over to review."""
+    try:
+        pkg = apkgfile.Package(path)
+        notes = list(apkgfile.read_notes(pkg.collection_sqlite()))
+        manifest = pkg.media_names()
+        with db() as conn:
+            known = {r["filename"]: r["sha256"] for r in conn.execute("SELECT filename, sha256 FROM media")}
+        renames, stats = {}, {"media_new": 0, "media_same": 0, "media_renamed": 0}
+        items = list(manifest.items())
+        for start in range(0, len(items), 100):
+            with db() as conn:
+                for member, name in items[start:start + 100]:
+                    if not releases.safe_filename(name):
+                        continue
+                    data = pkg.media_bytes(member)
+                    sha = hashlib.sha256(data).hexdigest()
+                    if name not in known:
+                        releases.store_media(conn, name, data); known[name] = sha; stats["media_new"] += 1
+                    elif known[name] == sha:
+                        stats["media_same"] += 1
+                    else:
+                        new_name = apkgfile.renamed(name, sha)
+                        releases.store_media(conn, new_name, data); known[new_name] = sha
+                        renames[name] = new_name; stats["media_renamed"] += 1
+        pkg.close()
+        if renames:
+            for n in notes:
+                n["fields"] = {k: apkgfile.rename_refs(v, renames) for k, v in n["fields"].items()}
+        incoming = _incoming_map(notes)
+        with db() as conn:
+            diff = reupload.compare(reupload.snapshot(conn), incoming,
+                                    pending_guids=reupload.pending_guids(conn))
+            summary = {k: (len(v) if isinstance(v, (dict, list)) else v) for k, v in diff.items()}
+            summary.update(stats)
+            summary["renamed_files"] = renames
+            conn.execute("UPDATE uploads SET status='pending', incoming_json=?, diff_json=?, summary_json=? WHERE id=?",
+                         (json.dumps(incoming), json.dumps(diff), json.dumps(summary), upload_id))
+    except reupload.IdMismatch as e:
+        _set_upload(upload_id, "failed", error=str(e), kind="id_mismatch")
+    except Exception as e:
+        _set_upload(upload_id, "failed", error=f"Could not read the file: {e}")
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def render_deck(user, csrf):
+    with db() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM notes WHERE retired=0").fetchone()[0]
+        retired = conn.execute("SELECT COUNT(*) FROM notes WHERE retired=1").fetchone()[0]
+        media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+        cur = releases.current_release(conn)
+        ups = [dict(r) for r in conn.execute(
+            "SELECT id, label, status, created_at FROM uploads ORDER BY id DESC LIMIT 15")]
+    free = shutil.disk_usage(releases.blob_root()).free if os.path.isdir(releases.blob_root()) else 0
+    rows = "".join(
+        f'<tr><td>#{u["id"]}</td><td>{esc(u["label"] or "")}</td><td>{esc(u["status"])}</td>'
+        f'<td>{esc(u["created_at"] or "")}</td>'
+        f'<td><a href="/uploads/{u["id"]}">open</a></td></tr>' for u in ups) or \
+        '<tr><td colspan="5" class="small">No uploads yet.</td></tr>'
+    if user["role"] == "admin":
+        form = f"""
+<div class="card"><div class="proposal">
+  <h3 style="margin-top:0">Re-upload this deck</h3>
+  <p class="small">Choose the new <code>.apkg</code>. Nothing changes yet: you get a side-by-side review of what
+  differs, and approved changes go to Next release. Cards are matched by their note id; a file whose ids mostly
+  differ is refused. A changed image that reuses an old filename is saved under a new name automatically.
+  Free space on the server: <b>{free / 1e9:.1f} GB</b>. Needs about 1.3&times; the file size plus 0.4 GB.</p>
+  <input type="file" id="deckfile" accept=".apkg">
+  <button id="deckgo" type="button">Upload and compare</button>
+  <div id="deckmsg" class="small" style="margin-top:8px"></div>
+  <progress id="deckprog" value="0" max="100" style="width:100%;display:none"></progress>
+</div></div>
+<script>
+(function(){{
+var f=document.getElementById('deckfile'),b=document.getElementById('deckgo'),m=document.getElementById('deckmsg'),p=document.getElementById('deckprog');
+function poll(id){{fetch('/deck/status/'+id).then(r=>r.json()).then(function(s){{
+  if(s.status==='pending'){{location.href='/uploads/'+id;}}
+  else if(s.status==='failed'){{m.textContent=s.error||'Failed.';b.disabled=false;}}
+  else{{m.textContent='Reading the file and comparing cards…';setTimeout(function(){{poll(id);}},2500);}}}});}}
+b.addEventListener('click',function(){{
+  var file=f.files[0]; if(!file){{m.textContent='Choose a .apkg first.';return;}}
+  b.disabled=true;p.style.display='block';m.textContent='Uploading…';
+  var x=new XMLHttpRequest();
+  x.open('POST','/deck/upload?name='+encodeURIComponent(file.name));
+  x.setRequestHeader('X-CSRF',{json.dumps(csrf)});
+  x.upload.onprogress=function(e){{if(e.lengthComputable)p.value=100*e.loaded/e.total;}};
+  x.onload=function(){{var r={{}};try{{r=JSON.parse(x.responseText);}}catch(e){{}}
+    if(x.status===200){{p.style.display='none';m.textContent='Uploaded. Comparing cards…';poll(r.upload_id);}}
+    else{{m.textContent=r.error||('Upload failed ('+x.status+').');b.disabled=false;}}}};
+  x.onerror=function(){{m.textContent='Upload failed (connection).';b.disabled=false;}};
+  x.send(file);
+}});}})();
+</script>"""
+    else:
+        form = '<p class="small">Only administrators can upload a deck file.</p>'
+    body = f"""
+<h1>Deck</h1>
+<p class="sub">The online deck is the master copy every release is cut from.</p>
+<div class="card"><div class="proposal">
+  <p style="margin:0"><b>Doctorine</b> &middot; {n:,} active cards{f' &middot; {retired:,} retired' if retired else ''}
+  &middot; {media:,} media files &middot; current release {esc(cur or '—')}</p>
+</div></div>
+{form}
+<h2>Recent uploads</h2>
+<table class="tbl"><tr><th>#</th><th>File</th><th>Status</th><th>When</th><th></th></tr>{rows}</table>"""
+    return page("Deck", body, "deck", user, csrf)
 
 
 def _upload_row(conn, upload_id):
@@ -2536,6 +2731,11 @@ def render_upload(user, csrf, upload_id):
         up = _upload_row(conn, upload_id)
     if up is None:
         return page("Not found", "<h1>Upload not found</h1>", "pending", user, csrf)
+    if up["status"] in ("processing", "failed"):
+        err = json.loads(up["summary_json"] or "{}").get("error", "")
+        msg = "Still reading the file…" if up["status"] == "processing" else f"This upload failed. {err}"
+        return page("Upload", f'<h1>Upload #{up["id"]}</h1><p class="sub">{esc(msg)}</p>'
+                    '<p><a href="/deck">Back to Deck</a></p>', "deck", user, csrf)
     diff = json.loads(up["diff_json"]); incoming = json.loads(up["incoming_json"]); summ = json.loads(up["summary_json"] or "{}")
     applied = up["status"] != "pending"
 
