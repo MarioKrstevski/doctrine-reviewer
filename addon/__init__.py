@@ -33,7 +33,7 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.6.2"
+ADDON_VERSION = "1.6.3"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -47,6 +47,9 @@ SUGGESTION_TYPES = [
 # ---------------------------------------------------------------- config
 
 DEFAULT_BOOTSTRAP = "https://doctrine-editor-production.up.railway.app"
+# The deck this build belongs to. The server serves one deck per slug, so a
+# copy of the add-on never sees another deck's cards or releases.
+DECK_SLUG = "doctorine"
 
 
 def user_files_dir():
@@ -328,7 +331,7 @@ def refresh_official_in_background(force=False):
     def task():
         cfg = get_config()
         return official.refresh(user_files_dir(), api_base(cfg), fetch_official,
-                                now=time.time, force=force)
+                                now=time.time, force=force, deck=DECK_SLUG)
 
     def done(fut):
         try:
@@ -640,7 +643,8 @@ class UpdatePromptDialog(QDialog):
 
 
 def _fetch_sync_payload(api_base_url, since):
-    return get_json(api_base_url + "/api/sync?since=" + urllib.parse.quote(since or "", safe=""))
+    return get_json(api_base_url + "/api/sync?since=" + urllib.parse.quote(since or "", safe="")
+                    + "&deck=" + urllib.parse.quote(DECK_SLUG, safe=""))
 
 
 def check_for_deck_updates(force=False, silent=False):
@@ -654,7 +658,7 @@ def check_for_deck_updates(force=False, silent=False):
     def task():
         cfg = get_config()
         base = api_base(cfg)
-        current = get_json(base + "/api/sync/version").get("current")
+        current = get_json(base + "/api/sync/version?deck=" + urllib.parse.quote(DECK_SLUG, safe="")).get("current")
         if not current or current == st["release"]:
             return {"base": base, "current": current, "payload": None}
         return {"base": base, "current": current, "payload": _fetch_sync_payload(base, st["release"])}

@@ -246,6 +246,17 @@ def init_db():
         _ensure_columns(conn, "releases", {"package_path": "TEXT", "build_log": "TEXT",
                                            "published_at": "TEXT", "built_by": "INTEGER",
                                            "public_notes": "TEXT", "visibility": "TEXT"})
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS decks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT
+        );""")
+        if conn.execute("SELECT COUNT(*) FROM decks").fetchone()[0] == 0:
+            conn.execute("INSERT INTO decks (id, slug, name, created_at) VALUES (1, 'doctorine', 'Doctorine', datetime('now'))")
+        for t in ("notes", "releases", "uploads", "suggestions"):
+            _ensure_columns(conn, t, {"platform_deck": "INTEGER DEFAULT 1"})
         _ensure_columns(conn, "suggestions", {"release": "TEXT"})
         _ensure_columns(conn, "suggestions", {
             "resolved_by": "INTEGER",
@@ -1119,11 +1130,18 @@ def is_official(guid) -> bool:
         ).fetchone() is not None
 
 
-_official_cache = {"key": None, "body": b"", "etag": ""}
+def deck_from_slug(conn, slug):
+    """Row for a deck slug; the first deck when none is given; None if unknown."""
+    if not slug:
+        return conn.execute("SELECT * FROM decks ORDER BY id LIMIT 1").fetchone()
+    return conn.execute("SELECT * FROM decks WHERE slug=?", (slug,)).fetchone()
 
 
-def official_list():
-    """(etag, json bytes) for the current official guid set, cached in memory.
+_official_cache = {}
+
+
+def official_list(deck_id=1):
+    """(etag, json bytes) for a deck's official guid set, cached in memory.
 
     Rebuilt only when the set changes: the cache key is (row count, newest
     updated_at, retired count), all cheap aggregates.
@@ -1131,17 +1149,19 @@ def official_list():
     import hashlib as _h
     with db() as conn:
         key = tuple(conn.execute(
-            "SELECT COUNT(*), MAX(updated_at), SUM(retired) FROM notes").fetchone())
-        if key == _official_cache["key"]:
-            return _official_cache["etag"], _official_cache["body"]
+            "SELECT COUNT(*), MAX(updated_at), SUM(retired) FROM notes WHERE platform_deck=?",
+            (deck_id,)).fetchone()) + (releases.current_release(conn, deck_id),)
+        hit = _official_cache.get(deck_id)
+        if hit and key == hit["key"]:
+            return hit["etag"], hit["body"]
         guids = [r["doctrine_id"] for r in conn.execute(
-            "SELECT doctrine_id FROM notes WHERE retired=0 ORDER BY doctrine_id")]
-        release = conn.execute(
-            "SELECT value FROM settings WHERE key='current_release'").fetchone()
-    body = json.dumps({"release": release["value"] if release else "unreleased",
+            "SELECT doctrine_id FROM notes WHERE retired=0 AND platform_deck=? ORDER BY doctrine_id",
+            (deck_id,))]
+        release = releases.current_release(conn, deck_id)
+    body = json.dumps({"release": release or "unreleased",
                        "count": len(guids), "guids": guids}).encode("utf-8")
     etag = '"' + _h.sha256(body).hexdigest()[:24] + '"'
-    _official_cache.update(key=key, body=body, etag=etag)
+    _official_cache[deck_id] = {"key": key, "body": body, "etag": etag}
     return etag, body
 
 
@@ -1212,6 +1232,9 @@ def api_suggestion(data):
              data.get("addon_version"), data.get("anki_version"),
              doctorine_id, guid, proposed_json),
         )
+        conn.execute("UPDATE suggestions SET platform_deck=COALESCE("
+                     "(SELECT platform_deck FROM notes WHERE doctrine_id=?),1) WHERE token=?",
+                     (doc_id, token))
     return 200, {"ok": True,
                  "tracking_url": f"{CFG.public_base_url}/s/{token}"}
 
@@ -1551,21 +1574,32 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"files": files})
         elif path == "/api/sync/version":
             with db() as conn:
-                cur = releases.current_release(conn)
+                deck = deck_from_slug(conn, parse_qs(urlparse(self.path).query).get("deck", [""])[0])
+                if deck is None:
+                    return self._json(404, {"error": "Unknown deck."})
+                cur = releases.current_release(conn, deck["id"])
                 row = conn.execute("SELECT published_at, note_count FROM releases WHERE version=?", (cur,)).fetchone() if cur else None
             self._json(200, {"current": cur, "published_at": row["published_at"] if row else None,
                              "note_count": row["note_count"] if row else None})
         elif path == "/api/sync":
-            since = parse_qs(urlparse(self.path).query).get("since", [""])[0]
+            q = parse_qs(urlparse(self.path).query)
+            since = q.get("since", [""])[0]
             with db() as conn:
-                payload = sync_payload(conn, since)
+                deck = deck_from_slug(conn, q.get("deck", [""])[0])
+                if deck is None:
+                    return self._json(404, {"error": "Unknown deck."})
+                payload = sync_payload(conn, since, deck["id"])
             self._json(200, payload)
         elif path == "/api/releases":
             with db() as conn:
                 self._json(200, {"current": releases.current_release(conn),
                                  "releases": releases.list_releases(conn)})
         elif path == "/api/official":
-            etag, body = official_list()
+            with db() as conn:
+                deck = deck_from_slug(conn, parse_qs(urlparse(self.path).query).get("deck", [""])[0])
+            if deck is None:
+                return self._json(404, {"error": "Unknown deck."})
+            etag, body = official_list(deck["id"])
             if self.headers.get("If-None-Match") == etag:
                 self.send_response(304)
                 self.send_header("ETag", etag)
@@ -1575,11 +1609,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, body, "application/json",
                            {"ETag": etag, "Cache-Control": "public, max-age=300"})
         elif path == "/where":
+            with db() as conn:
+                deck = deck_from_slug(conn, parse_qs(urlparse(self.path).query).get("deck", [""])[0])
             self._send(
                 200,
                 json.dumps({
                     "api_base": CFG.public_base_url,
                     "min_addon_version": MIN_ADDON_VERSION,
+                    "deck": deck["slug"] if deck else None,
                 }),
                 "application/json",
                 {"Cache-Control": "public, max-age=3600"},
@@ -1826,6 +1863,16 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     start_build(version, user["id"])
                     self._redirect("/releases")
+        elif path == "/deck/new":
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"))
+            if user is None:
+                self._redirect("/login")
+            elif user["role"] != "admin" or not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
+            else:
+                add_deck(form.get("name", [""])[0])
+                self._redirect("/deck")
         elif path == "/api/reupload":
             if not CFG.pipeline_api_key or not self._bearer_ok(CFG.pipeline_api_key):
                 self._json(401, {"error": "Unauthorized."})
@@ -1863,7 +1910,7 @@ class Handler(BaseHTTPRequestHandler):
                         count = int(qs.get("note_count", ["0"])[0])
                         with db() as conn:
                             info = releases.store_baseline(conn, version, count, raw, now())
-                        _official_cache["key"] = None
+                        _official_cache.clear()
                         self._json(200, info)
                     except ValueError as e:
                         self._json(400, {"error": str(e)})
@@ -2589,6 +2636,19 @@ def create_upload(label, notes):
         return cur.lastrowid, summary
 
 
+def add_deck(name):
+    """Create an empty deck; its slug is derived from the name."""
+    name = (name or "").strip()[:80]
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    if not name or not slug:
+        return None
+    with db() as conn:
+        if conn.execute("SELECT 1 FROM decks WHERE slug=?", (slug,)).fetchone():
+            return None
+        return conn.execute("INSERT INTO decks (slug, name, created_at) VALUES (?,?,?)",
+                            (slug, name, now())).lastrowid
+
+
 DECK_MARGIN = 400 * 1024 * 1024   # headroom beyond the file itself
 DECK_MAX = 6 * 1024 ** 3
 
@@ -2664,6 +2724,9 @@ def render_deck(user, csrf):
         retired = conn.execute("SELECT COUNT(*) FROM notes WHERE retired=1").fetchone()[0]
         media = conn.execute("SELECT COUNT(*) FROM media").fetchone()[0]
         cur = releases.current_release(conn)
+        decks = [dict(r) for r in conn.execute(
+            "SELECT d.id, d.slug, d.name, (SELECT COUNT(*) FROM notes n WHERE n.platform_deck=d.id AND n.retired=0) AS cards "
+            "FROM decks d ORDER BY d.id")]
         ups = [dict(r) for r in conn.execute(
             "SELECT id, label, status, created_at FROM uploads ORDER BY id DESC LIMIT 15")]
     free = shutil.disk_usage(releases.blob_root()).free if os.path.isdir(releases.blob_root()) else 0
@@ -2708,9 +2771,26 @@ b.addEventListener('click',function(){{
 </script>"""
     else:
         form = '<p class="small">Only administrators can upload a deck file.</p>'
+    deck_rows = "".join(
+        f'<tr><td><b>{esc(d["name"])}</b></td><td><code>{esc(d["slug"])}</code></td><td>{d["cards"]:,} cards</td>'
+        f'<td></td></tr>'
+        for d in decks)
+    add_deck = ""
+    if user["role"] == "admin":
+        add_deck = f"""
+<form method="post" action="/deck/new" class="create-form">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <input type="text" name="name" placeholder="New deck name, e.g. Pathoma companion" required>
+  <button type="submit" class="secondary">Add deck</button>
+</form>
+<p class="small">Each deck has its own cards, releases and download. The add-on is pinned to one deck, so
+students of one deck never see another. Release versions must be unique across decks (e.g. <code>pathoma-1.0</code>).</p>"""
     body = f"""
 <h1>Deck</h1>
 <p class="sub">The online deck is the master copy every release is cut from.</p>
+<h2>Decks</h2>
+<table class="tbl"><tr><th>Name</th><th>Add-on id</th><th>Cards</th><th></th></tr>{deck_rows}</table>
+{add_deck}
 <div class="card"><div class="proposal">
   <p style="margin:0"><b>Doctorine</b> &middot; {n:,} active cards{f' &middot; {retired:,} retired' if retired else ''}
   &middot; {media:,} media files &middot; current release {esc(cur or '—')}</p>
@@ -3044,7 +3124,7 @@ def _build_release(version):
                 (col_path, now(), json.dumps({"patch": counts, "package": info}), version))
             conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('current_release', ?)", (version,))
         _prune_collections()
-        _official_cache["key"] = None
+        _official_cache.clear()
     except Exception as e:  # recorded, never raised into the thread
         import traceback
         with db() as conn:
@@ -3182,19 +3262,20 @@ def media_for_package(conn):
 _MEDIA_REF = re.compile(r'(?:src=["\']|\[sound:)([^"\'\]]+)')
 
 
-def _release_order(conn):
+def _release_order(conn, deck_id=1):
     return [r["version"] for r in conn.execute(
-        "SELECT version FROM releases WHERE status='published' ORDER BY published_at, created_at")]
+        "SELECT version FROM releases WHERE status='published' AND COALESCE(platform_deck,1)=? "
+        "ORDER BY published_at, created_at", (deck_id,))]
 
 
-def sync_payload(conn, since):
+def sync_payload(conn, since, deck_id=1):
     """Changes a collection at release `since` needs to reach the current release.
 
     Collapses multiple revisions of one field to its final value and reports
     `before` (the field at `since`) so the add-on can tell a local edit from
     an untouched card. Unknown `since` → everything after the first release.
     """
-    order = _release_order(conn)
+    order = _release_order(conn, deck_id)
     current = order[-1] if order else None
     baseline_missing = since not in order
     later = order[order.index(since) + 1:] if not baseline_missing else order[1:]

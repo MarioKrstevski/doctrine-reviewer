@@ -45,7 +45,7 @@ def _save(directory, guids, release, etag, fetched_at):
         pass
 
 
-def refresh(directory, api_base, fetch, now, force=False):
+def refresh(directory, api_base, fetch, now, force=False, deck=""):
     """fetch(url, headers) -> (status, headers_dict, body_bytes). Never raises."""
     current = load(directory)
     if current and not force and now() - current.fetched_at < MIN_INTERVAL:
@@ -54,7 +54,7 @@ def refresh(directory, api_base, fetch, now, force=False):
     if current and current.etag:
         headers["If-None-Match"] = current.etag
     try:
-        status, resp_headers, body = fetch(api_base.rstrip("/") + "/api/official", headers)
+        status, resp_headers, body = fetch(api_base.rstrip("/") + "/api/official" + (f"?deck={deck}" if deck else ""), headers)
         if status == 304 and current:
             _save(directory, current.guids, current.release, current.etag, now())
             return current

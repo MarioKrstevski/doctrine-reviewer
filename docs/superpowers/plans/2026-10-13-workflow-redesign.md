@@ -49,7 +49,7 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       "replace this deck (re-upload)" or "new deck"; id-overlap check refuses a
       replacement whose ids mostly differ; re-upload → diff review (existing);
       `/api/media/claim` so the CLI skips uploading blobs already on disk.
-- [ ] **T9 Multi-deck.** `decks` table; `deck_id` on scoped tables (default 1);
+- [x] **T9 Multi-deck.** (done as foundation: decks table, platform_deck columns, per-deck official/sync/where, add-on pinned by DECK_SLUG, Add deck on Deck page. Not yet: per-deck release building UI and import into a second deck; release versions must be unique across decks) `decks` table; `deck_id` on scoped tables (default 1);
       queries filter by active deck; `/where` returns deck slug; add-on pinned to it.
 - [ ] **T10 Detection.** Licenses table; per-download license token; installs table
       from pings; page listing licenses by install count with thresholds.

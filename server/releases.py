@@ -88,8 +88,12 @@ def store_baseline(conn, version, note_count, data, now):
     return {"version": version, "path": path, "size": len(data)}
 
 
-def current_release(conn):
-    row = conn.execute("SELECT value FROM settings WHERE key='current_release'").fetchone()
+def current_release_key(deck_id=1):
+    return "current_release" if deck_id == 1 else f"current_release:{deck_id}"
+
+
+def current_release(conn, deck_id=1):
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (current_release_key(deck_id),)).fetchone()
     return row["value"] if row else None
 
 
