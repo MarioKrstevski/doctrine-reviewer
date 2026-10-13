@@ -164,7 +164,8 @@ UI_CSS = """
 /* ---- sidebar (shadcn-style) ---- */
 .staff { grid-template-columns:248px minmax(0,1fr); }
 .sidebar { padding:12px; gap:2px; overflow-y:auto; }
-.sidebar nav { display:flex; flex-direction:column; gap:2px; flex:1; padding-top:6px; }
+.sidebar nav { display:flex; flex-direction:column; gap:2px; flex:1; padding-top:6px; margin-left:0; }
+.sidebar nav a { margin-left:0; padding-bottom:8px; }
 .sidebar .group { padding:16px 10px 6px; font-size:11px; letter-spacing:.1em; color:#7FA0B6; }
 .sidebar a { gap:10px; border-radius:8px; padding:8px 10px; color:#C9DCEA; font-size:14px; font-weight:500; }
 .sidebar a svg { flex:none; opacity:.85; }
