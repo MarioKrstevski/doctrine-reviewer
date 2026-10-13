@@ -104,18 +104,23 @@ class BuildTest(unittest.TestCase):
                 cur = releases.current_release(conn)
             self.assertEqual("published", rel["status"], rel.get("build_log"))
             self.assertEqual("1.1", cur)
-            self.assertTrue(os.path.exists(rel["package_path"]))
-            import sys; sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
+            self.assertIsNone(rel["package_path"], "packages are never stored")
+            import sys, http.client, urllib.parse; sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "tools"))
             import apkg, release_build as rb
-            pkg = apkg.Package(rel["package_path"])
-            self.assertEqual({"0": "pic.png"}, pkg.media_names())
+            u = urllib.parse.urlparse(base)
+            hc = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+            hc.request("GET", "/download/release/latest", headers={"Cookie": cookie})
+            body = hc.getresponse().read(); hc.close()
+            tmp_pkg = rel["collection_path"] + ".apkg"; open(tmp_pkg, "wb").write(body)
+            pkg = apkg.Package(tmp_pkg)
+            self.assertEqual({"0": "pic.png", "1": "_doctrine_license.json"}, pkg.media_names())
             col = pkg.collection_sqlite()
-            tmp = rel["package_path"] + ".col"; open(tmp, "wb").write(col)
+            tmp = rel["collection_path"] + ".col"; open(tmp, "wb").write(col)
             c = rb.connect(tmp)
             self.assertEqual("<b>p53</b> NEW\x1fe", c.execute("SELECT flds FROM notes WHERE guid='guidAAAAAA'").fetchone()[0])
             pkg.close()
 
-    def test_a_second_publish_removes_the_older_package_file(self):
+    def test_a_second_publish_keeps_both_collections(self):
         with running_server() as base:
             cookie = self._cut(base)
             request(base, "POST", "/releases/1.1/build", {"csrf": csrf_for(cookie), "confirm": "1.1"}, cookie=cookie)
@@ -133,11 +138,11 @@ class BuildTest(unittest.TestCase):
                     r12 = dict(conn.execute("SELECT * FROM releases WHERE version='1.2'").fetchone())
                 if r12["status"] == "published": break
                 time.sleep(0.1)
-            self.assertFalse(os.path.exists(r11["package_path"]), "older .apkg should be removed to save space")
-            self.assertTrue(os.path.exists(r12["package_path"]))
+            self.assertIsNone(r12["package_path"])
             with server.db() as conn:
-                self.assertTrue(os.path.exists(conn.execute("SELECT collection_path FROM releases WHERE version='1.1'").fetchone()[0]),
-                                "per-version collection stays so 1.1 can be rebuilt")
+                for v in ("1.1", "1.2"):
+                    self.assertTrue(os.path.exists(conn.execute(
+                        "SELECT collection_path FROM releases WHERE version=?", (v,)).fetchone()[0]))
 
     def test_updates_page_groups_by_release(self):
         with running_server() as base:
@@ -171,11 +176,13 @@ class DownloadTest(unittest.TestCase):
             conn = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
             conn.request("GET", "/download/release/latest", headers={"Cookie": cookie})
             r = conn.getresponse(); body = r.read(); headers = dict(r.getheaders()); status = r.status; conn.close()
-            expected = open(rel["package_path"], "rb").read()
+        import io, zipfile
         self.assertEqual(200, status)
-        self.assertEqual(str(len(expected)), headers["Content-Length"])
+        self.assertNotIn("Content-Length", headers)
         self.assertIn("Doctorine-1.1.apkg", headers["Content-Disposition"])
-        self.assertEqual(expected, body)
+        z = zipfile.ZipFile(io.BytesIO(body))
+        self.assertIsNone(z.testzip())
+        self.assertIn("collection.anki21b", z.namelist())
 
     def test_token_download(self):
         with running_server() as base:
@@ -215,22 +222,5 @@ class TokenPageTest(unittest.TestCase):
             self.assertEqual(404, request(base, "GET", f"/dl/{tok}")[0])
 
 
-class RebuildTest(unittest.TestCase):
-    def test_a_published_release_without_a_package_can_be_rebuilt(self):
-        with running_server() as base:
-            cookie, rel = DownloadTest._published(self, base)
-            os.remove(rel["package_path"])
-            with server.db() as conn:
-                conn.execute("UPDATE releases SET package_path=NULL WHERE version='1.1'")
-            _, _, html = request(base, "GET", "/releases", cookie=cookie)
-            self.assertIn("Rebuild package", html)
-            status, _, _ = request(base, "POST", "/releases/1.1/rebuild", {"csrf": csrf_for(cookie)}, cookie=cookie)
-            self.assertEqual(303, status)
-            for _ in range(100):
-                with server.db() as conn:
-                    r = dict(conn.execute("SELECT * FROM releases WHERE version='1.1'").fetchone())
-                if r["package_path"] and os.path.exists(r["package_path"]): break
-                time.sleep(0.1)
-            rebuilt = bool(r["package_path"]) and os.path.exists(r["package_path"])
-        self.assertTrue(rebuilt)
-        self.assertEqual("published", r["status"])
+if __name__ == "__main__":
+    unittest.main()

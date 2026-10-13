@@ -193,34 +193,77 @@ def zstd_compress(data, level=3):
     return _subprocess.run(["zstd", "-q", f"-{level}", "-c"], input=data, capture_output=True, check=True).stdout
 
 
+def _fill_zip(z, collection_path, media, level):
+    """Write the package members into open zip `z`. media items are
+    (filename, path_on_disk) or (filename, bytes)."""
+    entries = []
+    nbytes = 0
+    z.writestr("meta", META_V3)
+    with open(collection_path, "rb") as fh:
+        z.writestr("collection.anki21b", zstd_compress(fh.read(), level))
+    with _tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as stub:
+        stub_path = stub.name
+    try:
+        c = sqlite3.connect(stub_path); c.executescript(LEGACY_STUB_SQL); c.commit(); c.close()
+        z.write(stub_path, "collection.anki2")
+    finally:
+        _os.unlink(stub_path)
+    for i, (name, src) in enumerate(media):
+        h = _hashlib.sha1()
+        size = 0
+        if isinstance(src, (bytes, bytearray)):
+            with z.open(str(i), "w", force_zip64=True) as dst:
+                dst.write(src)
+            h.update(src); size = len(src)
+        else:
+            with open(src, "rb") as fh, z.open(str(i), "w", force_zip64=True) as dst:
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    h.update(chunk); size += len(chunk); dst.write(chunk)
+        entries.append((name, size, h.digest()))
+        nbytes += size
+    z.writestr("media", encode_media_manifest(entries))
+    return {"media": len(entries), "bytes": nbytes + _os.path.getsize(collection_path)}
+
+
 def write_apkg(out_path, collection_path, media, level=3):
     """media: iterable of (filename, path_on_disk). Streams every file into
     the zip, so a 2 GB package never sits in memory. Returns counts."""
     tmp = out_path + ".tmp"
-    entries = []
-    nbytes = 0
     with _zipfile.ZipFile(tmp, "w", _zipfile.ZIP_DEFLATED, allowZip64=True) as z:
-        z.writestr("meta", META_V3)
-        with open(collection_path, "rb") as fh:
-            z.writestr("collection.anki21b", zstd_compress(fh.read(), level))
-        with _tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as stub:
-            stub_path = stub.name
-        try:
-            c = sqlite3.connect(stub_path); c.executescript(LEGACY_STUB_SQL); c.commit(); c.close()
-            z.write(stub_path, "collection.anki2")
-        finally:
-            _os.unlink(stub_path)
-        for i, (name, path) in enumerate(media):
-            h = _hashlib.sha1()
-            size = 0
-            with open(path, "rb") as src, z.open(str(i), "w", force_zip64=True) as dst:
-                while True:
-                    chunk = src.read(1 << 20)
-                    if not chunk:
-                        break
-                    h.update(chunk); size += len(chunk); dst.write(chunk)
-            entries.append((name, size, h.digest()))
-            nbytes += size
-        z.writestr("media", encode_media_manifest(entries))
+        info = _fill_zip(z, collection_path, media, level)
     _os.replace(tmp, out_path)
-    return {"media": len(entries), "bytes": nbytes + _os.path.getsize(collection_path)}
+    return info
+
+
+class _Sink:
+    """Write-only, non-seekable file object; zipfile then uses data descriptors."""
+    def __init__(self, write):
+        self._write = write
+
+    def write(self, data):
+        self._write(data)
+        return len(data)
+
+    def flush(self):
+        pass
+
+
+def license_member(token, version):
+    import json as _json
+    return ("_doctrine_license.json",
+            _json.dumps({"license": token, "release": version}).encode())
+
+
+def stream_apkg(write, collection_path, media, license=None, level=3):
+    """Build the package straight into write(bytes); nothing touches disk.
+    Media is already compressed, so members are stored. `license` is an
+    optional (filename, bytes) extra media member (see license_member)."""
+    items = list(media)
+    if license:
+        items.append(license)
+    sink = _Sink(write)
+    with _zipfile.ZipFile(sink, "w", _zipfile.ZIP_STORED, allowZip64=True) as z:
+        return _fill_zip(z, collection_path, items, level)

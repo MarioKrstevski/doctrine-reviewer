@@ -163,3 +163,23 @@ def stamp_guids(conn, version, guids):
 
 def unstamp(conn, version):
     return conn.execute("UPDATE revisions SET release=NULL WHERE release=?", (version,)).rowcount
+
+
+def text_at(conn, guid, included, row_fields=None):
+    """Editable fields of `guid` as they were once the releases in `included`
+    (a set of version strings) shipped. Edits not stamped to one of them, whether
+    still pending or cut later, are ignored. `row_fields` is the note's current
+    fields, used for fields that have no revision at all."""
+    out = {}
+    for field in EDITABLE_FIELDS:
+        rows = conn.execute(
+            "SELECT release, before, after FROM revisions WHERE guid=? AND field=? ORDER BY id",
+            (guid, field)).fetchall()
+        done = [r for r in rows if r["release"] in included]
+        if done:
+            out[field] = done[-1]["after"]
+        elif rows:
+            out[field] = rows[0]["before"]
+        elif row_fields is not None and field in row_fields:
+            out[field] = row_fields[field]
+    return out

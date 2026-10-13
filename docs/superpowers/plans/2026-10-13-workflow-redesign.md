@@ -25,9 +25,9 @@ studynavigator.com (navy/blue/teal/cream, Fraunces + Plus Jakarta Sans).
       no staff links; staff sidebar (Inbox, Cards, Next release, Releases, Outbox,
       Deck, Detection, Settings) with counts; tests that anonymous pages contain no
       staff links.
-- [ ] **T2 Release text at version.** `revisions.text_at(conn, guid, release_order)`;
+- [x] **T2 Release text at version.** (done) `revisions.text_at(conn, guid, release_order)`;
       build and sync use it. Test: edit after cut does not leak.
-- [ ] **T3 Streamed downloads.** `release_build.stream_apkg(write, collection, media,
+- [x] **T3 Streamed downloads.** (done; HTTP/1.0 streamed zip, no Content-Length, keeps 2 newest collections) `release_build.stream_apkg(write, collection, media,
       license=None)` with ZIP_STORED and precomputed length; `/dl/<token>` and staff
       downloads stream; no package files; keep latest + previous collection, delete
       older. Tests: round-trip via `tools/apkg.py`, Content-Length exact, license file

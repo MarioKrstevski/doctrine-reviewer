@@ -1465,6 +1465,23 @@ class Handler(BaseHTTPRequestHandler):
         supplied = form.get("csrf", [""])[0]
         return bool(token) and auth.csrf_ok(supplied, token, session_secret())
 
+    def _send_package(self, collection_path, version, license_id):
+        """Build the .apkg on the fly. No Content-Length (HTTP/1.0, closes at the end)."""
+        with db() as conn:
+            media = media_for_package(conn)
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="Doctorine-{version}.apkg"')
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            release_build.stream_apkg(self.wfile.write, collection_path, media,
+                                      license=release_build.license_member(license_id, version))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def _send_file(self, path, filename, ctype="application/octet-stream"):
         size = os.path.getsize(path)
         self.send_response(200)
@@ -1590,7 +1607,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, page("Not found", "<h1>Link not valid</h1><p>This download link is "
                                      "unknown, expired, or no release is published yet.</p>"))
             else:
-                self._send_file(pkg, f"Doctorine-{version}.apkg")
+                lic = hashlib.sha256(token.encode()).hexdigest()[:16]
+                self._send_package(pkg, version, lic)
         elif path == "/releases" or path.startswith("/download/release/"):
             user = self._current_user()
             if user is None:
@@ -1604,7 +1622,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not pkg:
                     self._send(404, page("Not found", "<h1>No package for that release</h1>"))
                 else:
-                    self._send_file(pkg, f"Doctorine-{version}.apkg")
+                    self._send_package(pkg, version, "staff")
         elif path.startswith("/uploads/"):
             user = self._current_user()
             if user is None:
@@ -1696,7 +1714,7 @@ class Handler(BaseHTTPRequestHandler):
                 code, obj = 400, {"error": "Invalid JSON."}
             self._json(code, obj)
         elif path in ("/releases/cut", "/releases/token", "/releases/token/revoke", "/releases/confirm") or \
-                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard") or path.endswith("/rebuild"))):
+                (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard"))):
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
             if user is None:
@@ -1717,9 +1735,6 @@ class Handler(BaseHTTPRequestHandler):
             elif path.endswith("/discard"):
                 discard_release(path[len("/releases/"):-len("/discard")])
                 self._redirect("/releases/next")
-            elif path.endswith("/rebuild"):
-                start_rebuild(path[len("/releases/"):-len("/rebuild")], user["id"])
-                self._redirect("/releases")
             elif path == "/releases/token/revoke":
                 if user["role"] != "admin":
                     self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Administrators only.</p>"))
@@ -2739,6 +2754,16 @@ to students through the add-on and the download links. It cannot be undone from 
     return page("Build release", body, "releases", user, csrf)
 
 
+def _versions_through(conn, version):
+    """Versions of every release cut up to and including `version`, in cut order."""
+    out = []
+    for r in conn.execute("SELECT version FROM releases ORDER BY rowid"):
+        out.append(r["version"])
+        if r["version"] == version:
+            return out
+    return out
+
+
 def _build_release(version):
     """Runs in a background thread. Patches the previous collection, writes
     the package, publishes, and removes older package files."""
@@ -2753,17 +2778,21 @@ def _build_release(version):
             changed_guids = {r["guid"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS}
             added_guids = [r["guid"] for r in revs if r["field"] == "added"]
             retired = [r["guid"] for r in revs if r["field"] == "retired"]
+            included = set(_versions_through(conn, version))
             changed = {}
             for guid in changed_guids - set(added_guids):
                 row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
                 fields = json.loads(row["fields_json"]) if row else {}
-                changed[guid] = {f: fields.get(f, "") for f in revisions.EDITABLE_FIELDS if f in fields}
+                at = revisions.text_at(conn, guid, included, fields)
+                changed[guid] = {f: at.get(f, "") for f in revisions.EDITABLE_FIELDS if f in fields}
             new_notes = []
             for guid in added_guids:
                 row = conn.execute("SELECT note_type, fields_json, tags_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
                 if row:
+                    nf = json.loads(row["fields_json"])
+                    nf.update(revisions.text_at(conn, guid, included, nf))
                     new_notes.append({"guid": guid, "note_type": row["note_type"],
-                                      "fields": json.loads(row["fields_json"]),
+                                      "fields": nf,
                                       "tags": json.loads(row["tags_json"] or "[]")})
             media = [(r["filename"], releases.sha_path(r["sha256"]))
                      for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")]
@@ -2773,24 +2802,15 @@ def _build_release(version):
         col_path = os.path.join(d, "collection.sqlite")
         counts = release_build.patch_collection(prev["collection_path"], col_path, changed, new_notes,
                                                 retired, now=int(datetime.now(timezone.utc).timestamp()))
-        pkg_path = os.path.join(d, f"Doctorine-{version}.apkg")
-        info = release_build.write_apkg(pkg_path, col_path, [m for m in media if os.path.exists(m[1])])
+        info = {"media": len(media), "stored_package": False}
 
         with db() as conn:
             conn.execute(
-                "UPDATE releases SET status='published', collection_path=?, package_path=?, "
+                "UPDATE releases SET status='published', collection_path=?, package_path=NULL, "
                 "published_at=?, build_log=? WHERE version=?",
-                (col_path, pkg_path, now(), json.dumps({"patch": counts, "package": info}), version))
+                (col_path, now(), json.dumps({"patch": counts, "package": info}), version))
             conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('current_release', ?)", (version,))
-            # Keep only the newest package on disk; collections stay per version.
-            for r in conn.execute("SELECT version, package_path FROM releases WHERE version != ? "
-                                  "AND package_path IS NOT NULL", (version,)).fetchall():
-                try:
-                    if r["package_path"] and os.path.exists(r["package_path"]):
-                        os.remove(r["package_path"])
-                except OSError:
-                    pass
-                conn.execute("UPDATE releases SET package_path=NULL WHERE version=?", (r["version"],))
+        _prune_collections()
         _official_cache["key"] = None
     except Exception as e:  # recorded, never raised into the thread
         import traceback
@@ -2799,29 +2819,19 @@ def _build_release(version):
                          (f"{e}\n{traceback.format_exc()}", version))
 
 
-def start_rebuild(version, user_id):
-    """Produce the package for an already-published release from its own
-    collection file. Does not change what is current."""
+def _prune_collections(keep=2):
+    """Keep the newest `keep` release collections on disk; older ones are not
+    needed to build the next release or to serve downloads."""
     with db() as conn:
-        rel = conn.execute("SELECT status, collection_path FROM releases WHERE version=?", (version,)).fetchone()
-        if rel is None or rel["status"] != "published" or not rel["collection_path"]:
-            return False
-
-    def run():
-        try:
-            with db() as conn:
-                col_path = conn.execute("SELECT collection_path FROM releases WHERE version=?", (version,)).fetchone()["collection_path"]
-                media = [(r["filename"], releases.sha_path(r["sha256"]))
-                         for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")]
-            pkg_path = os.path.join(releases.release_dir(version), f"Doctorine-{version}.apkg")
-            release_build.write_apkg(pkg_path, col_path, [m for m in media if os.path.exists(m[1])])
-            with db() as conn:
-                conn.execute("UPDATE releases SET package_path=? WHERE version=?", (pkg_path, version))
-        except Exception as e:
-            with db() as conn:
-                conn.execute("UPDATE releases SET build_log=? WHERE version=?", (f"rebuild failed: {e!r}", version))
-    threading.Thread(target=run, daemon=True).start()
-    return True
+        rows = conn.execute("SELECT version, collection_path FROM releases WHERE status='published' "
+                            "AND collection_path IS NOT NULL ORDER BY published_at DESC, rowid DESC").fetchall()
+        for r in rows[keep:]:
+            try:
+                if os.path.exists(r["collection_path"]):
+                    os.remove(r["collection_path"])
+            except OSError:
+                continue
+            conn.execute("UPDATE releases SET collection_path=NULL WHERE version=?", (r["version"],))
 
 
 def start_build(version, user_id):
@@ -2851,12 +2861,10 @@ def render_releases(user, csrf, notice=None, token_link=None):
         elif r["status"] == "building":
             act = '<span class="badge warn">Building…</span>'
         elif r["status"] == "published":
-            if r.get("package_path") and os.path.exists(r["package_path"]):
+            if r.get("collection_path") and os.path.exists(r["collection_path"]):
                 act = f'<span class="badge ok">Published</span> <a class="btn-link" href="/download/release/{esc(r["version"])}">Download</a>'
             else:
-                act = (f'<span class="badge ok">Published</span> '
-                       f'<form method="post" action="/releases/{esc(r["version"])}/rebuild" class="inline">'
-                       f'<input type="hidden" name="csrf" value="{csrf}"><button class="ghost">Rebuild package</button></form>')
+                act = '<span class="badge ok">Published</span> <span class="small">older release, no longer downloadable</span>'
         log = f'<details class="trace"><summary>Build log</summary><pre>{esc(r["build_log"] or "")}</pre></details>' if r.get("build_log") else ""
         items.append(f"""
 <div class="card"><div class="card-head">
@@ -2917,14 +2925,23 @@ def mint_download_token(note, days, user_id):
 
 
 def latest_package(conn):
-    r = conn.execute("SELECT version, package_path FROM releases WHERE status='published' AND package_path IS NOT NULL "
-                     "ORDER BY published_at DESC LIMIT 1").fetchone()
-    return (r["version"], r["package_path"]) if r and os.path.exists(r["package_path"]) else (None, None)
+    """(version, collection_path) of the current release, or (None, None).
+    Packages are never stored; they are built from this file on download."""
+    r = conn.execute("SELECT version, collection_path FROM releases WHERE status='published' "
+                     "AND collection_path IS NOT NULL ORDER BY published_at DESC, rowid DESC LIMIT 1").fetchone()
+    return (r["version"], r["collection_path"]) if r and os.path.exists(r["collection_path"]) else (None, None)
 
 
 def package_for_version(conn, version):
-    r = conn.execute("SELECT version, package_path FROM releases WHERE version=? AND status='published'", (version,)).fetchone()
-    return (r["version"], r["package_path"]) if r and r["package_path"] and os.path.exists(r["package_path"]) else (None, None)
+    r = conn.execute("SELECT version, collection_path FROM releases WHERE version=? AND status='published'",
+                     (version,)).fetchone()
+    return (r["version"], r["collection_path"]) if r and r["collection_path"] and os.path.exists(r["collection_path"]) else (None, None)
+
+
+def media_for_package(conn):
+    return [(r["filename"], releases.sha_path(r["sha256"]))
+            for r in conn.execute("SELECT filename, sha256 FROM media ORDER BY filename")
+            if os.path.exists(releases.sha_path(r["sha256"]))]
 
 
 # ---------------------------------------------------------------- sync
@@ -2964,13 +2981,15 @@ def sync_payload(conn, since):
         elif r["field"] in revisions.EDITABLE_FIELDS:
             touched.add(r["guid"])
             before.setdefault(r["guid"], {}).setdefault(r["field"], r["before"])
+    shipped = set(order)
     changed, added_out, media = [], [], set()
     for guid in sorted(touched - set(added) - set(retired)):
         row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
         if row is None:
             continue
         fields = json.loads(row["fields_json"] or "{}")
-        now_fields = {f: fields.get(f, "") for f in revisions.EDITABLE_FIELDS}
+        at = revisions.text_at(conn, guid, shipped, fields)
+        now_fields = {f: at.get(f, "") for f in revisions.EDITABLE_FIELDS}
         b = {f: before[guid].get(f, now_fields[f]) for f in revisions.EDITABLE_FIELDS}
         changed.append({"guid": guid, "fields": now_fields, "before": b})
         for f in now_fields.values():
@@ -2980,6 +2999,7 @@ def sync_payload(conn, since):
         if row is None:
             continue
         fields = json.loads(row["fields_json"] or "{}")
+        fields.update(revisions.text_at(conn, guid, shipped, fields))
         added_out.append({"guid": guid, "note_type": row["note_type"], "fields": fields,
                           "tags": json.loads(row["tags_json"] or "[]")})
         for f in fields.values():
