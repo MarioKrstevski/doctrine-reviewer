@@ -487,18 +487,22 @@ border:2px solid #fff}}
 
 BASE_CSS = """
 :root {
-  --paper:#F6F4EE; --card:#FFFFFF; --panel:#FAF9F4;
-  --ink:#1E2A25; --muted:#5F6B66; --faint:#89938D;
-  --line:#E4E1D8; --line-strong:#CDC9BD;
-  --accent:#0E5F50; --accent-ink:#0A4A3F;
-  --accent-soft:#E3EFE9; --accent-border:#C2DAD1;
+  /* Study Navigator brand (studynavigator.com) */
+  --navy:#0F2A3D; --navy-mid:#14324A; --navy-soft:#1B3E59;
+  --blue:#57B9FF; --blue-light:#90D5FF; --teal:#77D1D4; --slate:#517891;
+  --paper:#FAF7F0; --card:#FFFFFF; --panel:#F6F2E8;
+  --ink:#122031; --muted:#4C6270; --faint:#6E8494;
+  --line:#E7DFCE; --line-strong:#D6CCB6;
+  --accent:#2F86C9; --accent-ink:#14324A;
+  --accent-soft:#E9F3FD; --accent-border:#90D5FF;
   --warn:#8A5800; --warn-soft:#F6EDD7; --warn-border:#E3D1A6;
   --bad:#943030; --bad-soft:#F5E4E1; --bad-border:#E1C1BB;
-  --dim-soft:#ECEAE2; --code-bg:#F1EFE8;
-  --serif:"Source Serif 4", Georgia, "Iowan Old Style", serif;
-  --sans:"Source Sans 3", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --dim-soft:#EFEAE0; --code-bg:#F1ECE0;
+  --serif:"Fraunces", Georgia, "Times New Roman", serif;
+  --sans:"Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono:ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --shadow:0 1px 2px rgba(30,42,37,.05), 0 6px 18px rgba(30,42,37,.05);
+  --shadow:0 12px 30px -14px rgba(15,42,61,.18);
+  --radius:16px;
 }
 * { box-sizing:border-box; }
 html { -webkit-text-size-adjust:100%; }
@@ -708,65 +712,107 @@ LEDGER_CSS = """
 """
 
 
+SHELL_CSS = """
+header.site { background:var(--navy); color:#fff; border-bottom:none; }
+header.site .wrap { display:flex; align-items:center; gap:18px; padding:16px 24px; }
+header.site .brand { color:#fff; font-family:var(--serif); font-size:22px; font-weight:600; }
+header.site .brand small { color:var(--blue-light); }
+header.site nav { margin-left:auto; }
+header.site nav a { color:#D6E6F2; margin-left:22px; font-size:14px; font-weight:500; text-decoration:none; }
+header.site nav a:hover, header.site nav a.active { color:#fff; box-shadow:inset 0 -2px 0 var(--blue); }
+.staff { display:grid; grid-template-columns:232px minmax(0,1fr); min-height:100vh; }
+.sidebar { background:var(--navy); color:#D6E6F2; padding:20px 14px; position:sticky; top:0;
+  height:100vh; display:flex; flex-direction:column; gap:4px; }
+.sidebar .brand { color:#fff; font-family:var(--serif); font-size:20px; font-weight:600; padding:4px 10px 16px; }
+.sidebar .brand small { display:block; color:var(--blue-light); font-family:var(--sans); font-size:10.5px;
+  letter-spacing:.14em; text-transform:uppercase; margin:2px 0 0; }
+.sidebar .group { font-size:10.5px; letter-spacing:.12em; text-transform:uppercase; color:var(--slate);
+  padding:14px 10px 4px; }
+.sidebar a { display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:10px;
+  color:#D6E6F2; text-decoration:none; font-size:14px; font-weight:500; }
+.sidebar a:hover { background:var(--navy-soft); color:#fff; }
+.sidebar a.active { background:var(--navy-mid); color:#fff; box-shadow:inset 3px 0 0 var(--blue); }
+.sidebar a .count { margin-left:auto; background:var(--blue); color:var(--navy); }
+.sidebar .who { margin-top:auto; padding:12px 10px 0; border-top:1px solid var(--navy-soft); font-size:12.5px; }
+.sidebar .who form { display:flex; align-items:center; gap:8px; }
+.sidebar .who button { background:transparent; border:1px solid var(--slate); color:#D6E6F2;
+  padding:3px 10px; font-size:12px; border-radius:8px; }
+.staff main .wrap { max-width:1180px; }
+button { background:var(--navy); border-color:var(--navy); border-radius:10px; }
+button:hover { background:var(--navy-soft); border-color:var(--navy-soft); }
+.card, .status-hero, .empty { border-radius:var(--radius); }
+.count { background:var(--accent); }
+@media (max-width:900px) { .staff { grid-template-columns:1fr; }
+  .sidebar { position:static; height:auto; flex-direction:row; flex-wrap:wrap; }
+  .sidebar .group, .sidebar .who { display:none; } }
+"""
+
+FONTS_LINK = ('<link rel="preconnect" href="https://fonts.googleapis.com">'
+              '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+              '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400..700'
+              '&family=Plus+Jakarta+Sans:ital,wght@0,400..700;1,400&display=swap">')
+
+
+def _staff_counts():
+    with db() as conn:
+        inbox = conn.execute("SELECT COUNT(DISTINCT doctrine_id) FROM suggestions WHERE status='open'").fetchone()[0]
+        nxt = conn.execute("SELECT COUNT(DISTINCT guid) FROM revisions WHERE release IS NULL").fetchone()[0]
+    return inbox, nxt, pending_thank_yous()
+
+
 def page(title, body, active="", user=None, csrf=""):
-    def nav_link(href, label, key):
-        cls = ' class="active"' if key == active else ""
-        return f'<a href="{href}"{cls}>{label}</a>'
-    admin_link = (nav_link("/admin/users", "Reviewers", "admin")
-                  if user and user.get("role") == "admin" else "")
-    outbox_link = ""
-    if user:
-        n = pending_thank_yous()
-        count = f' <span class="count">{n}</span>' if n else ""
-        cls = ' class="active"' if active == "outbox" else ""
-        outbox_link = f'<a href="/outbox"{cls}>Outbox{count}</a>'
-        pcls = ' class="active"' if active == "pending" else ""
-        outbox_link += f'<a href="/releases/next"{pcls}>Next release</a>'
-        rcls = ' class="active"' if active == "releases" else ""
-        outbox_link += f'<a href="/releases"{rcls}>Releases</a>'
-        ccls = ' class="active"' if active == "cards" else ""
-        outbox_link += f'<a href="/cards"{ccls}>Cards</a>'
-    account_link = nav_link("/account", "Account", "account") if user else ""
-    signed_in = ""
-    if user:
-        signed_in = (
-            f'<form method="post" action="/logout" class="signout">'
-            f'<input type="hidden" name="csrf" value="{csrf}">'
-            f'<span>{esc(user["username"])}</span>'
-            f'<button type="submit">Sign out</button></form>')
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+    head = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{esc(title)} — Doctrine</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400..600;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap">
-<style>{BASE_CSS}{LEDGER_CSS}
-.signout {{ display: inline-flex; align-items: center; gap: 8px;
-  margin-left: auto; font-size: 12px; color: #777; }}
-.signout button {{ padding: 3px 9px; font-size: 12px; cursor: pointer;
-  background: transparent; border: 1px solid #bbb; border-radius: 3px;
-  color: inherit; }}
-header.site .wrap {{ display: flex; align-items: center; gap: 18px; }}
-</style></head><body>
-<header class="site"><div class="wrap">
-  <span class="brand">Doctrine<small>Card quality</small></span>
-  <nav>
-    {nav_link("/updates", "Community updates", "updates")}
-    {nav_link("/install", "Install add-on", "install")}
-    {nav_link("/reviewer", "Reviewer queue", "reviewer")}
-    {outbox_link}{admin_link}{account_link}
-  </nav>{signed_in}
-</div></header>
-<div class="wrap">{body}</div>
-<script>
-document.querySelectorAll('.actions input[name=publish]').forEach(cb => {{
+<title>{esc(title)} — Doctrine</title>{FONTS_LINK}
+<style>{BASE_CSS}{LEDGER_CSS}{SHELL_CSS}</style></head><body>"""
+    script = """<script>
+document.querySelectorAll('.actions input[name=publish]').forEach(cb => {
   const fields = cb.closest('form').querySelector('.pub-fields');
   if (!fields) return;
   const sync = () => fields.classList.toggle('off', !cb.checked);
-  cb.addEventListener('change', sync);
-  sync();
-}});
+  cb.addEventListener('change', sync); sync();
+});
 </script></body></html>"""
+
+    if not user:
+        def pub(href, label, key):
+            cls = ' class="active"' if key == active else ""
+            return f'<a href="{href}"{cls}>{label}</a>'
+        return (head + f"""
+<header class="site"><div class="wrap">
+  <span class="brand">Doctrine<small>Card quality</small></span>
+  <nav>{pub("/updates", "Updates", "updates")}{pub("/install", "Install the add-on", "install")}</nav>
+</div></header>
+<div class="wrap">{body}</div>""" + script)
+
+    inbox, nxt, thanks = _staff_counts()
+
+    def item(href, label, key, n=0):
+        cls = ' class="active"' if key == active else ""
+        c = f'<span class="count">{n}</span>' if n else ""
+        return f'<a href="{href}"{cls}>{label}{c}</a>'
+
+    admin = user.get("role") == "admin"
+    side = f"""
+<aside class="sidebar">
+  <span class="brand">Doctrine<small>Deck workspace</small></span>
+  <span class="group">Review</span>
+  {item("/reviewer", "Inbox", "reviewer", inbox)}
+  {item("/cards", "Cards", "cards")}
+  <span class="group">Ship</span>
+  {item("/releases/next", "Next release", "pending", nxt)}
+  {item("/releases", "Releases", "releases")}
+  {item("/outbox", "Outbox", "outbox", thanks)}
+  <span class="group">Deck</span>
+  {item("/deck", "Deck", "deck")}
+  {item("/detection", "Detection", "detection") if admin else ""}
+  {item("/admin/users", "Settings", "admin") if admin else item("/account", "Account", "account")}
+  {item("/updates", "Public updates", "updates")}
+  <div class="who"><form method="post" action="/logout"><input type="hidden" name="csrf" value="{csrf}">
+  <span>{esc(user["username"])}</span><button type="submit">Sign out</button></form>
+  <a href="/account" style="padding:6px 0 0;font-size:12px">Account</a></div>
+</aside>"""
+    return head + f'<div class="staff">{side}<main><div class="wrap">{body}</div></main></div>' + script
 
 
 # ---------------------------------------------------------------- pages
