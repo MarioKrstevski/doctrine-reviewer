@@ -500,7 +500,7 @@ def card_iframe(q_html, a_html, css, label):
     q_html, a_html = rewrite_media(q_html), rewrite_media(a_html)
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <style>body{{font-family:system-ui,sans-serif;padding:18px;margin:0;
-background:#fff;color:#15201B;font-size:15px;line-height:1.5}}
+background:#fff;color:#122031;font-size:15px;line-height:1.5}}
 hr{{border:none;border-top:1px solid #E4E1D8;margin:16px 0}}
 img{{max-width:100%}}
 ::-webkit-scrollbar{{width:10px;height:10px}}
@@ -610,13 +610,13 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
   font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
 .pane .fields mark { background:#fff1a8; padding:0 2px; border-radius:2px; }
 .count { display:inline-block; min-width:18px; padding:0 6px; margin-left:4px;
-  border-radius:9px; background:var(--accent, #2f6f4f); color:#fff;
+  border-radius:9px; background:var(--accent); color:#fff;
   font-size:11px; text-align:center; line-height:18px; }
 .outbox-body { display:grid; grid-template-columns:1fr 1fr; gap:0; }
 .outbox-col { padding:12px 16px; min-width:0; }
 .outbox-col + .outbox-col { border-left:1px solid var(--line); }
-.outbox-col blockquote { margin:8px 0; padding:10px 12px; background:#f7f7f4;
-  border-left:3px solid #cfd6cf; white-space:pre-wrap; }
+.outbox-col blockquote { margin:8px 0; padding:10px 12px; background:var(--panel);
+  border-left:3px solid var(--line-strong); white-space:pre-wrap; }
 .outbox-col label.small { display:block; font-size:11px; color:var(--muted);
   margin-top:8px; text-transform:uppercase; letter-spacing:.04em; }
 .outbox-col .copyable { width:100%; box-sizing:border-box; font-size:13px;
@@ -629,7 +629,7 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .linkcell { display:flex; gap:6px; align-items:center; min-width:420px; }
 .badge.substantial { background:#e5edf7; color:#2a4a6f; }
 .badge.brief { background:#eee; color:#666; }
-.proposal { padding:10px 16px 12px; border-top:1px solid var(--line); background:#fbfbf8; }
+.proposal { padding:10px 16px 12px; border-top:1px solid var(--line); background:var(--panel); }
 .proposal .fields { padding:8px 0 0; height:auto; max-height:260px; }
 .diff del { background:#fde2e2; color:#8a1f1f; text-decoration:line-through; padding:0 2px; }
 .diff ins { background:#dcf5e4; color:#145a32; text-decoration:none; padding:0 2px; }
@@ -640,8 +640,8 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .btn-link-primary:hover { background:var(--accent-soft); }
 .actions .hint { color:var(--faint); font-size:12.5px; flex:1 1 260px; }
 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
-.chip { font-size:11px; padding:2px 8px; border-radius:10px; background:#eef1ee;
-  color:#3a4a40; border:1px solid #dfe5df; white-space:nowrap; }
+.chip { font-size:11px; padding:2px 8px; border-radius:10px; background:var(--dim-soft);
+  color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
 .trace { padding:6px 16px; font-size:12px; color:var(--muted); }
 .trace summary { cursor:pointer; user-select:none; }
 .trace dl { display:grid; grid-template-columns:max-content 1fr; gap:2px 14px;
@@ -650,7 +650,7 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .trace dd { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 .pane iframe { width:100%; height:270px; border:none; display:block;
   background:#fff; }
-.pane.suggestion { background:#F8FAF7; }
+.pane.suggestion { background:var(--panel); }
 .pane .sugg-body { padding:15px 16px; font-size:14.5px; line-height:1.6;
   white-space:pre-wrap; overflow-wrap:anywhere; flex:1; }
 .pane .sugg-empty { color:var(--faint); font-style:italic; }
@@ -820,7 +820,11 @@ document.querySelectorAll('.actions input[name=publish]').forEach(cb => {
 
     decks, deck_id = deck_context(user)
     side = ui.sidebar(user, decks, deck_id, active, _staff_counts(deck_id), csrf, esc)
-    return head + f'<div class="staff">{side}<main><div class="wrap">{body}</div></main></div>' + script
+    cur = next((d for d in decks if d["id"] == deck_id), decks[0] if decks else None)
+    mbar = (f'<div class="mbar"><button type="button" id="navbtn" aria-label="Menu">Menu</button>'
+            f'<span class="brand">Doctrine</span><span class="deckname">{esc(cur["name"] if cur else "")}</span></div>')
+    return (head + f'<div class="staff">{mbar}<div class="scrim" id="scrim"></div>{side}'
+            f'<main><div class="wrap">{body}</div></main></div>' + script)
 
 
 # ---------------------------------------------------------------- pages
@@ -2292,20 +2296,7 @@ def render_login(error=None, username=""):
   <p class="login-note">No account? Ask an administrator to create one.
   Forgot your password? An administrator can reset it.</p>
 </div>
-<style>
-.login-wrap {{ max-width: 340px; margin: 12vh auto; }}
-.login-form {{ display: flex; flex-direction: column; gap: 6px; }}
-.login-form label {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
-.login-form input {{ padding: 8px; font-size: 15px; border: 1px solid #ccc;
-  border-radius: 4px; }}
-.login-form button {{ margin-top: 16px; padding: 9px; font-size: 15px;
-  cursor: pointer; border: 0; border-radius: 4px; background: #2f6f4f;
-  color: #fff; }}
-.login-error {{ padding: 9px 12px; border-radius: 4px; background: #fdeaea;
-  color: #8a1f1f; font-size: 14px; }}
-.login-note {{ margin-top: 18px; font-size: 12px; color: #777;
-  line-height: 1.5; }}
-</style>"""
+"""
     return page("Sign in", body)
 
 
@@ -2368,27 +2359,7 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
 <p class="admin-note">Deactivating keeps a person's review history intact
 and signs them out immediately. Resetting a password also signs them out.
 There is no email in this system, so hand credentials over directly.</p>
-<style>
-.pw-reveal {{ margin: 16px 0; padding: 14px 16px; border-radius: 6px;
-  background: #eef7f0; border: 1px solid #bcdcc6; }}
-.pw-reveal code {{ display: inline-block; margin: 6px 0; padding: 6px 10px;
-  font-size: 17px; background: #fff; border: 1px solid #ccc; border-radius: 4px; }}
-.pw-note {{ font-size: 12px; color: #55694d; margin: 4px 0 0; }}
-.notice {{ padding: 9px 12px; border-radius: 4px; background: #f4f4f4; }}
-.create-form {{ display: flex; gap: 8px; align-items: center; margin: 18px 0; }}
-.create-form input[type=text] {{ padding: 7px; min-width: 240px;
-  border: 1px solid #ccc; border-radius: 4px; }}
-table.users {{ width: 100%; border-collapse: collapse; }}
-table.users th, table.users td {{ text-align: left; padding: 8px 6px;
-  border-bottom: 1px solid #eee; font-size: 14px; }}
-tr.inactive {{ opacity: 0.5; }}
-.role {{ font-size: 11px; padding: 2px 7px; border-radius: 10px;
-  background: #eee; }}
-.role-admin {{ background: #e5edf7; }}
-form.inline {{ display: inline; }}
-.row-actions {{ text-align: right; }}
-.admin-note {{ margin-top: 22px; font-size: 12px; color: #777; line-height: 1.6; }}
-</style>"""
+"""
     return page("Reviewers", body, "admin", user, csrf)
 
 
@@ -2414,18 +2385,7 @@ def render_account(user, csrf, notice=None, error=None):
 </form>
 <p class="admin-note">Forgot your password? An administrator can reset it.
 There is no email recovery.</p>
-<style>
-.login-form {{ display: flex; flex-direction: column; gap: 6px; }}
-.login-form label {{ font-size: 13px; font-weight: 600; margin-top: 8px; }}
-.login-form input {{ padding: 8px; font-size: 15px; border: 1px solid #ccc;
-  border-radius: 4px; }}
-.login-form button {{ margin-top: 16px; padding: 9px; cursor: pointer;
-  border: 0; border-radius: 4px; background: #2f6f4f; color: #fff; }}
-.login-error {{ padding: 9px 12px; border-radius: 4px; background: #fdeaea;
-  color: #8a1f1f; }}
-.notice {{ padding: 9px 12px; border-radius: 4px; background: #eef7f0; }}
-.admin-note {{ margin-top: 22px; font-size: 12px; color: #777; }}
-</style>"""
+"""
     return page("Your account", body, "account", user, csrf)
 
 
@@ -2622,14 +2582,7 @@ reverts an update right after it runs.</p>
 install the new file. Your settings and pending suggestions are unaffected.</p>
 
 {reviewer_block}
-<style>
-.install-box {{ margin:18px 0 26px; padding:18px 20px; border:1px solid var(--line);
-  border-radius:8px; background:#fafaf7; }}
-.btn-primary {{ display:inline-block; padding:10px 16px; border-radius:6px;
-  background:#2f6f4f; color:#fff !important; text-decoration:none; font-weight:600; }}
-.steps li {{ margin:6px 0; }}
-h2 {{ font-size:16px; margin-top:26px; }}
-</style>"""
+"""
     return page("Install", body, "install", user,
                 auth.csrf_token(session_token, session_secret()) if session_token else "", public=True)
 
@@ -2746,7 +2699,7 @@ EDITOR_SCRIPT = r"""
 EDITOR_CSS = """
 <style>
 .ed-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.15fr); gap:28px; align-items:start; }
-.ed-left blockquote { margin:8px 0 16px; padding:10px 12px; background:#f7f7f4; border-left:3px solid #cfd6cf; white-space:pre-wrap; }
+.ed-left blockquote { margin:8px 0 16px; padding:10px 12px; background:var(--panel); border-left:3px solid var(--line-strong); white-space:pre-wrap; }
 .ed-left .pane { border:1px solid var(--line); border-radius:6px; }
 .ed-field { margin:0 0 18px; }
 .ed-field label { display:block; font-size:11px; font-weight:600; letter-spacing:.06em; text-transform:uppercase;
