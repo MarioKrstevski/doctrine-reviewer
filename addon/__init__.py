@@ -34,7 +34,7 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import ping, versions, addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.7.1"
+ADDON_VERSION = "1.7.2"
 
 SUGGESTION_TYPES = [
     ("typo", "Typo / spelling"),
@@ -85,15 +85,17 @@ API_BASE_OVERRIDE = ""
 # excluded from content hashing, so a profile that was stamped by an older
 # build still hashes identically to a clean import of the same deck.
 LEGACY_ID_FIELD = "DoctrineID"
-BUTTON_TOP_OFFSET = 150
+BUTTON_BOTTOM_OFFSET = 12
 BUTTON_RIGHT_OFFSET = 12
+# Space kept free at the end of the card so the last lines scroll clear of the button.
+BUTTON_CLEARANCE = 52
 
 
 def get_config():
     return {
         "bootstrap_url": DEFAULT_BOOTSTRAP,
         "api_base_override": API_BASE_OVERRIDE,
-        "button_top_offset": BUTTON_TOP_OFFSET,
+        "button_bottom_offset": BUTTON_BOTTOM_OFFSET,
         "button_right_offset": BUTTON_RIGHT_OFFSET,
         "_cache": state.load(user_files_dir()),
     }
@@ -469,19 +471,20 @@ def on_webview_will_set_content(web_content, context):
     cfg = get_config()
     web_content.body += """
 <style>
+body { padding-bottom: %dpx; }
 #doctrine-suggest-btn {
-  position: fixed; right: %dpx; top: %dpx; z-index: 300;
+  position: fixed; right: %dpx; bottom: %dpx; z-index: 300;
   display: none;
   padding: 4px 10px; font-size: 12px; cursor: pointer;
-  border: 1px solid #888; border-radius: 4px; background: transparent;
-  color: inherit;
+  border: 1px solid #888; border-radius: 4px;
+  background: var(--canvas, Canvas); color: inherit;
 }
-#doctrine-suggest-btn:hover { background: rgba(128,128,128,0.15); }
+#doctrine-suggest-btn:hover { filter: brightness(1.15); }
 </style>
 <button id="doctrine-suggest-btn" onclick="pycmd('doctrine_editor')"
-        title="Suggest an edit to this card">&#9998; Suggest an edit</button>
+        title="Suggest an edit to this card">&#9998; Suggest</button>
 <style>#doctrine-suggest-btn:disabled { opacity:.45; cursor:not-allowed; }</style>
-""" % (cfg["button_right_offset"], cfg["button_top_offset"])
+""" % (BUTTON_CLEARANCE, cfg["button_right_offset"], cfg["button_bottom_offset"])
 
 
 @addon_log.guarded("reviewer_did_show_question")
@@ -891,10 +894,6 @@ def open_diagnostics():
 def setup_menu():
     from aqt.qt import QMenu, QAction
     menu = QMenu(ADDON_NAME, mw)
-
-    a1 = QAction("Suggest an edit for current card", mw)
-    a1.triggered.connect(open_suggestion_dialog)
-    menu.addAction(a1)
 
     a4 = QAction("Open public updates page", mw)
     a4.triggered.connect(open_updates_page)
