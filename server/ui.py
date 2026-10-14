@@ -330,6 +330,9 @@ table.tbl.wrap td.wide { min-width:260px; max-width:440px; }
 .chgline .k { font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-ink); margin-right:6px; }
 .rpt { margin:0 0 10px; font-size:13.5px; }
 
+.tblscroll { overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }
+.tblscroll > table { margin:0; }
+
 /* ---- tables ---- */
 table.tbl { width:100%; border-collapse:collapse; font-size:14px; background:var(--card); border:1px solid var(--line);
   border-radius:12px; overflow:hidden; }
@@ -459,7 +462,7 @@ button[disabled] { opacity:.45; cursor:not-allowed; }
   .viewpane { height:300px; }
   .pane { border-right:0; border-bottom:1px solid var(--line); }
   .pane-body { max-height:300px; }
-  table.tbl, table.users { display:block; overflow-x:auto; -webkit-overflow-scrolling:touch; white-space:nowrap; }
+  table.tbl, table.users { white-space:nowrap; }
   table.tbl td .copyblock code { white-space:normal; min-width:220px; }
   input[type=text], input[type=email], input[type=password], select { min-width:0 !important; max-width:100%; }
   .row { align-items:stretch; }

@@ -858,6 +858,7 @@ document.querySelectorAll('.actions input[name=publish]').forEach(cb => {
 </div></header>
 <div class="wrap">{body}</div>""" + script)
 
+    body = re.sub(r'(<table class="(?:tbl|users)[^"]*">.*?</table>)', r'<div class="tblscroll">\1</div>', body, flags=re.S)
     decks, deck_id = deck_context(user)
     side = ui.sidebar(user, decks, deck_id, active, _staff_counts(deck_id), csrf, esc)
     cur = next((d for d in decks if d["id"] == deck_id), decks[0] if decks else None)
@@ -1504,18 +1505,18 @@ def fetch_master(doctorine_id, guid):
 
 
 def api_suggestion(data):
-    doc_id = (data.get("doctrine_id") or "").strip()
-    doctorine_id = (data.get("doctorine_id") or "").strip()
-    guid = (data.get("guid") or "").strip()
+    doc_id = _text(data.get("doctrine_id"))
+    doctorine_id = _text(data.get("doctorine_id"))
+    guid = _text(data.get("guid"))
     if not doc_id:
         doc_id = doctorine_id or guid
     if not doc_id:
         return 400, {"error": "Missing card identity."}
 
-    text = (data.get("text") or "").strip()
+    text = _text(data.get("text"))
     if not text:
         return 400, {"error": "Suggestion text is required."}
-    snap = data.get("snapshot") or {}
+    snap = data.get("snapshot") if isinstance(data.get("snapshot"), dict) else {}
 
     # Only official notes: a guid in the current release and not retired.
     # Students' own notes, local copies (new guid) and other decks stop here.
@@ -1565,21 +1566,38 @@ def api_suggestion(data):
                  "tracking_url": f"{CFG.public_base_url}/s/{token}"}
 
 
+def _json_object(raw):
+    """Parse a request body that must be a JSON object. ValueError (400) otherwise."""
+    data = json.loads(raw or b"{}")
+    if not isinstance(data, dict):
+        raise ValueError("The request body must be a JSON object.")
+    return data
+
+
+def _text(value):
+    """A client-sent value as text. Lists, dicts and null become empty instead of crashing."""
+    return value.strip() if isinstance(value, str) else (str(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else "")
+
+
 def api_register(data):
     notes = data.get("notes") or []
+    if not isinstance(notes, list):
+        return 400, {"error": "notes must be a list."}
     registered = updated = 0
     with db() as conn:
         for n in notes:
-            doc_id = (n.get("doctrine_id") or "").strip()
+            if not isinstance(n, dict):
+                continue
+            doc_id = _text(n.get("doctrine_id"))
             if not doc_id:
                 continue
-            fields = n.get("fields") or {}
+            fields = n.get("fields") if isinstance(n.get("fields"), dict) else {}
             h = content_hash(fields)
             existing = conn.execute(
                 "SELECT content_hash, version FROM notes WHERE doctrine_id=?",
                 (doc_id,)
             ).fetchone()
-            tags = json.dumps(list(n.get("tags") or []))
+            tags = json.dumps([t for t in (n.get("tags") if isinstance(n.get("tags"), list) else []) if isinstance(t, str)])
             if existing is None:
                 conn.execute(
                     """INSERT INTO notes (doctrine_id, anki_note_id, note_type,
@@ -1885,6 +1903,10 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.OperationalError as e:
             print(f"[db] {e} on GET {self.path}", flush=True)
             self._db_unavailable()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            self._internal_error("GET")
 
     def do_POST(self):
         try:
@@ -1892,6 +1914,21 @@ class Handler(BaseHTTPRequestHandler):
         except sqlite3.OperationalError as e:
             print(f"[db] {e} on POST {self.path}", flush=True)
             self._db_unavailable()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            self._internal_error("POST")
+
+    def _internal_error(self, method):
+        """An unexpected error: log it, and still answer so the client is not left hanging."""
+        import traceback
+        print(f"[error] unhandled on {method} {self.path}\n{traceback.format_exc()}", flush=True)
+        try:
+            self._send(500, page("Something went wrong", "<h1>Something went wrong</h1><p>The request could not be "
+                                 "completed. It has been logged. Try again, and tell an administrator if it keeps "
+                                 "happening.</p>"))
+        except Exception:
+            pass
 
     def _do_GET(self):
         path = urlparse(self.path).path
@@ -2188,9 +2225,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/suggestions":
             try:
-                code, obj = api_suggestion(json.loads(raw or b"{}"))
-            except json.JSONDecodeError:
-                code, obj = 400, {"error": "Invalid JSON."}
+                code, obj = api_suggestion(_json_object(raw))
+            except ValueError as e:
+                code, obj = 400, {"error": str(e) or "Invalid JSON."}
             self._json(code, obj)
         elif path in ("/releases/cut", "/releases/token", "/releases/token/revoke", "/releases/confirm") or \
                 (path.startswith("/releases/") and (path.endswith("/build") or path.endswith("/discard")
@@ -2275,9 +2312,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(429, {"ok": False, "error": "Too many pings."})
                 return
             try:
-                ok = record_ping(json.loads(raw or b"{}"))
+                ok = record_ping(_json_object(raw))
                 self._json(200 if ok else 400, {"ok": ok})
-            except (json.JSONDecodeError, AttributeError):
+            except ValueError:
                 self._json(400, {"ok": False})
         elif path == "/labels/set":
             user = self._current_user()
@@ -2334,14 +2371,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"error": "Unauthorized."})
             else:
                 try:
-                    data = json.loads(raw or b"{}")
-                    upload_id, summary = create_upload(data.get("label") or "", data.get("notes") or [])
+                    data = _json_object(raw)
+                    upload_id, summary = create_upload(_text(data.get("label")), data.get("notes") or [])
                     self._json(200, {"ok": True, "upload_id": upload_id, "summary": summary,
                                      "review_url": f"{CFG.public_base_url}/uploads/{upload_id}"})
-                except json.JSONDecodeError:
-                    self._json(400, {"error": "Invalid JSON."})
                 except ValueError as e:
-                    self._json(400, {"error": str(e)})
+                    self._json(400, {"error": str(e) or "Invalid JSON."})
         elif path.startswith("/uploads/") and path.endswith("/apply"):
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"))
@@ -2387,9 +2422,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"error": "Unauthorized."})
             else:
                 try:
-                    code, obj = api_register(json.loads(raw or b"{}"))
-                except json.JSONDecodeError:
-                    code, obj = 400, {"error": "Invalid JSON."}
+                    code, obj = api_register(_json_object(raw))
+                except ValueError as e:
+                    code, obj = 400, {"error": str(e) or "Invalid JSON."}
                 self._json(code, obj)
         elif path == "/login":
             form = parse_qs(raw.decode("utf-8"))
@@ -2591,17 +2626,19 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
   <td>{esc(r['username'])}</td>
   <td><span class="role role-{r['role']}">{r['role']}</span></td>
   <td>{state}</td>
-  <td class="row-actions">
+  <td>
+    <div class="row" style="gap:8px;flex-wrap:nowrap">
     <form method="post" action="/admin/users" class="inline">
       <input type="hidden" name="csrf" value="{csrf}">
       <input type="hidden" name="user_id" value="{r['id']}">
-      <button name="do" value="reset" class="ghost">Reset password</button>
+      <button name="do" value="reset" class="secondary">Reset password</button>
     </form>
     <form method="post" action="/admin/users" class="inline">
       <input type="hidden" name="csrf" value="{csrf}">
       <input type="hidden" name="user_id" value="{r['id']}">
-      <button name="do" value="{toggle}" class="ghost">{toggle.title()}</button>
+      <button name="do" value="{toggle}" class="secondary">{toggle.title()}</button>
     </form>
+    </div>
   </td>
 </tr>""")
 
@@ -2616,8 +2653,8 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
   <label class="chk"><input type="checkbox" name="admin" value="1"> Administrator</label>
   <button type="submit">Create</button>
 </form>
-<table class="users">
-  <thead><tr><th>User</th><th>Role</th><th>Status</th><th></th></tr></thead>
+<table class="tbl">
+  <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
   <tbody>{''.join(items)}</tbody>
 </table>
 {self_approval_form}
@@ -3183,13 +3220,18 @@ def new_note_from_form(form, user_id, deck_id=1):
 # ---------------------------------------------------------------- re-upload
 
 def _incoming_map(notes):
+    if not isinstance(notes, list):
+        raise ValueError("notes must be a list.")
     incoming = {}
     for n in notes:
-        guid = (n.get("guid") or n.get("doctrine_id") or "").strip()
+        if not isinstance(n, dict):
+            continue
+        guid = _text(n.get("guid")) or _text(n.get("doctrine_id"))
         if not guid:
             continue
-        incoming[guid] = {"fields": n.get("fields") or {}, "tags": list(n.get("tags") or []),
-                          "note_type": n.get("note_type") or ""}
+        incoming[guid] = {"fields": n.get("fields") if isinstance(n.get("fields"), dict) else {},
+                          "tags": [t for t in (n.get("tags") if isinstance(n.get("tags"), list) else []) if isinstance(t, str)],
+                          "note_type": _text(n.get("note_type"))}
     return incoming
 
 
@@ -4242,7 +4284,11 @@ def render_releases(user, csrf, notice=None, token_link=None):
 
 def mint_download_token(note, days, user_id, deck_id=1):
     token = auth.new_token()
-    expires = (datetime.now(timezone.utc) + __import__("datetime").timedelta(days=max(1, min(int(days or 7), 90))))
+    try:
+        n_days = int(str(days).strip())
+    except (TypeError, ValueError):
+        n_days = 7   # "7 days", "abc" and blanks fall back to the default instead of failing
+    expires = datetime.now(timezone.utc) + __import__("datetime").timedelta(days=max(1, min(n_days, 90)))
     with db() as conn:
         conn.execute("INSERT INTO download_tokens (token, note, created_by, created_at, expires_at, platform_deck) "
                      "VALUES (?,?,?,?,?,?)",
