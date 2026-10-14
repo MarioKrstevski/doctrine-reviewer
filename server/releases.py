@@ -49,7 +49,31 @@ def store_media(conn, filename, data, deck_id=1):
     if not existing:
         conn.execute("INSERT OR REPLACE INTO media (filename, sha256, size, platform_deck) VALUES (?,?,?,?)",
                      (filename, sha, len(data), deck_id))
+    link_media(conn, filename, deck_id)
     return {"filename": filename, "sha256": sha, "size": len(data), "existing": existing}
+
+
+def link_media(conn, filename, deck_id):
+    """A media file can belong to several decks. This records that `deck_id` uses it."""
+    conn.execute("INSERT OR IGNORE INTO deck_media (filename, platform_deck) VALUES (?,?)", (filename, deck_id))
+
+
+def drop_deck_media(conn, deck_id):
+    """Forget a deck's media. Files no other deck uses are deleted from disk. Returns bytes freed."""
+    conn.execute("DELETE FROM deck_media WHERE platform_deck=?", (deck_id,))
+    orphans = conn.execute("SELECT filename, sha256 FROM media WHERE filename NOT IN "
+                           "(SELECT filename FROM deck_media)").fetchall()
+    freed = 0
+    for r in orphans:
+        conn.execute("DELETE FROM media WHERE filename=?", (r["filename"],))
+        if conn.execute("SELECT 1 FROM media WHERE sha256=?", (r["sha256"],)).fetchone() is None:
+            path = sha_path(r["sha256"])
+            try:
+                freed += os.path.getsize(path)
+                os.remove(path)
+            except OSError:
+                pass
+    return freed
 
 
 def media_file(conn, filename):

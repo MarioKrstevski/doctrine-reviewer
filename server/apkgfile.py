@@ -85,6 +85,27 @@ class Package:
                 return self.zip.read(n)
         raise ValueError("no collection in package")
 
+    def collection_to_file(self, out_path):
+        """Write the raw collection SQLite to out_path without holding it in memory."""
+        names = self.zip.namelist()
+        if "collection.anki21b" in names:
+            if shutil.which("zstd") is None:
+                raise RuntimeError("zstd CLI not found")
+            with self.zip.open("collection.anki21b") as src, open(out_path, "wb") as dst:
+                proc = subprocess.Popen(["zstd", "-d", "-q", "-c"], stdin=subprocess.PIPE, stdout=dst)
+                for chunk in iter(lambda: src.read(1 << 20), b""):
+                    proc.stdin.write(chunk)
+                proc.stdin.close()
+                if proc.wait() != 0:
+                    raise RuntimeError("could not decompress the collection")
+            return out_path
+        for n in ("collection.anki21", "collection.anki2"):
+            if n in names:
+                with self.zip.open(n) as src, open(out_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst, 1 << 20)
+                return out_path
+        raise ValueError("no collection in package")
+
     def media_names(self) -> dict:
         return decode_media_manifest(self.zip.read("media"))
 
@@ -106,6 +127,11 @@ def read_notes(sqlite_bytes):
     """Yield dicts shaped like /api/master/sync expects, from a raw collection."""
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         f.write(sqlite_bytes); path = f.name
+    yield from read_notes_file(path, remove=True)
+
+
+def read_notes_file(path, remove=False):
+    """Same as read_notes, reading a collection file on disk row by row."""
     try:
         c = sqlite3.connect(path); c.row_factory = sqlite3.Row
         fields = {}
@@ -121,7 +147,8 @@ def read_notes(sqlite_bytes):
                    "tags": [t for t in r["tags"].split() if t]}
         c.close()
     finally:
-        os.unlink(path)
+        if remove:
+            os.unlink(path)
 
 
 _REF = re.compile(r'''(src=["']|\[sound:)([^"'\]]+)''')

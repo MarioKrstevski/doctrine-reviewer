@@ -37,6 +37,7 @@ def running_server(**env):
         previous = server.CFG
         server.CFG = config.load(settings)
         server.init_db()
+        server._ping_seen.clear()   # the ping rate limit is per process; each test starts fresh
 
         httpd = server.Server(("127.0.0.1", 0), server.Handler)
         port = httpd.server_address[1]

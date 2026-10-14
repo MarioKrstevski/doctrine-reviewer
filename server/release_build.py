@@ -193,14 +193,35 @@ def zstd_compress(data, level=3):
     return _subprocess.run(["zstd", "-q", f"-{level}", "-c"], input=data, capture_output=True, check=True).stdout
 
 
+def compressed_collection(collection_path, level=3):
+    """Path of the zstd-compressed collection, made once and reused by every download.
+
+    Compressing streams file to file through the zstd CLI, so the collection is
+    never held in memory. The cache sits next to the collection and is rebuilt
+    only when the collection is newer.
+    """
+    out = collection_path + ".zst"
+    try:
+        if _os.path.getmtime(out) >= _os.path.getmtime(collection_path):
+            return out
+    except OSError:
+        pass
+    if _shutil.which("zstd") is None:
+        raise RuntimeError("zstd CLI not found")
+    tmp = f"{out}.{_os.getpid()}.tmp"
+    with open(collection_path, "rb") as src, open(tmp, "wb") as dst:
+        _subprocess.run(["zstd", "-q", f"-{level}", "-c"], stdin=src, stdout=dst, check=True)
+    _os.replace(tmp, out)
+    return out
+
+
 def _fill_zip(z, collection_path, media, level):
     """Write the package members into open zip `z`. media items are
     (filename, path_on_disk) or (filename, bytes)."""
     entries = []
     nbytes = 0
     z.writestr("meta", META_V3)
-    with open(collection_path, "rb") as fh:
-        z.writestr("collection.anki21b", zstd_compress(fh.read(), level))
+    z.write(compressed_collection(collection_path, level), "collection.anki21b")
     with _tempfile.NamedTemporaryFile(suffix=".anki2", delete=False) as stub:
         stub_path = stub.name
     try:

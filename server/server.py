@@ -253,6 +253,11 @@ def init_db():
             sha256 TEXT NOT NULL,
             size INTEGER
         );
+        CREATE TABLE IF NOT EXISTS deck_media (
+            filename TEXT NOT NULL,
+            platform_deck INTEGER NOT NULL,
+            PRIMARY KEY (filename, platform_deck)
+        );
         CREATE INDEX IF NOT EXISTS idx_attempts_username
             ON login_attempts(username, attempted_at);
         CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -290,6 +295,12 @@ def init_db():
         _ensure_columns(conn, "users", {"active_deck": "INTEGER"})
         _ensure_columns(conn, "installs", {"deck": "TEXT"})
         _ensure_columns(conn, "media", {"platform_deck": "INTEGER DEFAULT 1"})
+        conn.execute("UPDATE uploads SET status='failed', summary_json=? WHERE status='processing'",
+                     (json.dumps({"error": "The server restarted while reading this file. Upload it again."}),))
+        # Media can be shared by decks. Seed the link table from the old one-owner column once.
+        if conn.execute("SELECT COUNT(*) FROM deck_media").fetchone()[0] == 0:
+            conn.execute("INSERT OR IGNORE INTO deck_media (filename, platform_deck) "
+                         "SELECT filename, COALESCE(platform_deck,1) FROM media")
         for t in ("notes", "releases", "uploads", "suggestions", "download_tokens"):
             _ensure_columns(conn, t, {"platform_deck": "INTEGER DEFAULT 1"})
         _ensure_columns(conn, "suggestions", {"release": "TEXT"})
@@ -1078,7 +1089,9 @@ def render_inbox_item(r, master, csrf, card_labels=()):
     ask, has_proposal = _ask_section(r, current, master, theirs, stale, css)
     saw = _saw_section(r, theirs, current, master, stale, css)
 
-    note_id = f'Note {r["anki_note_id"]}' if r["anki_note_id"] else f'Card {r["doctrine_id"]}'
+    # Escaped once here: a guid can contain < > & " (Anki's base91 alphabet).
+    note_label = f'Note {r["anki_note_id"]}' if r["anki_note_id"] else f'Card {r["doctrine_id"]}'
+    note_id = esc(note_label)
     contact = f'<dt>email</dt><dd>{esc(r["email"])}</dd>' if r["email"] else ""
     details = (f'<details class="trace"><summary>Details</summary><dl>'
                f'<dt>deck</dt><dd>{esc(r["deck"])}</dd><dt>note type</dt><dd>{esc(r["note_type"])}</dd>'
@@ -1124,7 +1137,7 @@ def render_inbox_item(r, master, csrf, card_labels=()):
   <div class="card-head">
     {status_badge} {email_chip}
     <span class="meta"><b>{note_id}</b> &middot; report #{sid}</span>
-    <span class="labelrow">{label_chips(card_labels)}{label_button(r["doctrine_id"], list(card_labels), note_id, "Edit labels" if card_labels else "Label")}</span>
+    <span class="labelrow">{label_chips(card_labels)}{label_button(r["doctrine_id"], list(card_labels), note_label, "Edit labels" if card_labels else "Label")}</span>
     <time>{ui.human_time(r["created_at"])}</time>
   </div>
   {tag_chips(r["tags_json"])}
@@ -1323,12 +1336,42 @@ def is_official(guid) -> bool:
 WATCH_AT, FLAG_AT = 20, 100   # installs per license: watch, red flag
 
 
+PING_PER_ADDRESS_PER_HOUR = 30     # a real install pings once a day
+PING_MAX_INSTALLS = 200_000        # hard ceiling so the table cannot fill the volume
+_LICENSE_RE = re.compile(r"^(?:[0-9a-f]{16}|staff)$")
+_ping_seen = {}
+_ping_lock = threading.Lock()
+
+
+def ping_allowed(address, now_ts=None):
+    """Sliding one-hour window per client address."""
+    import time as _time
+    t = _time.time() if now_ts is None else now_ts
+    with _ping_lock:
+        recent = [x for x in _ping_seen.get(address, []) if t - x < 3600]
+        if len(recent) >= PING_PER_ADDRESS_PER_HOUR:
+            _ping_seen[address] = recent
+            return False
+        recent.append(t)
+        _ping_seen[address] = recent
+        if len(_ping_seen) > 50_000:      # forget idle addresses
+            for k in [k for k, v in _ping_seen.items() if not v or t - v[-1] >= 3600]:
+                _ping_seen.pop(k, None)
+        return True
+
+
 def record_ping(data):
     """Upsert one install from an add-on ping. Returns False for junk."""
     iid = str(data.get("install_id") or "").strip()[:64]
-    if len(iid) < 8:
+    if len(iid) < 8 or not re.match(r"^[A-Za-z0-9_-]+$", iid):
         return False
     lic = str(data.get("license") or "").strip()[:64] or None
+    if lic is not None and not _LICENSE_RE.match(lic):
+        lic = None   # only ids our own downloads mint are counted
+    with db() as conn:
+        known = conn.execute("SELECT 1 FROM installs WHERE install_id=?", (iid,)).fetchone()
+        if not known and conn.execute("SELECT COUNT(*) FROM installs").fetchone()[0] >= PING_MAX_INSTALLS:
+            return False
     deck = str(data.get("deck") or "").strip()[:64] or None
     with db() as conn:
         conn.execute(
@@ -1656,11 +1699,27 @@ def resolve_together(conn, sid, also_ids, user_id, note="Fixed together with ano
                 queue_thank_you(conn, other)
 
 
+def proposal_is_stale(conn, guid, snap_fields_json):
+    """True when the card has changed since the student saw it (Text or Extra differ)."""
+    note = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+    if note is None:
+        return False
+    try:
+        theirs = json.loads(snap_fields_json or "{}")
+        current = json.loads(note["fields_json"] or "{}")
+    except ValueError:
+        return False
+    return any(theirs.get(f, "") != current.get(f, "") for f in revisions.EDITABLE_FIELDS if f in theirs)
+
+
 def accept_proposal(conn, sid, user_id):
     """Apply the student's proposed edit to the note and resolve. False if none."""
-    r = conn.execute("SELECT doctrine_id, proposed_fields_json FROM suggestions "
+    r = conn.execute("SELECT doctrine_id, proposed_fields_json, snap_fields_json FROM suggestions "
                      "WHERE id=? AND status='open'", (sid,)).fetchone()
     if r is None or not r["proposed_fields_json"]:
+        return False
+    if proposal_is_stale(conn, r["doctrine_id"], r["snap_fields_json"]):
+        # Written against an older card: applying it would silently revert the newer edit.
         return False
     try:
         proposed = json.loads(r["proposed_fields_json"])
@@ -2155,8 +2214,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, render_confirm_selection(
                         user, auth.csrf_token(self._cookie_token(), session_secret()), guids, message))
             elif path.endswith("/discard"):
-                discard_release(path[len("/releases/"):-len("/discard")])
-                self._redirect("/releases/next")
+                if discard_release(unquote(path[len("/releases/"):-len("/discard")]), user):
+                    self._redirect("/releases/next")
+                else:
+                    self._send(403, page("Forbidden", "<h1>Not allowed</h1><p>Only an administrator or the person "
+                                         "who prepared this draft can discard it.</p>", "releases", user))
             elif path.endswith("/approve") or path.endswith("/unapprove") or path.endswith("/remove"):
                 action = path.rsplit("/", 1)[1]
                 version = unquote(path[len("/releases/"):-len("/" + action)])
@@ -2208,6 +2270,10 @@ class Handler(BaseHTTPRequestHandler):
                                  ("1" if form.get("allow") else "0",))
                 self._redirect("/admin/users")
         elif path == "/api/ping":
+            address = (self.headers.get("X-Forwarded-For", "") or self.client_address[0]).split(",")[0].strip()
+            if not ping_allowed(address):
+                self._json(429, {"ok": False, "error": "Too many pings."})
+                return
             try:
                 ok = record_ping(json.loads(raw or b"{}"))
                 self._json(200 if ok else 400, {"ok": ok})
@@ -3179,9 +3245,10 @@ def _set_upload(upload_id, status, **summary):
 def process_deck_upload(upload_id, path, deck_id=1):
     """Background: read the .apkg, store its media (renaming a changed image that
     reuses a filename), compare notes with the online deck, hand over to review."""
+    col_path = path + ".collection"
     try:
         pkg = apkgfile.Package(path)
-        notes = list(apkgfile.read_notes(pkg.collection_sqlite()))
+        pkg.collection_to_file(col_path)   # streamed to disk, never held in memory
         manifest = pkg.media_names()
         with db() as conn:
             known = {r["filename"]: r["sha256"] for r in conn.execute("SELECT filename, sha256 FROM media")}
@@ -3197,16 +3264,23 @@ def process_deck_upload(upload_id, path, deck_id=1):
                     if name not in known:
                         releases.store_media(conn, name, data, deck_id); known[name] = sha; stats["media_new"] += 1
                     elif known[name] == sha:
+                        releases.link_media(conn, name, deck_id)
                         stats["media_same"] += 1
                     else:
                         new_name = apkgfile.renamed(name, sha)
                         releases.store_media(conn, new_name, data, deck_id); known[new_name] = sha
                         renames[name] = new_name; stats["media_renamed"] += 1
         pkg.close()
-        if renames:
-            for n in notes:
-                n["fields"] = {k: apkgfile.rename_refs(v, renames) for k, v in n["fields"].items()}
-        incoming = _incoming_map(notes)
+        # One pass over the notes straight into the comparison map: no second full copy.
+        incoming = {}
+        for n in apkgfile.read_notes_file(col_path):
+            guid = (n.get("guid") or "").strip()
+            if not guid:
+                continue
+            fields = n["fields"]
+            if renames:
+                fields = {k: apkgfile.rename_refs(v, renames) for k, v in fields.items()}
+            incoming[guid] = {"fields": fields, "tags": list(n.get("tags") or []), "note_type": n.get("note_type") or ""}
         with db() as conn:
             diff = reupload.compare(reupload.snapshot(conn, deck_id), incoming,
                                     pending_guids=reupload.pending_guids(conn))
@@ -3220,10 +3294,11 @@ def process_deck_upload(upload_id, path, deck_id=1):
     except Exception as e:
         _set_upload(upload_id, "failed", error=f"Could not read the file: {e}")
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        for p in (path, col_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
 
 
 def delete_deck(deck_id, typed_name):
@@ -3252,6 +3327,7 @@ def delete_deck(deck_id, typed_name):
                      (deck_id,))
         conn.execute("DELETE FROM card_labels WHERE guid IN (SELECT doctrine_id FROM notes WHERE platform_deck=?)", (deck_id,))
         conn.execute("DELETE FROM labels WHERE platform_deck=?", (deck_id,))
+        releases.drop_deck_media(conn, deck_id)
         for table in ("suggestions", "uploads", "download_tokens", "releases", "notes"):
             conn.execute(f"DELETE FROM {table} WHERE platform_deck=?", (deck_id,))
         conn.execute("DELETE FROM settings WHERE key=?", (releases.current_release_key(deck_id),))
@@ -3260,6 +3336,8 @@ def delete_deck(deck_id, typed_name):
     for p in paths:
         try:
             os.remove(p)
+            if os.path.exists(p + ".zst"):
+                os.remove(p + ".zst")
             os.rmdir(os.path.dirname(p))
         except OSError:
             pass
@@ -3278,7 +3356,7 @@ def render_deck(user, csrf, notice=None):
                 "retired": conn.execute("SELECT COUNT(*) FROM notes WHERE platform_deck=? AND retired=1", (d["id"],)).fetchone()[0],
                 "release": releases.current_release(conn, d["id"]),
             }
-        media = {d["id"]: conn.execute("SELECT COUNT(*) FROM media WHERE COALESCE(platform_deck,1)=?",
+        media = {d["id"]: conn.execute("SELECT COUNT(*) FROM deck_media WHERE platform_deck=?",
                                        (d["id"],)).fetchone()[0] for d in decks}
         ups = [dict(r) for r in conn.execute(
             "SELECT id, label, status, created_at FROM uploads WHERE COALESCE(platform_deck,1)=? "
@@ -3529,10 +3607,12 @@ def cut_release(version, user_id, guids, notes="", visibility="public"):
     return True, f"Release {version} drafted with {n} field change(s) across {len(groups)} note(s)."
 
 
-def discard_release(version):
-    """Drop a draft: its revisions go back to Next release."""
+def discard_release(version, user=None):
+    """Drop a draft: its revisions go back to Next release. Only an administrator or its preparer may."""
     with db() as conn:
-        rel = conn.execute("SELECT status FROM releases WHERE version=?", (version,)).fetchone()
+        rel = conn.execute("SELECT status, prepared_by FROM releases WHERE version=?", (version,)).fetchone()
+        if rel is not None and user is not None and user["role"] != "admin" and rel["prepared_by"] != user["id"]:
+            return False
         if rel is None or rel["status"] not in ("draft", "failed"):
             return False
         revisions.unstamp(conn, version)
@@ -3803,6 +3883,7 @@ def _build_release(version):
         col_path = os.path.join(d, "collection.sqlite")
         counts = release_build.patch_collection(prev["collection_path"], col_path, changed, new_notes,
                                                 retired, now=int(datetime.now(timezone.utc).timestamp()))
+        release_build.compressed_collection(col_path)   # downloads reuse this instead of compressing each time
         info = {"media": len(media), "stored_package": False}
 
         with db() as conn:
@@ -3832,6 +3913,8 @@ def _prune_collections(deck_id=1, keep=2):
             try:
                 if os.path.exists(r["collection_path"]):
                     os.remove(r["collection_path"])
+                if os.path.exists(r["collection_path"] + ".zst"):
+                    os.remove(r["collection_path"] + ".zst")
             except OSError:
                 continue
             conn.execute("UPDATE releases SET collection_path=NULL WHERE version=?", (r["version"],))
@@ -3850,29 +3933,37 @@ def start_build(version, user_id):
     return True
 
 
-def release_changes(conn, version):
-    """Readable lines for what a release changed: [{kind, label, snippet, fields, who, guid}]."""
-    out, seen = [], {}
-    for rv in conn.execute(
+def _text_as_of(conn, guid, version, fields):
+    """The card's Text as it shipped in `version`, not as it reads today."""
+    return revisions.text_at(conn, guid, set(_versions_through(conn, version)), fields).get("Text", "")
+
+
+def release_changes(conn, version, limit=None):
+    """Readable lines for what a release changed: [{kind, label, snippet, fields, who, guid}].
+
+    With `limit`, only the first `limit` cards are read, so a list page stays cheap
+    even for a release that touched thousands of cards.
+    """
+    guids = [r["guid"] for r in conn.execute(
+        "SELECT guid FROM revisions WHERE release=? GROUP BY guid ORDER BY MIN(id)"
+        + (" LIMIT ?" if limit else ""), (version, limit) if limit else (version,))]
+    out = []
+    for guid in guids:
+        row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+        fields = json.loads(row["fields_json"] or "{}") if row else {}
+        revs = [dict(r) for r in conn.execute(
             "SELECT r.*, u.username FROM revisions r LEFT JOIN users u ON u.id=r.user_id "
-            "WHERE r.release=? ORDER BY r.id", (version,)):
-        rv = dict(rv)
-        e = seen.get(rv["guid"])
-        if e is None:
-            row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (rv["guid"],)).fetchone()
-            text = ui.plain_text((json.loads(row["fields_json"] or "{}") if row else {}).get("Text", ""), 90)
-            kind = revisions.kind_of(conn, rv)
-            e = {"kind": kind, "label": revisions.KIND_LABELS.get(kind, kind), "snippet": text or rv["guid"],
-                 "fields": set(), "who": set(), "guid": rv["guid"]}
-            seen[rv["guid"]] = e
-            out.append(e)
-        if rv["field"] in revisions.EDITABLE_FIELDS:
-            e["fields"].add(rv["field"])
-        if rv["username"]:
-            e["who"].add(rv["username"])
-    for e in out:
-        e["fields"], e["who"] = sorted(e["fields"]), sorted(e["who"])
+            "WHERE r.release=? AND r.guid=? ORDER BY r.id", (version, guid))]
+        kind = revisions.kind_of(conn, revs[0])
+        out.append({"kind": kind, "label": revisions.KIND_LABELS.get(kind, kind),
+                    "snippet": ui.plain_text(_text_as_of(conn, guid, version, fields), 90) or guid,
+                    "fields": sorted({r["field"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS}),
+                    "who": sorted({r["username"] for r in revs if r["username"]}), "guid": guid})
     return out
+
+
+def release_card_count(conn, version):
+    return conn.execute("SELECT COUNT(DISTINCT guid) FROM revisions WHERE release=?", (version,)).fetchone()[0]
 
 
 def _changes_html(changes):
@@ -3898,7 +3989,7 @@ def release_detail_rows(conn, version):
             note = conn.execute("SELECT anki_note_id, fields_json FROM notes WHERE doctrine_id=?", (rv["guid"],)).fetchone()
             fields = json.loads(note["fields_json"] or "{}") if note else {}
             c = {"guid": rv["guid"], "nid": note["anki_note_id"] if note else None,
-                 "snippet": ui.plain_text(fields.get("Text", ""), 90) or rv["guid"],
+                 "snippet": ui.plain_text(_text_as_of(conn, rv["guid"], version, fields), 90) or rv["guid"],
                  "kind": revisions.kind_of(conn, rv), "changes": [], "who": set(), "sources": [], "when": rv["created_at"]}
             cards[rv["guid"]] = c
             order.append(rv["guid"])
@@ -4041,7 +4132,9 @@ def render_releases(user, csrf, notice=None, token_link=None):
             "SELECT * FROM releases WHERE COALESCE(platform_deck,1)=? ORDER BY rowid DESC", (deck_id,))]
         cur = releases.current_release(conn, deck_id)
         pending_n = len(revisions.pending(conn, deck_id))
-        changes = {r["version"]: release_changes(conn, r["version"]) for r in rows}
+        # Only a preview per release here; the detail page has the full list.
+        changes = {r["version"]: release_changes(conn, r["version"], limit=5) for r in rows}
+        card_counts = {r["version"]: release_card_count(conn, r["version"]) for r in rows}
         tokens = [dict(r) for r in conn.execute(
             "SELECT * FROM download_tokens WHERE COALESCE(platform_deck,1)=? ORDER BY created_at DESC LIMIT 30",
             (deck_id,))] if user["role"] == "admin" else []
@@ -4075,7 +4168,7 @@ def render_releases(user, csrf, notice=None, token_link=None):
                 acts = f'<a class="btn-link-primary" href="/download/release/{esc(v)}">Download</a>'
             else:
                 acts = '<span class="small">An older release. It can no longer be downloaded.</span>'
-        n_changes = len(changes.get(v, []))
+        n_changes = card_counts.get(v, 0)
         summary = (f'<a class="small" href="/releases/{quote(v, safe="")}">{n_changes} card{"s" if n_changes != 1 else ""} changed, see details</a>'
                    if n_changes else '<span class="small">The original deck</span>')
         notes = (f'<p class="small" style="margin:10px 0 0">{esc(r["public_notes"])}</p>'
@@ -4086,7 +4179,7 @@ def render_releases(user, csrf, notice=None, token_link=None):
         items.append(f"""
 <div class="{cls}">
   <div class="rh"><a class="v" href="/releases/{quote(v, safe="")}" style="text-decoration:none">Release {esc(v)}</a>{badge}{public}{summary}<span class="when">{when}</span></div>
-  {notes}{_changes_html(changes.get(v, []))}
+  {notes}{_changes_html(changes.get(v, []))}{f'<p class="small"><a href="/releases/{quote(v, safe="")}">and {n_changes - 5} more, see details</a></p>' if n_changes > 5 else ""}
   <div class="acts">{acts}</div>{log}
 </div>""")
     msg = f'<p class="notice">{esc(notice)}</p>' if notice else ""
@@ -4175,8 +4268,8 @@ def package_for_version(conn, version):
 def media_for_package(conn, deck_id=1):
     """Media files a deck's package carries: only the ones that deck owns."""
     return [(r["filename"], releases.sha_path(r["sha256"]))
-            for r in conn.execute("SELECT filename, sha256 FROM media WHERE COALESCE(platform_deck,1)=? "
-                                  "ORDER BY filename", (deck_id,))
+            for r in conn.execute("SELECT m.filename, m.sha256 FROM media m JOIN deck_media dm ON dm.filename=m.filename "
+                                  "WHERE dm.platform_deck=? ORDER BY m.filename", (deck_id,))
             if os.path.exists(releases.sha_path(r["sha256"]))]
 
 
@@ -4304,7 +4397,8 @@ def _card_filter(q, deck_id):
     if q.lower().startswith("label:"):
         return (f"{D} AND doctrine_id IN (SELECT cl.guid FROM card_labels cl JOIN labels l ON l.id=cl.label_id "
                 f"WHERE l.platform_deck=? AND l.name=?)", (deck_id, deck_id, labels.normalize(q[6:])))
-    bare = re.sub(r"^(note\s*id|note|nid|id|#)[\s:#]*", "", q, flags=re.I).strip()
+    # 'Note 1788…', 'nid:1788…', '#1788…' -> the number. Ordinary words like 'idiopathic' stay as typed.
+    bare = re.sub(r"^(?:note\s*id|note|nid|id)?\s*[:#]?\s*(?=\d)", "", q, flags=re.I).strip()
     if bare.isdigit() and len(bare) >= 5:
         return f"{D} AND (anki_note_id=? OR CAST(anki_note_id AS TEXT) LIKE ? OR doctrine_id LIKE ?)", \
                (deck_id, int(bare), f"{bare}%", f"%{bare}%")

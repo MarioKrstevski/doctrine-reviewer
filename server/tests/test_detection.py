@@ -25,13 +25,13 @@ def ping(base, **data):
 class PingTest(unittest.TestCase):
     def test_ping_upserts_and_rejects_junk(self):
         with running_server() as base:
-            self.assertEqual(200, ping(base, install_id="install-aaaa", addon_version="1.6.3", release="1.0", license="L1"))
+            self.assertEqual(200, ping(base, install_id="install-aaaa", addon_version="1.6.3", release="1.0", license="00000000000000a1"))
             self.assertEqual(200, ping(base, install_id="install-aaaa", addon_version="1.6.3", release="1.1"))
             self.assertEqual(400, ping(base, install_id="x"))
             with server.db() as conn:
                 rows = [dict(r) for r in conn.execute("SELECT * FROM installs")]
         self.assertEqual(1, len(rows))
-        self.assertEqual(("L1", "1.1", 2), (rows[0]["license"], rows[0]["release"], rows[0]["pings"]))
+        self.assertEqual(("00000000000000a1", "1.1", 2), (rows[0]["license"], rows[0]["release"], rows[0]["pings"]))
 
 
 class DetectionPageTest(unittest.TestCase):
