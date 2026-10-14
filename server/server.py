@@ -2601,8 +2601,8 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
   <input type="hidden" name="csrf" value="{csrf}">
   <label class="chk"><input type="checkbox" name="allow" value="1"{" checked" if self_ok else ""} onchange="this.form.submit()">
   Let an administrator approve a release they prepared themselves</label>
-  <p class="small" style="margin:4px 0 0">Off by default. A release needs another administrator's approval before it can be built.
-  Turn this on only when there is just one administrator.</p>
+  <p class="small" style="margin:4px 0 0">On by default, so a single administrator can prepare, approve and build.
+  Turn it off to require a second administrator's approval before a release can be built.</p>
 </form>"""
 
     banner = ""
@@ -3664,8 +3664,9 @@ def discard_release(version, user=None):
 
 
 def self_approval_allowed(conn):
+    """On unless an administrator switched it off on the Users page."""
     row = conn.execute("SELECT value FROM settings WHERE key='allow_self_approval'").fetchone()
-    return bool(row and row["value"] == "1")
+    return row is None or row["value"] == "1"
 
 
 def approve_release(version, user):

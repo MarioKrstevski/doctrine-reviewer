@@ -62,18 +62,28 @@ class ApprovalTest(unittest.TestCase):
                 time.sleep(0.1)
             self.assertEqual("published", status_of("1.1")["status"], status_of("1.1")["build_log"])
 
-    def test_the_preparer_cannot_approve_their_own_draft_unless_allowed(self):
+    def test_an_admin_can_approve_their_own_draft_by_default(self):
         with running_server() as base:
             admin = person(base, "solo_admin", "admin")
             self._draft(base, admin)
-            _, _, html = request(base, "POST", "/releases/1.1/approve", {"csrf": csrf_for(admin)}, cookie=admin)
-            self.assertIn("another administrator", html)
-            self.assertIsNone(status_of("1.1")["approved_by"])
-            request(base, "POST", "/admin/self-approval", {"allow": "1", "csrf": csrf_for(admin)}, cookie=admin)
             request(base, "POST", "/releases/1.1/approve", {"csrf": csrf_for(admin)}, cookie=admin)
             self.assertIsNotNone(status_of("1.1")["approved_by"])
             _, _, users = request(base, "GET", "/admin/users", cookie=admin)
             self.assertIn("checked", users.split("Let an administrator approve")[0].rsplit("<input", 1)[1])
+
+    def test_the_preparer_cannot_approve_their_own_draft_when_self_approval_is_off(self):
+        with running_server() as base:
+            admin = person(base, "solo_admin", "admin")
+            request(base, "POST", "/admin/self-approval", {"csrf": csrf_for(admin)}, cookie=admin)
+            self._draft(base, admin)
+            _, _, html = request(base, "POST", "/releases/1.1/approve", {"csrf": csrf_for(admin)}, cookie=admin)
+            self.assertIn("another administrator", html)
+            self.assertIsNone(status_of("1.1")["approved_by"])
+            _, _, users = request(base, "GET", "/admin/users", cookie=admin)
+            self.assertNotIn("checked", users.split("Let an administrator approve")[0].rsplit("<input", 1)[1])
+            request(base, "POST", "/admin/self-approval", {"allow": "1", "csrf": csrf_for(admin)}, cookie=admin)
+            request(base, "POST", "/releases/1.1/approve", {"csrf": csrf_for(admin)}, cookie=admin)
+            self.assertIsNotNone(status_of("1.1")["approved_by"])
 
     def test_removing_a_card_resets_approval_and_sends_it_back_to_next_release(self):
         with running_server() as base:
