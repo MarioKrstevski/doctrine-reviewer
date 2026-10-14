@@ -2,7 +2,8 @@
 
 Everything that touches Anki lives here, behind small functions that take
 the plan from sync_plan (pure, tested). Rules enforced:
-- only Text and Extra are written; tags, scheduling, other fields untouched
+- only Text and Extra are written; scheduling and other fields untouched
+- tags get the release's added and removed tags; the student's own tags stay
 - adds go into the deck the student keeps Doctorine in (or "Doctorine v2")
 - retired notes are never deleted
 - every note is applied inside its own try/except; one failure never leaves
@@ -19,7 +20,7 @@ log = addon_log.log
 
 
 def local_state(col, guids):
-    """{guid: {"nid", "fields"}} for the given guids that exist locally."""
+    """{guid: {"nid", "fields", "tags"}} for the given guids that exist locally."""
     out = {}
     if not guids:
         return out
@@ -30,7 +31,7 @@ def local_state(col, guids):
     nid_by_guid = {g: nid for nid, g in rows if g in wanted}
     for guid, nid in nid_by_guid.items():
         note = col.get_note(nid)
-        out[guid] = {"nid": nid, "fields": {k: note[k] for k in note.keys()}}
+        out[guid] = {"nid": nid, "fields": {k: note[k] for k in note.keys()}, "tags": list(note.tags)}
     return out
 
 
@@ -84,6 +85,8 @@ def apply_plan(col, plan, on_progress=None):
             for field, value in u["fields"].items():
                 if field in note:
                     note[field] = value
+            if u.get("tags") is not None:
+                note.tags = list(u["tags"])
             col.update_note(note)
             counts["updated"] += 1
         except Exception as e:

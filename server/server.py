@@ -38,6 +38,7 @@ import release_build
 import apkgfile
 import cardview
 import labels
+import tagindex
 import ui
 import reupload
 import revisions
@@ -58,7 +59,8 @@ TYPE_LABELS = {
     "typo": "Typo",
     "incorrect": "Incorrect",
     "confusing": "Confusing",
-    "media": "Image / audio",
+    "tags": "Tags",
+    "media": "Image / video",
     "other": "Other",
 }
 
@@ -200,6 +202,11 @@ def init_db():
             name TEXT NOT NULL,
             created_at TEXT,
             UNIQUE(platform_deck, name)
+        );
+        CREATE TABLE IF NOT EXISTS user_decks (
+            user_id INTEGER NOT NULL,
+            deck_id INTEGER NOT NULL,
+            PRIMARY KEY (user_id, deck_id)
         );
         CREATE TABLE IF NOT EXISTS card_labels (
             guid TEXT NOT NULL,
@@ -408,6 +415,26 @@ def tag_chips(tags_json):
     chips = "".join(f'<span class="chip" title="{esc(t)}">{esc(label(t))}</span>'
                     for t in tags)
     return f'<div class="chips">{chips}</div>'
+
+
+def tag_diff_html(before_json, after_json):
+    """A tags revision as added and removed chips."""
+    try:
+        before, after = json.loads(before_json or "[]"), json.loads(after_json or "[]")
+    except ValueError:
+        before, after = [], []
+    low_b, low_a = {t.lower() for t in before}, {t.lower() for t in after}
+    added = [t for t in after if t.lower() not in low_b]
+    removed = [t for t in before if t.lower() not in low_a]
+    bits = ([f'<span class="chip tag-add" title="added">+ {esc(t)}</span>' for t in added]
+            + [f'<span class="chip tag-del" title="removed">&minus; {esc(t)}</span>' for t in removed])
+    return f'<span class="chips tagdiff">{"".join(bits) or "order only"}</span>'
+
+
+def revision_diff_html(field, before, after):
+    if field == "tags":
+        return tag_diff_html(before, after)
+    return diff_words(before or "", after or "")
 
 
 def trace_block(r):
@@ -682,6 +709,9 @@ h1 { font-family:var(--serif); font-weight:600; font-size:31px;
 .chips { display:flex; flex-wrap:wrap; gap:6px; padding:8px 16px 0; }
 .chip { font-size:11px; padding:2px 8px; border-radius:10px; background:var(--dim-soft);
   color:var(--muted); border:1px solid var(--line); white-space:nowrap; }
+.tagdiff { display:inline-flex; flex-wrap:wrap; gap:6px; padding:0; }
+.chip.tag-add { background:#E6F4EA; color:#1E5B32; border-color:#B7DEC2; }
+.chip.tag-del { background:var(--bad-soft); color:var(--bad); border-color:var(--bad-border); text-decoration:line-through; }
 .trace { padding:6px 16px; font-size:12px; color:var(--muted); }
 .trace summary { cursor:pointer; user-select:none; }
 .trace dl { display:grid; grid-template-columns:max-content 1fr; gap:2px 14px;
@@ -1435,23 +1465,74 @@ def render_detection(user, csrf):
     return page("Detection", body, "detection", user, csrf)
 
 
+def user_deck_ids(conn, user_id):
+    """The decks a person may work on, or None for every deck (no rows, or an administrator)."""
+    ids = {r[0] for r in conn.execute("SELECT deck_id FROM user_decks WHERE user_id=?", (user_id,))}
+    return ids or None
+
+
+def set_user_decks(user_id, deck_ids):
+    """Limit a person to these decks. An empty list means every deck."""
+    with db() as conn:
+        conn.execute("DELETE FROM user_decks WHERE user_id=?", (user_id,))
+        known = {r[0] for r in conn.execute("SELECT id FROM decks")}
+        for d in deck_ids:
+            if d in known:
+                conn.execute("INSERT OR IGNORE INTO user_decks (user_id, deck_id) VALUES (?,?)", (user_id, d))
+
+
+def deck_allowed(user, deck_id):
+    allowed = (user or {}).get("decks")
+    return allowed is None or deck_id in allowed
+
+
 def deck_context(user):
-    """(decks, active deck id) for a signed-in user. Falls back to the first deck."""
+    """(decks, active deck id) for a signed-in user: only the decks they may see.
+    Falls back to the first of those. 0 when they may see none (all deleted)."""
     with db() as conn:
         decks = [dict(r) for r in conn.execute("SELECT id, slug, name FROM decks ORDER BY id")]
+    decks = [d for d in decks if deck_allowed(user, d["id"])]
     want = (user or {}).get("active_deck") or 1
     ids = {d["id"] for d in decks}
-    return decks, (want if want in ids else (decks[0]["id"] if decks else 1))
+    return decks, (want if want in ids else (decks[0]["id"] if decks else 0))
+
+
+def target_deck(path, full_path, raw):
+    """The deck a request is about, when its URL or form names one card, report,
+    release or upload. None when the page works on the active deck instead."""
+    qs = parse_qs(urlparse(full_path).query)
+    form = parse_qs(raw.decode("utf-8", "replace")) if raw else {}
+    with db() as conn:
+        def one(sql, arg):
+            r = conn.execute(sql, (arg,)).fetchone()
+            return (r[0] or 1) if r else None
+        if path in ("/cards/edit", "/cards/retire", "/cards/revert"):
+            return one("SELECT platform_deck FROM notes WHERE doctrine_id=?", qs.get("guid", [""])[0])
+        if path == "/labels/set":
+            return one("SELECT platform_deck FROM notes WHERE doctrine_id=?", form.get("guid", [""])[0])
+        if path.startswith("/edit/"):
+            return one("SELECT platform_deck FROM suggestions WHERE id=?", path[len("/edit/"):])
+        if path == "/reviewer/action":
+            return one("SELECT platform_deck FROM suggestions WHERE id=?", form.get("id", [""])[0])
+        if path.startswith("/uploads/"):
+            return one("SELECT platform_deck FROM uploads WHERE id=?", path[len("/uploads/"):].split("/")[0])
+        if path.startswith("/download/release/"):
+            return one("SELECT platform_deck FROM releases WHERE version=?", unquote(path[len("/download/release/"):]))
+        if path.startswith("/releases/"):
+            v = unquote(path[len("/releases/"):].split("/")[0])
+            if v not in ("next", "status", "pending", "token", "confirm", "cut"):
+                return one("SELECT platform_deck FROM releases WHERE version=?", v)
+    return None
 
 
 def active_deck_id(user):
     return deck_context(user)[1]
 
 
-def select_deck(user_id, slug):
+def select_deck(user_id, slug, user=None):
     with db() as conn:
         d = conn.execute("SELECT id FROM decks WHERE slug=?", (slug,)).fetchone()
-        if d:
+        if d and deck_allowed(user, d["id"]):
             conn.execute("UPDATE users SET active_deck=? WHERE id=?", (d["id"], user_id))
             return True
     return False
@@ -1930,8 +2011,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def _deck_denied(self, path, raw=b""):
+        """Stop someone limited to some decks from opening another deck's card,
+        report, release or upload by its URL."""
+        user = self._current_user()
+        if user is None or user.get("decks") is None:
+            return False
+        deck = target_deck(path, self.path, raw)
+        if deck is None or deck in user["decks"]:
+            return False
+        self._send(403, page("Not available", "<h1>Not available</h1><p>This belongs to a deck you do not "
+                             "have access to. An administrator can change that on the Users page.</p>", "", user,
+                             auth.csrf_token(self._cookie_token(), session_secret())))
+        return True
+
     def _do_GET(self):
         path = urlparse(self.path).path
+        if self._deck_denied(path):
+            return
         if path.startswith("/media/"):
             name = unquote(path[len("/media/"):])
             found = None
@@ -2106,6 +2203,18 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self._json(200, {"status": up["status"],
                                      "error": json.loads(up["summary_json"] or "{}").get("error", "")})
+        elif path == "/cards/tags":
+            user = self._current_user()
+            if user is None:
+                self._json(401, {"error": "Sign in first."})
+            else:
+                qs = parse_qs(urlparse(self.path).query)
+                with db() as conn:
+                    data = tagindex.index(conn, active_deck_id(user))
+                if "find" in qs:
+                    self._json(200, {"hits": tagindex.search(data, qs["find"][0])})
+                else:
+                    self._json(200, {"children": tagindex.children(data, qs.get("prefix", [""])[0])})
         elif path in ("/cards", "/cards/edit"):
             user = self._current_user()
             if user is None:
@@ -2222,6 +2331,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b""
         path = urlparse(self.path).path
+        if self._deck_denied(path, raw):
+            return
 
         if path == "/api/suggestions":
             try:
@@ -2340,7 +2451,7 @@ class Handler(BaseHTTPRequestHandler):
             elif not self._csrf_ok(form):
                 self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
             else:
-                select_deck(user["id"], form.get("deck", [""])[0])
+                select_deck(user["id"], form.get("deck", [""])[0], user)
                 back = urlparse(self.headers.get("Referer", "")).path or "/reviewer"
                 self._redirect(back if back.startswith("/") and not back.startswith("//") else "/reviewer")
         elif path == "/deck/delete":
@@ -2500,11 +2611,37 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     with db() as conn:
                         revisions.apply_edit(conn, guid, values, user["id"], "staff")
+                        if "tags" in form:
+                            revisions.apply_tags(conn, guid, form["tags"][0], user["id"], "staff")
                     self._redirect("/releases/next")
                 except (ValueError, LookupError) as e:
                     csrf = auth.csrf_token(self._cookie_token(), session_secret())
                     html = render_card_edit(user, csrf, guid, str(e))
                     self._send(200 if html else 404, html or page("Not found", "<h1>No such card</h1>"))
+        elif path in ("/cards/retire", "/cards/revert"):
+            user = self._current_user()
+            form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+            guid = parse_qs(urlparse(self.path).query).get("guid", [""])[0]
+            if user is None:
+                self._redirect("/login")
+            elif not self._csrf_ok(form):
+                self._send(403, page("Forbidden", "<h1>Forbidden</h1><p>Invalid form token.</p>"))
+            else:
+                try:
+                    with db() as conn:
+                        if path == "/cards/retire":
+                            revisions.retire_note(conn, guid, user["id"], "staff")
+                            outcome = "kept"
+                        else:
+                            outcome = revisions.revert_pending(conn, guid)
+                except LookupError:
+                    outcome = None
+                    self._send(404, page("Not found", "<h1>No such card</h1>", "cards", user))
+                else:
+                    if outcome == "deleted":
+                        self._redirect("/releases/next")
+                    else:
+                        self._redirect(f"/cards/edit?guid={quote(guid, safe='')}")
         elif path.startswith("/edit/") or path == "/notes/new":
             user = self._current_user()
             form = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
@@ -2590,12 +2727,36 @@ def render_login(error=None, username=""):
     return page("Sign in", body)
 
 
+USERS_CSS = """<style>
+.deckaccess summary { cursor:pointer; color:var(--accent-ink); }
+.deckaccess form { margin-top:8px; display:grid; gap:8px; justify-items:start; }
+.scope { display:flex; flex-wrap:wrap; gap:4px 14px; align-items:center; }
+.scope-decks { display:flex; flex-wrap:wrap; gap:4px 12px; padding-left:22px; flex-basis:100%; }
+.scope:has(input[value=all]:checked) .scope-decks { opacity:.45; pointer-events:none; }
+.create-decks { display:flex; gap:10px; align-items:flex-start; flex-basis:100%; }
+</style>"""
+
+
+def _deck_scope_fields(decks, chosen, uid):
+    """'All decks' or 'Only these decks' with a checkbox per deck."""
+    some = bool(chosen)
+    boxes = "".join(
+        f'<label class="chk"><input type="checkbox" name="deck" value="{d["id"]}"{" checked" if d["id"] in (chosen or ()) else ""}> {esc(d["name"])}</label>'
+        for d in decks)
+    return (f'<div class="scope" data-scope-box>'
+            f'<label class="chk"><input type="radio" name="scope" value="all"{"" if some else " checked"}> All decks</label>'
+            f'<label class="chk"><input type="radio" name="scope" value="some"{" checked" if some else ""}> Only these</label>'
+            f'<div class="scope-decks">{boxes}</div></div>')
+
+
 def render_admin_users(user, csrf, notice=None, new_password=None):
     with db() as conn:
         rows = conn.execute(
             "SELECT id, username, role, active, created_at FROM users"
             " ORDER BY role='reviewer', username").fetchall()
         self_ok = self_approval_allowed(conn)
+        decks = [dict(r) for r in conn.execute("SELECT id, name FROM decks ORDER BY id")]
+        access = {r["id"]: user_deck_ids(conn, r["id"]) for r in rows}
     self_approval_form = f"""
 <form method="post" action="/admin/self-approval" style="margin:22px 0">
   <input type="hidden" name="csrf" value="{csrf}">
@@ -2617,17 +2778,36 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
     elif notice:
         banner = f'<p class="notice">{esc(notice)}</p>'
 
+    names = {d["id"]: d["name"] for d in decks}
     items = []
     for r in rows:
         state = "active" if r["active"] else "inactive"
         toggle = "deactivate" if r["active"] else "activate"
+        chosen = access.get(r["id"])
+        if r["role"] == "admin":
+            deck_cell = '<span class="small">All decks (administrator)</span>'
+        else:
+            summary = ("All decks" if not chosen else ", ".join(names[d] for d in sorted(chosen) if d in names) or "No deck")
+            deck_cell = (f'<details class="deckaccess"><summary>{esc(summary)}</summary>'
+                         f'<form method="post" action="/admin/users">'
+                         f'<input type="hidden" name="csrf" value="{csrf}"><input type="hidden" name="user_id" value="{r["id"]}">'
+                         f'<input type="hidden" name="do" value="decks">{_deck_scope_fields(decks, chosen, r["id"])}'
+                         f'<button type="submit" class="secondary">Save access</button></form></details>')
+        role_do, role_label = (("make_reviewer", "Make reviewer") if r["role"] == "admin"
+                               else ("make_admin", "Make administrator"))
         items.append(f"""
 <tr class="{state}">
   <td>{esc(r['username'])}</td>
   <td><span class="role role-{r['role']}">{r['role']}</span></td>
+  <td>{deck_cell}</td>
   <td>{state}</td>
   <td>
     <div class="row" style="gap:8px;flex-wrap:nowrap">
+    <form method="post" action="/admin/users" class="inline">
+      <input type="hidden" name="csrf" value="{csrf}">
+      <input type="hidden" name="user_id" value="{r['id']}">
+      <button name="do" value="{role_do}" class="secondary">{role_label}</button>
+    </form>
     <form method="post" action="/admin/users" class="inline">
       <input type="hidden" name="csrf" value="{csrf}">
       <input type="hidden" name="user_id" value="{r['id']}">
@@ -2651,13 +2831,17 @@ def render_admin_users(user, csrf, notice=None, new_password=None):
   <input type="hidden" name="do" value="create">
   <input type="text" name="username" placeholder="New reviewer username" required>
   <label class="chk"><input type="checkbox" name="admin" value="1"> Administrator</label>
+  <div class="create-decks"><span class="small">Decks</span>{_deck_scope_fields(decks, None, 0)}</div>
   <button type="submit">Create</button>
 </form>
 <table class="tbl">
-  <thead><tr><th>User</th><th>Role</th><th>Status</th><th>Actions</th></tr></thead>
+  <thead><tr><th>User</th><th>Role</th><th>Decks</th><th>Status</th><th>Actions</th></tr></thead>
   <tbody>{''.join(items)}</tbody>
 </table>
 {self_approval_form}
+<p class="admin-note">A reviewer limited to some decks only sees those decks in the deck switcher, and
+links into other decks are refused. Administrators always see every deck.</p>
+{USERS_CSS}
 <p class="admin-note">Deactivating keeps a person's review history intact
 and signs them out immediately. Resetting a password also signs them out.
 There is no email in this system, so hand credentials over directly.</p>
@@ -2705,11 +2889,24 @@ def admin_action(form):
     """Apply an admin action. Returns (notice, new_password_tuple_or_None)."""
     action = form.get("do", [""])[0]
 
+    def deck_ids():
+        out = []
+        for v in form.get("deck", []):
+            try:
+                out.append(int(v))
+            except ValueError:
+                pass
+        return out
+
     if action == "create":
         username = form.get("username", [""])[0].strip()
         role = "admin" if form.get("admin") else "reviewer"
         password = auth.generate_password()
         ok, message = create_user(username, password, role)
+        if ok and role != "admin" and form.get("scope", ["all"])[0] == "some":
+            with db() as conn:
+                new_id = conn.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()[0]
+            set_user_decks(new_id, deck_ids())
         return (None, (username, password)) if ok else (message, None)
 
     try:
@@ -2740,6 +2937,26 @@ def admin_action(form):
         set_active(user_id, True)
         return (f"Reactivated {target['username']}. Reset their password to "
                 "give them a way back in."), None
+
+    if action == "decks":
+        if form.get("scope", ["all"])[0] == "some":
+            ids = deck_ids()
+            if not ids:
+                return "Pick at least one deck, or choose All decks.", None
+            set_user_decks(user_id, ids)
+            return f"{target['username']} now works on the chosen decks only.", None
+        set_user_decks(user_id, [])
+        return f"{target['username']} now works on every deck.", None
+
+    if action in ("make_admin", "make_reviewer"):
+        role = "admin" if action == "make_admin" else "reviewer"
+        if role == "reviewer" and target["role"] == "admin" and count_active_admins(exclude_id=user_id) == 0:
+            return ("That is the only active administrator. Make someone else an "
+                    "administrator first."), None
+        with db() as conn:
+            conn.execute("UPDATE users SET role=? WHERE id=?", (role, user_id))
+        return (f"{target['username']} is now an administrator." if role == "admin"
+                else f"{target['username']} is now a reviewer."), None
 
     return "Unknown action.", None
 
@@ -2946,9 +3163,12 @@ EDITOR_SCRIPT = r"""
   });
   var save = document.getElementById('savebtn');
   var status = document.getElementById('savestate');
+  var tracked = Array.from(document.querySelectorAll('[data-track]'));
+  var initialTracked = tracked.map(function (el) { return el.dataset.initial !== undefined ? el.dataset.initial : el.value; });
   function dirty() {
     if (!save) return;
-    var changed = areas.some(function (ta) { return ta.value !== initial[ta.name]; });
+    var changed = areas.some(function (ta) { return ta.value !== initial[ta.name]; })
+      || tracked.some(function (el, i) { return el.value !== initialTracked[i]; });
     if (!save.dataset.always) save.disabled = !changed;
     if (status) status.textContent = changed ? 'Unsaved changes' : 'No changes yet';
   }
@@ -2994,6 +3214,7 @@ EDITOR_SCRIPT = r"""
     if (side === 'back' && map[e.key]) rate(map[e.key]);
   });
   areas.forEach(function (ta) { ta._sync(); });
+  window.edDirty = dirty;
   dirty(); anki();
 })();
 </script>"""
@@ -3021,8 +3242,82 @@ EDITOR_CSS = """
   background:var(--panel); margin:6px 0 16px; }
 .ed-publish input[type=text] { width:100%; box-sizing:border-box; }
 .ed-actions { display:flex; gap:12px; align-items:center; }
+.tagbox { display:flex; flex-wrap:wrap; gap:6px; align-items:center; padding:6px 8px; min-height:38px;
+  border:1px solid var(--line-strong); border-radius:6px; background:#fff; cursor:text; }
+.tagbox:focus-within { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+.tagbox .tagchips { display:contents; }
+.tagbox .tchip { display:inline-flex; align-items:center; gap:4px; font-size:12px; padding:2px 4px 2px 9px;
+  border-radius:12px; background:var(--accent-soft); color:var(--accent-ink); border:1px solid var(--accent-border); }
+.tagbox .tchip button { all:unset; cursor:pointer; width:16px; height:16px; line-height:16px; text-align:center;
+  border-radius:50%; color:var(--muted); font-size:13px; }
+.tagbox .tchip button:hover { background:rgba(0,0,0,.08); color:var(--ink); }
+.tagbox input { flex:1 1 180px; min-width:120px; border:0; outline:none; padding:4px 2px; font:13px var(--sans); background:transparent; }
 @media (max-width: 900px) { .ed-grid { grid-template-columns:minmax(0,1fr); } }
 </style>"""
+
+TAG_SCRIPT = r"""
+<script>
+(function () {
+  var box = document.querySelector('[data-tagbox]');
+  if (!box) return;
+  var hidden = document.getElementById('tagsval'), input = document.getElementById('tagin');
+  var holder = box.querySelector('.tagchips');
+  var tags = hidden.value.split(/\s+/).filter(Boolean);
+  function render() {
+    holder.innerHTML = '';
+    tags.forEach(function (t, i) {
+      var c = document.createElement('span'); c.className = 'tchip'; c.title = t;
+      c.appendChild(document.createTextNode(t));
+      var x = document.createElement('button'); x.type = 'button'; x.textContent = '\u00d7';
+      x.setAttribute('aria-label', 'Remove tag ' + t);
+      x.addEventListener('click', function () { tags.splice(i, 1); changed(); });
+      c.appendChild(x); holder.appendChild(c);
+    });
+  }
+  function changed() {
+    hidden.value = tags.join(' ');
+    render();
+    if (window.edDirty) window.edDirty();
+  }
+  function add(raw) {
+    (raw || '').split(/[\s,]+/).filter(Boolean).forEach(function (t) {
+      var low = t.toLowerCase();
+      if (!tags.some(function (x) { return x.toLowerCase() === low; })) tags.push(t);
+    });
+    input.value = '';
+    changed();
+  }
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' || e.key === ',' || e.key === ' ') {
+      if (input.value.trim()) { e.preventDefault(); add(input.value); }
+      else if (e.key === 'Enter') e.preventDefault();
+    } else if (e.key === 'Backspace' && !input.value && tags.length) {
+      tags.pop(); changed();
+    }
+  });
+  input.addEventListener('change', function () { if (input.value.trim()) add(input.value); });
+  box.addEventListener('click', function (e) { if (e.target === box) input.focus(); });
+  var form = box.closest('form');
+  if (form) form.addEventListener('submit', function () { if (input.value.trim()) add(input.value); });
+  render();
+})();
+</script>"""
+
+
+def tag_editor(tags, suggestions=()):
+    """Chips with remove buttons plus an input that suggests the deck's tags.
+    Posts the tags space separated in `tags`."""
+    value = " ".join(tags or [])
+    opts = "".join(f'<option value="{esc(t)}"></option>' for t in list(suggestions)[:4000])
+    return f"""
+<div class="ed-field"><label for="tagin">Tags</label>
+<div class="tagbox" data-tagbox><span class="tagchips"></span>
+<input id="tagin" list="taglist" autocomplete="off" placeholder="Add a tag and press Enter"></div>
+<input type="hidden" name="tags" id="tagsval" value="{esc(value)}" data-track data-initial="{esc(value)}">
+<datalist id="taglist">{opts}</datalist>
+<p class="small" style="margin:6px 0 0">Tags place the card in the scheduler and in students' tag lists.
+Nested tags use <code>::</code>, for example <code>Doctorine::Shelf::Micro</code>.</p></div>"""
+
 
 
 def editor_form(action, values, csrf, with_publish=True, submit_label="Save and accept", extra_html="",
@@ -3052,8 +3347,8 @@ def editor_form(action, values, csrf, with_publish=True, submit_label="Save and 
 
 
 _EDITOR_HINT = ui.infobox("Writing cards", "<p>Cloze markers look like <code>{{c1::answer}}</code> and are highlighted in the preview. "
-                          "Only <b>Text</b> and <b>Extra</b> can be edited here. Tags are never changed by edits, "
-                          "because the scheduler uses them.</p>")
+                          "<b>Text</b> and <b>Extra</b> are edited here. Tags are edited on the card's own page "
+                          "(Cards, then open the card). Other fields of the note type stay as they are.</p>")
 
 
 def _editor_tabs(edit_html, history_html):
@@ -3134,34 +3429,68 @@ def values_text(master):
 
 def render_card_edit(user, csrf, guid, error=None):
     with db() as conn:
-        master = conn.execute("SELECT * FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
-        history = card_history_html(conn, guid) if master else ""
+        master = conn.execute("SELECT * FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+        if master is None:
+            return None
+        history = card_history_html(conn, guid)
         pend = conn.execute("SELECT COUNT(*) FROM revisions WHERE guid=? AND release IS NULL",
-                            (guid,)).fetchone()[0] if master else 0
-    if master is None:
-        return None
+                            (guid,)).fetchone()[0]
+        pending_retire = conn.execute("SELECT 1 FROM revisions WHERE guid=? AND field='retired' AND release IS NULL",
+                                      (guid,)).fetchone() is not None
+        deck_id = master["platform_deck"] or 1
+        suggestions = [t for t, _ in tagindex.all_tags(tagindex.index(conn, deck_id))]
+        my_labels = labels.labels_for(conn, [guid])[guid]
+        all_lab = labels.all_labels(conn, deck_id)
+    q = quote(guid, safe="")
+    undo_form = (f'<form method="post" action="/cards/revert?guid={q}" class="inline">'
+                 f'<input type="hidden" name="csrf" value="{csrf}">'
+                 '<button type="submit" class="secondary">Undo pending changes</button></form>')
+    if master["retired"]:
+        if pending_retire:
+            body = (f'<h1>Card removed</h1><p class="sub"><code>{esc(guid)}</code></p>'
+                    '<p class="notice">This card leaves the deck in the next release. Until that release is built '
+                    'you can undo it, which also undoes any other pending change to the card.</p>'
+                    f'<div class="ed-actions">{undo_form}</div>' + _editor_tabs("", history))
+        else:
+            body = (f'<h1>Card removed</h1><p class="sub"><code>{esc(guid)}</code></p>'
+                    '<p>This card was removed from the deck in an earlier release.</p>' + _editor_tabs("", history))
+        return page("Card removed", body + EDITOR_CSS + EDITOR_SCRIPT, "cards", user, csrf)
     notice = (f'<p class="notice">This card already has {pend} pending edit(s) waiting for the next '
               'release. The fields below show them, and saving builds on top.</p>') if pend else ""
     values = json.loads(master["fields_json"] or "{}")
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
-    with db() as conn:
-        my_labels = labels.labels_for(conn, [guid])[guid]
-        all_lab = labels.all_labels(conn, master["platform_deck"] or 1)
     label_row = (f'<p class="labelrow" style="margin:0 0 10px"><span class="small">Labels</span>{label_chips(my_labels)}'
                  f'{label_button(guid, my_labels, ui.plain_text(values_text(master), 80), "Edit labels" if my_labels else "Add a label")}</p>')
-    edit = (notice + msg + label_row + _EDITOR_HINT + tag_chips(master["tags_json"])
-            + editor_form(f"/cards/edit?guid={quote(guid, safe='')}", values, csrf, with_publish=False, submit_label="Save"))
+    tags = json.loads(master["tags_json"] or "[]")
+    edit = (notice + msg + label_row + _EDITOR_HINT
+            + editor_form(f"/cards/edit?guid={q}", values, csrf, with_publish=False, submit_label="Save",
+                          extra_html=tag_editor(tags, suggestions)))
+    remove_dialog = f"""
+<div class="dlg-back" id="removedlg"><div class="dlg"><h3>Remove this card from the deck?</h3>
+  <p>It leaves the deck in the next release. Students keep their copy and their review history,
+  the update only stops shipping it. You can undo this until the release is built.</p>
+  <form method="post" action="/cards/retire?guid={q}">
+    <input type="hidden" name="csrf" value="{csrf}">
+    <div class="foot"><button type="button" class="btn-quiet" data-close>Cancel</button>
+    <button type="submit" class="btn-danger">Remove card</button></div>
+  </form></div></div>"""
+    danger = (f'<div class="ed-actions" style="margin-top:28px;padding-top:16px;border-top:1px solid var(--line)">'
+              f'{undo_form if pend else ""}'
+              '<button type="button" class="secondary" data-dialog="removedlg">Remove card from the deck</button></div>')
     body = (f'<h1>Edit card</h1><p class="sub"><code>{esc(guid)}</code> &middot; version {master["version"]}. '
             'Saving changes the card in the online deck and queues it for the next release.</p>'
-            + _editor_tabs(edit, history) + label_dialog(all_lab, csrf, f"/cards/edit?guid={quote(guid, safe='')}")
-            + EDITOR_CSS + EDITOR_SCRIPT)
+            + _editor_tabs(edit + danger, history) + label_dialog(all_lab, csrf, f"/cards/edit?guid={q}")
+            + remove_dialog + EDITOR_CSS + EDITOR_SCRIPT + TAG_SCRIPT)
     return page("Edit card", body, "cards", user, csrf)
 
 
 def render_new_note(user, csrf, error=None):
+    deck_id = active_deck_id(user)
     with db() as conn:
         types = [r["note_type"] for r in conn.execute(
-            "SELECT note_type, COUNT(*) n FROM notes GROUP BY note_type ORDER BY n DESC")]
+            "SELECT note_type, COUNT(*) n FROM notes WHERE COALESCE(platform_deck,1)=? GROUP BY note_type ORDER BY n DESC",
+            (deck_id,))]
+        suggestions = [t for t, _ in tagindex.all_tags(tagindex.index(conn, deck_id))]
     opts = "".join(f'<option value="{esc(t)}">{esc(t)}</option>' for t in types)
     msg = f'<p class="login-error">{esc(error)}</p>' if error else ""
     body = f"""
@@ -3175,12 +3504,10 @@ Tags decide where the scheduler places it.</p>
   <select id="nt" name="note_type">{opts}</select></div>
   {_editor_field("Text", "", 12)}
   {_editor_field("Extra", "", 8)}
-  <div class="ed-field"><label for="tags">Tags (space separated, the scheduler uses these)</label>
-  <input id="tags" type="text" name="tags" style="width:100%;box-sizing:border-box"
-         placeholder="Doctorine::Yield::Step1::Gold Doctorine::Shelf::Internal_Medicine::Silver"></div>
+  {tag_editor([], suggestions)}
   <div class="ed-actions"><button type="submit">Add note</button>
   <a class="btn-link" href="/releases/next">Cancel</a></div>
-</form>{EDITOR_CSS}{EDITOR_SCRIPT}"""
+</form>{EDITOR_CSS}{EDITOR_SCRIPT}{TAG_SCRIPT}"""
     return page("Add a note", body, "reviewer", user, csrf)
 
 
@@ -3195,7 +3522,7 @@ def render_pending(user, csrf):
             if rv["field"] == "added":
                 rows += f'<dt>added</dt><dd class="diff"><ins>{esc(rv["after"])}</ins></dd>'
             else:
-                rows += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{diff_words(rv["before"], rv["after"])}</dd>'
+                rows += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{revision_diff_html(rv["field"], rv["before"], rv["after"])}</dd>'
         who = ", ".join(sorted({(rv["username"] or "?") for rv in g["revisions"]}))
         src = ", ".join(sorted({rv["source"] or "" for rv in g["revisions"]}))
         items.append(f"""
@@ -3210,7 +3537,7 @@ def render_pending(user, csrf):
 
 
 def new_note_from_form(form, user_id, deck_id=1):
-    tags = [t for t in (form.get("tags", [""])[0]).split() if t]
+    tags = revisions.clean_tags(form.get("tags", [""])[0])
     fields = {f: form.get(f, [""])[0] for f in revisions.EDITABLE_FIELDS}
     with db() as conn:
         return revisions.add_note(conn, form.get("note_type", [""])[0] or "AnKingOverhaul++++++",
@@ -3530,19 +3857,19 @@ def render_upload(user, csrf, upload_id):
     diff = json.loads(up["diff_json"]); incoming = json.loads(up["incoming_json"]); summ = json.loads(up["summary_json"] or "{}")
     applied = up["status"] != "pending"
 
-    def radio(guid, options, default):
+    def radio(guid, options, default, prefix="d"):
         if applied:
             return ""
         return " ".join(
-            f'<label class="chk"><input type="radio" name="d:{esc(guid)}" value="{v}"'
+            f'<label class="chk"><input type="radio" name="{prefix}:{esc(guid)}" value="{v}"'
             f'{" checked" if v == default else ""}> {label}</label>' for v, label in options)
 
-    def section(title, guids, body_fn, options=None, default=None):
+    def section(title, guids, body_fn, options=None, default=None, prefix="d"):
         if not guids:
             return ""
         items = "".join(
             f'<div class="card"><div class="card-head"><span class="meta"><code>{esc(g)}</code></span>'
-            f'<span class="row-actions">{radio(g, options, default) if options else ""}</span></div>'
+            f'<span class="row-actions">{radio(g, options, default, prefix) if options else ""}</span></div>'
             f'<div class="proposal">{body_fn(g)}</div></div>' for g in guids)
         return f'<h2>{title} <span class="count">{len(guids)}</span></h2>{items}'
 
@@ -3555,8 +3882,8 @@ def render_upload(user, csrf, upload_id):
 <p class="sub">Uploaded {esc(up['created_at'])} &middot; status <b>{esc(up['status'])}</b> &middot;
 {summ.get('unchanged', 0)} unchanged, {summ.get('changed', 0)} changed, {summ.get('conflicts', 0)} conflicts,
 {summ.get('new', 0)} new, {summ.get('missing', 0)} missing from the file.
-Tag changes ({summ.get('tag_changes', 0)}) and changes to non-editable fields ({summ.get('other_field_changes', 0)})
-are listed but never applied.</p>
+{summ.get('tag_changes', 0)} tag changes. Changes to fields other than Text and Extra
+({summ.get('other_field_changes', 0)}) are listed but never applied.</p>
 <form method="post" action="/uploads/{up['id']}/apply">
 <input type="hidden" name="csrf" value="{csrf}">
 {section("Changed", list(diff["changed"]), lambda g: field_diffs(diff["changed"][g]["fields"]),
@@ -3569,8 +3896,9 @@ are listed but never applied.</p>
          [("add", "Add"), ("skip", "Skip")], "add")}
 {section("Missing from the file", diff["missing"], lambda g: '<p class="small">Not in the uploaded deck. Kept unless retired.</p>',
          [("keep", "Keep"), ("retire", "Retire")], "keep")}
-{section("Tag changes (not applied)", list(diff["tag_changes"]),
-         lambda g: f'<p class="small">platform: {esc(" ".join(diff["tag_changes"][g][0]))}<br>file: {esc(" ".join(diff["tag_changes"][g][1]))}</p>')}
+{section("Tag changes", list(diff["tag_changes"]),
+         lambda g: f'<p class="small">{tag_diff_html(json.dumps(diff["tag_changes"][g][0]), json.dumps(diff["tag_changes"][g][1]))}</p>',
+         [("file", "Apply file tags"), ("skip", "Keep platform tags")], "file", prefix="t")}
 {section("Other field changes (not applied)", list(diff["other_field_changes"]),
          lambda g: f'<p class="small">{esc(", ".join(diff["other_field_changes"][g]))}</p>')}
 {"" if applied else '<div class="actions"><button type="submit">Apply selected</button></div>'}
@@ -3584,11 +3912,14 @@ def apply_upload(upload_id, form, user_id):
         if up is None or up["status"] != "pending":
             return False
         diff = json.loads(up["diff_json"]); incoming = json.loads(up["incoming_json"])
-        decisions = {}
+        decisions, tag_decisions = {}, {}
         for key, vals in form.items():
             if key.startswith("d:"):
                 decisions[key[2:]] = vals[0]
-        reupload.apply(conn, diff, incoming, decisions, user_id, up["id"], up.get("platform_deck") or 1)
+            elif key.startswith("t:"):
+                tag_decisions[key[2:]] = vals[0]
+        reupload.apply(conn, diff, incoming, decisions, user_id, up["id"], up.get("platform_deck") or 1,
+                       tag_decisions=tag_decisions)
         conn.execute("UPDATE uploads SET status='applied', applied_at=?, applied_by=? WHERE id=?",
                      (now(), user_id, up["id"]))
     return True
@@ -3612,7 +3943,7 @@ def changelog_for(conn, guids):
     for g in revisions.pending_by_kind(conn, set(guids)):
         lines.append(f"{g['label']} ({len(g['notes'])})")
         for n in g["notes"]:
-            fields = sorted({rv["field"] for rv in n["revisions"] if rv["field"] in revisions.EDITABLE_FIELDS})
+            fields = sorted({rv["field"] for rv in n["revisions"] if rv["field"] in revisions.EDITABLE_FIELDS + ("tags",)})
             row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (n["guid"],)).fetchone()
             text = ui.plain_text((json.loads(row["fields_json"] or "{}") if row else {}).get("Text", ""), 90) or n["guid"]
             lines.append(f"- {text} ({', '.join(fields) or 'new card'}) by {', '.join(n['users'])}")
@@ -3754,7 +4085,7 @@ def render_next_release(user, csrf, label_filter=()):
                 elif rv["field"] == "retired":
                     parts += '<dt>retired</dt><dd class="diff"><del>removed from the deck</del></dd>'
                 else:
-                    parts += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{diff_words(rv["before"], rv["after"])}</dd>'
+                    parts += f'<dt>{esc(rv["field"])}</dt><dd class="diff">{revision_diff_html(rv["field"], rv["before"], rv["after"])}</dd>'
             src = ", ".join(s.replace("suggestion:", "#") for s in n["sources"])
             rows += f"""
 <div class="card nr-note"><div class="card-head">
@@ -3901,9 +4232,14 @@ def _build_release(version):
             revs = [dict(r) for r in conn.execute(
                 "SELECT * FROM revisions WHERE release=? ORDER BY id", (version,))]
             changed_guids = {r["guid"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS}
+            tagged_guids = {r["guid"] for r in revs if r["field"] == "tags"}
             added_guids = [r["guid"] for r in revs if r["field"] == "added"]
             retired = [r["guid"] for r in revs if r["field"] == "retired"]
             included = set(_versions_through(conn, version))
+            tag_changes = {}
+            for guid in tagged_guids - set(added_guids) - set(retired):
+                row = conn.execute("SELECT tags_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+                tag_changes[guid] = revisions.tags_at(conn, guid, included, json.loads(row["tags_json"] or "[]") if row else [])
             changed = {}
             for guid in changed_guids - set(added_guids):
                 row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
@@ -3918,14 +4254,15 @@ def _build_release(version):
                     nf.update(revisions.text_at(conn, guid, included, nf))
                     new_notes.append({"guid": guid, "note_type": row["note_type"],
                                       "fields": nf,
-                                      "tags": json.loads(row["tags_json"] or "[]")})
+                                      "tags": revisions.tags_at(conn, guid, included, json.loads(row["tags_json"] or "[]"))})
             media = media_for_package(conn, deck_id)
 
         d = releases.release_dir(version)
         os.makedirs(d, exist_ok=True)
         col_path = os.path.join(d, "collection.sqlite")
         counts = release_build.patch_collection(prev["collection_path"], col_path, changed, new_notes,
-                                                retired, now=int(datetime.now(timezone.utc).timestamp()))
+                                                retired, now=int(datetime.now(timezone.utc).timestamp()),
+                                                tags=tag_changes)
         release_build.compressed_collection(col_path)   # downloads reuse this instead of compressing each time
         info = {"media": len(media), "stored_package": False}
 
@@ -4000,7 +4337,7 @@ def release_changes(conn, version, limit=None):
         kind = revisions.kind_of(conn, revs[0])
         out.append({"kind": kind, "label": revisions.KIND_LABELS.get(kind, kind),
                     "snippet": ui.plain_text(_text_as_of(conn, guid, version, fields), 90) or guid,
-                    "fields": sorted({r["field"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS}),
+                    "fields": sorted({r["field"] for r in revs if r["field"] in revisions.EDITABLE_FIELDS + ("tags",)}),
                     "who": sorted({r["username"] for r in revs if r["username"]}), "guid": guid})
     return out
 
@@ -4109,7 +4446,7 @@ def render_release_detail(user, csrf, version, message=None, ok=True):
             return '<div class="chgline"><span class="k">New card</span></div>'
         if ch["field"] == "retired":
             return '<div class="chgline"><span class="k">Retired</span> removed from the deck</div>'
-        return f'<div class="chgline"><span class="k">{esc(ch["field"])}</span> <span class="diff">{diff_words(ch["before"], ch["after"])}</span></div>'
+        return f'<div class="chgline"><span class="k">{esc(ch["field"])}</span> <span class="diff">{revision_diff_html(ch["field"], ch["before"], ch["after"])}</span></div>'
 
     def source_html(c):
         bits = []
@@ -4337,6 +4674,11 @@ def sync_payload(conn, since, deck_id=1):
     Collapses multiple revisions of one field to its final value and reports
     `before` (the field at `since`) so the add-on can tell a local edit from
     an untouched card. Unknown `since` → everything after the first release.
+
+    Tag changes ride on the same entries as {"tags": {"add": [...], "remove": [...]}},
+    the difference between the tags at `since` and now, so a student's own tags
+    survive. A note whose only change is its tags carries empty "fields": add-ons
+    before 1.8 skip such an entry instead of rewriting the text.
     """
     order = _release_order(conn, deck_id)
     current = order[-1] if order else None
@@ -4349,7 +4691,7 @@ def sync_payload(conn, since, deck_id=1):
     revs = conn.execute(
         f"SELECT * FROM revisions WHERE release IN ({marks}) ORDER BY id", later).fetchall()
     added, retired, before = {}, [], {}
-    touched = set()
+    touched, tag_touched = set(), set()
     for r in revs:
         if r["field"] == "added":
             added[r["guid"]] = True
@@ -4358,19 +4700,35 @@ def sync_payload(conn, since, deck_id=1):
         elif r["field"] in revisions.EDITABLE_FIELDS:
             touched.add(r["guid"])
             before.setdefault(r["guid"], {}).setdefault(r["field"], r["before"])
+        elif r["field"] == "tags":
+            tag_touched.add(r["guid"])
     shipped = set(order)
+    at_since = set(order[:order.index(since) + 1]) if not baseline_missing else set(order[:1])
     changed, added_out, media = [], [], set()
-    for guid in sorted(touched - set(added) - set(retired)):
-        row = conn.execute("SELECT fields_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+    for guid in sorted((touched | tag_touched) - set(added) - set(retired)):
+        row = conn.execute("SELECT fields_json, tags_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
         if row is None:
             continue
-        fields = json.loads(row["fields_json"] or "{}")
-        at = revisions.text_at(conn, guid, shipped, fields)
-        now_fields = {f: at.get(f, "") for f in revisions.EDITABLE_FIELDS}
-        b = {f: before[guid].get(f, now_fields[f]) for f in revisions.EDITABLE_FIELDS}
-        changed.append({"guid": guid, "fields": now_fields, "before": b})
-        for f in now_fields.values():
-            media.update(_MEDIA_REF.findall(f or ""))
+        entry = {"guid": guid, "fields": {}, "before": {}}
+        if guid in touched:
+            fields = json.loads(row["fields_json"] or "{}")
+            at = revisions.text_at(conn, guid, shipped, fields)
+            now_fields = {f: at.get(f, "") for f in revisions.EDITABLE_FIELDS}
+            entry["fields"] = now_fields
+            entry["before"] = {f: before[guid].get(f, now_fields[f]) for f in revisions.EDITABLE_FIELDS}
+            for f in now_fields.values():
+                media.update(_MEDIA_REF.findall(f or ""))
+        if guid in tag_touched:
+            current = json.loads(row["tags_json"] or "[]")
+            old = revisions.tags_at(conn, guid, at_since, current)
+            new = revisions.tags_at(conn, guid, shipped, current)
+            old_low, new_low = {t.lower() for t in old}, {t.lower() for t in new}
+            add = [t for t in new if t.lower() not in old_low]
+            remove = [t for t in old if t.lower() not in new_low]
+            if add or remove:
+                entry["tags"] = {"add": add, "remove": remove}
+        if entry["fields"] or entry.get("tags"):
+            changed.append(entry)
     for guid in added:
         row = conn.execute("SELECT note_type, fields_json, tags_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
         if row is None:
@@ -4378,7 +4736,7 @@ def sync_payload(conn, since, deck_id=1):
         fields = json.loads(row["fields_json"] or "{}")
         fields.update(revisions.text_at(conn, guid, shipped, fields))
         added_out.append({"guid": guid, "note_type": row["note_type"], "fields": fields,
-                          "tags": json.loads(row["tags_json"] or "[]")})
+                          "tags": revisions.tags_at(conn, guid, shipped, json.loads(row["tags_json"] or "[]"))})
         for f in fields.values():
             media.update(_MEDIA_REF.findall(f or ""))
     known = set()
@@ -4419,10 +4777,10 @@ def search_cards(conn, q, deck_id=1):
         if rows:
             return rows
     if q.lower().startswith("tag:"):
-        like = f"%{q[4:].strip()}%"
+        sql, args = tagindex.sql_match(q[4:])
         return conn.execute(
-            f"SELECT * FROM notes WHERE retired=0 AND {D} AND tags_json LIKE ? ORDER BY doctrine_id LIMIT ?",
-            (deck_id, like, CARDS_LIMIT + 1)).fetchall()
+            f"SELECT * FROM notes WHERE retired=0 AND {D} AND {sql} ORDER BY doctrine_id LIMIT ?",
+            (deck_id, *args, CARDS_LIMIT + 1)).fetchall()
     like = f"%{q}%"
     return conn.execute(
         f"SELECT * FROM notes WHERE retired=0 AND {D} AND (fields_json LIKE ? OR tags_json LIKE ?) "
@@ -4440,7 +4798,8 @@ def _card_filter(q, deck_id):
     q = (q or "").strip()
     D = "retired=0 AND COALESCE(platform_deck,1)=?"
     if q.lower().startswith("tag:"):
-        return f"{D} AND tags_json LIKE ?", (deck_id, f"%{q[4:].strip()}%")
+        sql, args = tagindex.sql_match(q[4:])
+        return f"{D} AND {sql}", (deck_id, *args)
     if q.lower().startswith("label:"):
         return (f"{D} AND doctrine_id IN (SELECT cl.guid FROM card_labels cl JOIN labels l ON l.id=cl.label_id "
                 f"WHERE l.platform_deck=? AND l.name=?)", (deck_id, deck_id, labels.normalize(q[6:])))
@@ -4476,12 +4835,138 @@ def tile_tags(tags_json, uid, show=3):
         tags = []
     if not tags:
         return ""
-    chip = lambda t: f'<span class="chip" title="{esc(t)}">{esc(_tag_label(t))}</span>'
+    chip = lambda t: (f'<a class="chip" title="{esc(t)}" href="/cards?q={quote("tag:" + t)}">'
+                      f'{esc(_tag_label(t))}</a>')
     out = "".join(chip(t) for t in tags[:show])
     if len(tags) > show:
         out += (f'<button type="button" class="chip btn-quiet" data-pop="tp{uid}">+{len(tags) - show} more</button>'
                 f'<div class="pop" id="tp{uid}" hidden>{"".join(chip(t) for t in tags)}</div>')
     return f'<div class="tg">{out}</div>'
+
+
+TAG_TREE_CSS = """
+<style>
+.cards-layout { display:grid; grid-template-columns:270px minmax(0,1fr); gap:24px; align-items:start; }
+.tagtree { position:sticky; top:16px; max-height:calc(100vh - 32px); overflow:auto; border:1px solid var(--line);
+  border-radius:10px; background:var(--card); padding:10px 8px 12px; font-size:13px; }
+.tagtree > summary { list-style:none; cursor:pointer; font-size:11px; font-weight:600; letter-spacing:.06em;
+  text-transform:uppercase; color:var(--muted); padding:2px 6px 8px; }
+.tagtree > summary::-webkit-details-marker { display:none; }
+.tagtree input[type=search] { width:100%; box-sizing:border-box; margin:0 0 8px; padding:6px 8px; font-size:13px; }
+.tagtree ul { list-style:none; margin:0; padding:0 0 0 12px; }
+.tagtree > ul, .tagtree .tt-hits { padding-left:0; }
+.tagtree li { margin:0; }
+.tagtree .tt-row { display:flex; align-items:center; gap:2px; border-radius:6px; }
+.tagtree .tt-row:hover { background:var(--panel); }
+.tagtree .tt-row.on { background:var(--accent-soft); }
+.tagtree .tt-tw { all:unset; width:18px; height:22px; text-align:center; cursor:pointer; color:var(--faint); flex:none;
+  transition:transform .12s; }
+.tagtree .tt-tw[aria-expanded="true"] { transform:rotate(90deg); }
+.tagtree .tt-tw.leaf { visibility:hidden; }
+.tagtree a { flex:1; min-width:0; display:flex; gap:6px; align-items:baseline; padding:3px 6px 3px 0; color:var(--ink);
+  text-decoration:none; }
+.tagtree a .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tagtree a .n { margin-left:auto; color:var(--faint); font-size:11.5px; font-variant-numeric:tabular-nums; }
+.tagtree .tt-hits a { padding-left:6px; }
+.tagtree .tt-hits a { align-items:center; }
+.tagtree .tt-hits .nm { display:flex; flex-direction:column; white-space:normal; }
+.tagtree .tt-hits .nm b { font-weight:600; }
+.tagtree .tt-hits .path { color:var(--faint); font-size:11.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; direction:rtl; text-align:left; }
+.tagtree .tt-empty { color:var(--faint); padding:4px 6px; }
+.tg a.chip { text-decoration:none; }
+.tg a.chip:hover { border-color:var(--accent-border); color:var(--accent-ink); }
+@media (max-width: 900px) {
+  .cards-layout { grid-template-columns:minmax(0,1fr); }
+  .tagtree { position:static; max-height:60vh; }
+}
+</style>"""
+
+TAG_TREE_SCRIPT = r"""
+<script>
+(function () {
+  var tree = document.getElementById('tagtree');
+  if (!tree) return;
+  if (window.matchMedia('(max-width: 900px)').matches && !tree.dataset.current) tree.open = false;
+  var current = (tree.dataset.current || '').toLowerCase();
+  function href(path) { return '/cards?q=' + encodeURIComponent('tag:' + path); }
+  function node(n) {
+    var li = document.createElement('li');
+    var row = document.createElement('div'); row.className = 'tt-row';
+    if (n.path.toLowerCase() === current) row.classList.add('on');
+    var tw = document.createElement('button'); tw.type = 'button'; tw.className = 'tt-tw' + (n.has_children ? '' : ' leaf');
+    tw.textContent = '▸'; tw.setAttribute('aria-expanded', 'false');
+    tw.setAttribute('aria-label', 'Show tags under ' + n.name);
+    var a = document.createElement('a'); a.href = href(n.path); a.title = n.path;
+    var nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = n.name;
+    var c = document.createElement('span'); c.className = 'n'; c.textContent = n.count.toLocaleString();
+    a.appendChild(nm); a.appendChild(c);
+    row.appendChild(tw); row.appendChild(a); li.appendChild(row);
+    var ul = document.createElement('ul'); ul.hidden = true; li.appendChild(ul);
+    tw.addEventListener('click', function () { toggle(n.path, tw, ul); });
+    return {li: li, tw: tw, ul: ul};
+  }
+  function load(prefix, ul) {
+    return fetch('/cards/tags?prefix=' + encodeURIComponent(prefix), {credentials: 'same-origin'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) { ul.innerHTML = ''; var made = {};
+        (d.children || []).forEach(function (n) { var x = node(n); ul.appendChild(x.li); made[n.path.toLowerCase()] = x; });
+        ul.dataset.loaded = '1'; return made; });
+  }
+  function toggle(path, tw, ul, open) {
+    var show = open !== undefined ? open : ul.hidden;
+    tw.setAttribute('aria-expanded', show ? 'true' : 'false');
+    ul.hidden = !show;
+    if (show && !ul.dataset.loaded) return load(path, ul);
+    return Promise.resolve(null);
+  }
+  var root = tree.querySelector('ul[data-root]');
+  load('', root).then(function (made) {
+    if (!current) return;
+    var parts = (tree.dataset.current || '').split('::'), i = 1;
+    (function step(level) {
+      if (i >= parts.length || !level) return;
+      var key = parts.slice(0, i).join('::').toLowerCase(), x = level[key];
+      i++;
+      if (!x) return;
+      toggle(key, x.tw, x.ul, true).then(function (m) { step(m); });
+    })(made);
+  });
+  var find = tree.querySelector('input[type=search]'), hits = tree.querySelector('.tt-hits'), timer;
+  find.addEventListener('input', function () {
+    clearTimeout(timer);
+    var v = find.value.trim();
+    if (!v) { hits.hidden = true; root.hidden = false; return; }
+    timer = setTimeout(function () {
+      fetch('/cards/tags?find=' + encodeURIComponent(v), {credentials: 'same-origin'})
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          hits.innerHTML = ''; root.hidden = true; hits.hidden = false;
+          if (!(d.hits || []).length) { var e = document.createElement('li'); e.className = 'tt-empty'; e.textContent = 'No tag matches.'; hits.appendChild(e); return; }
+          d.hits.forEach(function (h) {
+            var li = document.createElement('li'), row = document.createElement('div'); row.className = 'tt-row';
+            var a = document.createElement('a'); a.href = href(h.path); a.title = h.path;
+            var nm = document.createElement('span'); nm.className = 'nm';
+            var cut = h.path.lastIndexOf('::');
+            var leaf = document.createElement('b'); leaf.textContent = h.path.slice(cut > 0 ? cut + 2 : 0); nm.appendChild(leaf);
+            if (cut > 0) { var p = document.createElement('span'); p.className = 'path'; p.textContent = h.path.slice(0, cut); nm.appendChild(p); }
+            var c = document.createElement('span'); c.className = 'n'; c.textContent = h.count.toLocaleString();
+            a.appendChild(nm); a.appendChild(c); row.appendChild(a); li.appendChild(row); hits.appendChild(li);
+          });
+        });
+    }, 180);
+  });
+})();
+</script>"""
+
+
+def tag_tree_html(top, current=""):
+    """The Anki-style tag sidebar. Levels load from /cards/tags as they open."""
+    if not top:
+        return '<aside></aside>'
+    return (f'<details class="tagtree" id="tagtree" open data-current="{esc(current)}"><summary>Tags</summary>'
+            '<input type="search" placeholder="Find a tag" aria-label="Find a tag">'
+            '<ul class="tt-hits" hidden></ul><ul data-root></ul></details>'
+            + TAG_TREE_CSS + TAG_TREE_SCRIPT)
 
 
 def render_cards(user, csrf, q, n=CARDS_PAGE):
@@ -4493,6 +4978,7 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
     with db() as conn:
         total = count_cards(conn, q, deck_id)
         rows = search_cards_page(conn, q, deck_id, n)
+        top_tags = tagindex.children(tagindex.index(conn, deck_id))
     tiles, fulls = [], []
     with db() as conn:
         card_labels = labels.labels_for(conn, [r["doctrine_id"] for r in rows])
@@ -4532,15 +5018,21 @@ def render_cards(user, csrf, q, n=CARDS_PAGE):
     if shown < total:
         more_link = (f'<p style="margin-top:18px"><a class="btn-link-primary" href="/cards?q={quote(q or "")}'
                      f'&n={n + CARDS_PAGE}">Show {min(CARDS_PAGE, total - shown)} more</a></p>')
+    current_tag = q[4:].strip() if (q or "").lower().startswith("tag:") else ""
+    tree = tag_tree_html(top_tags, current_tag)
     body = f"""
 <h1>Cards</h1>
-{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code>, a label with <code>label:ask anna</code>, or an ID. An ID can be the Anki note ID or the internal one, whole or partial. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
+{ui.infobox("What you can search", "<p>Search any text on a card, a tag with <code>tag:Step1::Gold</code> (whole parts of a tag, plus every tag below it, so <code>tag:Step1</code> does not also find Step10, and <code>*</code> stands for any text), a label with <code>label:ask anna</code>, or an ID. An ID can be the Anki note ID or the internal one, whole or partial. Or open a tag in the tree. Edits go to Next release like accepted suggestions do. Cards are shown the way Anki shows them, with the answer hidden on the front.</p>")}
+<div class="cards-layout">
+{tree}
+<div class="cards-main">
 <form method="get" action="/cards" class="row" style="margin:0 0 14px">
-  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, or an ID" style="min-width:380px" autofocus>
+  <input type="text" name="q" value="{esc(q or '')}" placeholder="Search text, a tag, or an ID" style="min-width:min(380px,100%)" autofocus>
   <button type="submit">Search</button>
 </form>
 {status}
 <div class="tiles">{"".join(tiles)}</div>{more_link}
+</div></div>
 {label_dialog(all_lab, csrf, "/cards?q=" + quote(q or ""))}
 <div class="dlg-back" id="fulldlg"><div class="dlg wide"><div id="fullbody"></div>
   <div class="foot"><button type="button" class="btn-quiet" data-close>Close</button></div></div></div>
@@ -4571,8 +5063,8 @@ def card_history_html(conn, guid):
         by = f" by {esc(r['username'])}" if r["username"] else ""
         state = (f'shipped in {esc(r["release"])}' if r["release"]
                  else '<span class="badge warn">pending, next release</span>')
-        if r["field"] in revisions.EDITABLE_FIELDS:
-            diff = diff_words(r["before"] or "", r["after"] or "")
+        if r["field"] in revisions.EDITABLE_FIELDS or r["field"] == "tags":
+            diff = revision_diff_html(r["field"], r["before"], r["after"])
             detail = f'<dl class="fields" style="height:auto"><dt>{esc(r["field"])}</dt><dd class="diff">{diff}</dd></dl>'
         else:
             detail = f'<p class="small">{esc(r["field"])}</p>'
@@ -4752,8 +5244,9 @@ def user_for_token(token):
         if not row["active"]:
             conn.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
             return None
+        decks = user_deck_ids(conn, row["id"]) if row["role"] != "admin" else None
     return {"id": row["id"], "username": row["username"], "role": row["role"],
-            "active_deck": row["active_deck"] or 1}
+            "active_deck": row["active_deck"] or 1, "decks": decks}
 
 
 def record_attempt(username, ok):

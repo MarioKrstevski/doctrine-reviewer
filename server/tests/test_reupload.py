@@ -93,7 +93,7 @@ class ApplyTest(unittest.TestCase):
         self.assertIsNotNone(newrow)
         self.assertEqual(["t"], json.loads(newrow["tags_json"]))
         self.assertEqual({"upload:5"}, srcs)
-        self.assertEqual({"changed": 1, "added": 1, "retired": 0, "kept": 0}, out)
+        self.assertEqual({"changed": 1, "added": 1, "retired": 0, "kept": 0, "tagged": 0}, out)
 
     def test_decisions_keep_platform_or_skip(self):
         with running_server() as base:

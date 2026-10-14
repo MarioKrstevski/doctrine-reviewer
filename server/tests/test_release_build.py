@@ -133,7 +133,7 @@ class PatchTest(unittest.TestCase):
         self.assertEqual(before, open(self.src, "rb").read())
         c = rb.connect(self.dst)
         self.assertEqual((T0 + 7) * 1000, c.execute("SELECT mod FROM col").fetchone()[0])
-        self.assertEqual({"changed": 1, "added": 0, "retired": 0}, out)
+        self.assertEqual({"changed": 1, "added": 0, "retired": 0, "tagged": 0, "new_cards": 0}, out)
 
     def test_changing_a_field_the_note_type_lacks_is_refused(self):
         with self.assertRaises(ValueError):

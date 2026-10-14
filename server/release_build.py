@@ -2,7 +2,8 @@
 
 patch_collection(): copy the SQLite, then for every revised note rewrite the
 field blob, the sort field (first field stripped of HTML), the checksum
-(first 8 hex of sha1 of that), mod and usn=-1; insert new notes with cards;
+(first 8 hex of sha1 of that), mod and usn=-1; add a card for a cloze number
+an edit introduced; rewrite tags that changed; insert new notes with cards;
 delete retired notes with their cards and add graves; bump col.mod.
 
 Everything a student's import matches on -- note ids, guids, note type ids,
@@ -72,15 +73,26 @@ def _tags_blob(tags):
     return f" {' '.join(tags)} " if tags else ""
 
 
-def patch_collection(src_path, dst_path, changed, new_notes, retired, now):
+def _register_tags(conn, tags):
+    """Anki lists every tag in its `tags` table. Older schemas have none."""
+    try:
+        for t in tags:
+            conn.execute("INSERT OR IGNORE INTO tags (tag, usn, collapsed) VALUES (?, -1, 0)", (t,))
+    except sqlite3.OperationalError:
+        pass
+
+
+def patch_collection(src_path, dst_path, changed, new_notes, retired, now, tags=None):
     """changed: {guid: {field: value}} (full editable values); new_notes:
-    [{guid, note_type, fields, tags}]; retired: [guid]. Returns counts."""
+    [{guid, note_type, fields, tags}]; retired: [guid]; tags: {guid: [tag]} for
+    notes whose tags changed. Returns counts."""
     shutil.copyfile(src_path, dst_path)
     conn = connect(dst_path)
     try:
         types = _note_types(conn)
         by_id = {t["id"]: t for t in types.values()}
-        out = {"changed": 0, "added": 0, "retired": 0}
+        out = {"changed": 0, "added": 0, "retired": 0, "tagged": 0, "new_cards": 0}
+        cid = _fresh_id(conn, "cards", int(now) * 1000)
 
         for guid, values in changed.items():
             n = conn.execute("SELECT id, mid, flds FROM notes WHERE guid=?", (guid,)).fetchone()
@@ -97,10 +109,32 @@ def patch_collection(src_path, dst_path, changed, new_notes, retired, now):
             conn.execute("UPDATE notes SET flds=?, sfld=?, csum=?, mod=?, usn=-1 WHERE id=?",
                          (SEP.join(flds), strip_html(flds[0]), checksum(flds[0]), int(now), n["id"]))
             out["changed"] += 1
+            if t["cloze"]:
+                # Anki makes one card per cloze number. An edit that adds {{c3::...}}
+                # needs a c3 card, or the new cloze never shows up after import.
+                have = {r[0] for r in conn.execute("SELECT ord FROM cards WHERE nid=?", (n["id"],))}
+                want = {int(m) - 1 for m in _CLOZE_N.findall(flds[0])}
+                missing = sorted(want - have)
+                if missing:
+                    r = conn.execute("SELECT did FROM cards WHERE nid=? LIMIT 1", (n["id"],)).fetchone()
+                    did = r[0] if r else _main_deck(conn)
+                    for o in missing:
+                        conn.execute("INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, "
+                                     "lapses, left, odue, odid, flags, data) VALUES (?,?,?,?,?,-1,0,0,?,0,0,0,0,0,0,0,0,'')",
+                                     (cid, n["id"], did, o, int(now), n["id"]))
+                        cid += 1
+                        out["new_cards"] += 1
+
+        for guid, note_tags in (tags or {}).items():
+            n = conn.execute("SELECT id FROM notes WHERE guid=?", (guid,)).fetchone()
+            if n is None:
+                continue
+            conn.execute("UPDATE notes SET tags=?, mod=?, usn=-1 WHERE id=?", (_tags_blob(note_tags), int(now), n["id"]))
+            _register_tags(conn, note_tags)
+            out["tagged"] += 1
 
         deck = _main_deck(conn)
         nid = _fresh_id(conn, "notes", int(now) * 1000)
-        cid = _fresh_id(conn, "cards", int(now) * 1000)
         for note in new_notes:
             t = types.get(note.get("note_type") or "")
             if t is None:
@@ -110,6 +144,7 @@ def patch_collection(src_path, dst_path, changed, new_notes, retired, now):
                          "VALUES (?,?,?,?,-1,?,?,?,?,0,'')",
                          (nid, note["guid"], t["id"], int(now), _tags_blob(note.get("tags")),
                           SEP.join(flds), strip_html(flds[0]), checksum(flds[0])))
+            _register_tags(conn, [x for x in (note.get("tags") or []) if x])
             if t["cloze"]:
                 ords = sorted({int(m) - 1 for m in _CLOZE_N.findall(flds[0])}) or [0]
             else:

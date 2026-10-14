@@ -3,9 +3,10 @@
 `notes` always holds the current text, so the reviewer's master pane and the
 staleness hash keep working. Each changed field writes one `revisions` row
 with before/after, who, source ("suggestion:<id>", "upload:<id>", "staff")
-and the release it shipped in (NULL while pending). Note type, tags and the
-other fields are never edited here: tags are the scheduler's, and a note
-type change is a one-off event, not an edit.
+and the release it shipped in (NULL while pending). Tags are edited too, as one
+"tags" revision holding the before and after lists as JSON. The other fields
+and the note type are never edited here: a note type change is a one-off
+event, not an edit.
 """
 
 import json
@@ -64,6 +65,95 @@ def apply_edit(conn, guid, new_values, user_id, source):
     return {"changed": changed}
 
 
+def clean_tags(tags):
+    """Anki tags: no spaces inside a tag, no duplicates (case-insensitive, first kept), order kept."""
+    if isinstance(tags, str):
+        tags = tags.split()
+    out, seen = [], set()
+    for t in tags or []:
+        if not isinstance(t, str):
+            continue
+        for part in t.split():
+            if part.lower() not in seen:
+                seen.add(part.lower())
+                out.append(part)
+    return out
+
+
+def apply_tags(conn, guid, tags, user_id, source):
+    """Replace a note's tags. Records one "tags" revision with the before and after
+    lists as JSON. Returns True when something changed."""
+    row = conn.execute("SELECT tags_json FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+    if row is None:
+        raise LookupError(f"unknown note {guid!r}")
+    before = clean_tags(json.loads(row["tags_json"] or "[]"))
+    after = clean_tags(tags)
+    if {t.lower() for t in after} == {t.lower() for t in before}:
+        return False   # Anki tags ignore order and case
+    conn.execute(
+        """INSERT INTO revisions (guid, field, before, after, user_id, source, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (guid, "tags", json.dumps(before), json.dumps(after), user_id, source, _now()))
+    conn.execute("UPDATE notes SET tags_json=?, version=version+1, updated_at=? WHERE doctrine_id=?",
+                 (json.dumps(after), _now(), guid))
+    return True
+
+
+def tags_at(conn, guid, included, current=None):
+    """A note's tags once the releases in `included` shipped, like text_at."""
+    rows = conn.execute("SELECT release, before, after FROM revisions WHERE guid=? AND field='tags' ORDER BY id",
+                        (guid,)).fetchall()
+    done = [r for r in rows if r["release"] in included]
+    if done:
+        return json.loads(done[-1]["after"] or "[]")
+    if rows:
+        return json.loads(rows[0]["before"] or "[]")
+    return list(current or [])
+
+
+def retire_note(conn, guid, user_id, source):
+    """Take a note out of the deck at the next release. It stays in the database."""
+    row = conn.execute("SELECT 1 FROM notes WHERE doctrine_id=? AND retired=0", (guid,)).fetchone()
+    if row is None:
+        raise LookupError(f"unknown note {guid!r}")
+    conn.execute("UPDATE notes SET retired=1, version=version+1, updated_at=? WHERE doctrine_id=?", (_now(), guid))
+    conn.execute(
+        """INSERT INTO revisions (guid, field, before, after, user_id, source, created_at)
+           VALUES (?,?,?,?,?,?,?)""",
+        (guid, "retired", "0", "1", user_id, source, _now()))
+
+
+def revert_pending(conn, guid):
+    """Undo every unreleased change to one note: field and tag edits, a removal,
+    or the note's creation. Returns what happened: "reverted", "deleted" or None."""
+    revs = conn.execute("SELECT * FROM revisions WHERE guid=? AND release IS NULL ORDER BY id", (guid,)).fetchall()
+    if not revs:
+        return None
+    if any(r["field"] == "added" for r in revs):
+        conn.execute("DELETE FROM revisions WHERE guid=?", (guid,))
+        conn.execute("DELETE FROM notes WHERE doctrine_id=?", (guid,))
+        return "deleted"
+    row = conn.execute("SELECT fields_json, tags_json FROM notes WHERE doctrine_id=?", (guid,)).fetchone()
+    if row is None:
+        return None
+    fields = json.loads(row["fields_json"] or "{}")
+    tags = json.loads(row["tags_json"] or "[]")
+    first = {}
+    for r in revs:
+        first.setdefault(r["field"], r["before"])
+    for name in EDITABLE_FIELDS:
+        if name in first:
+            fields[name] = first[name] or ""
+    if "tags" in first:
+        tags = json.loads(first["tags"] or "[]")
+    conn.execute(
+        """UPDATE notes SET fields_json=?, tags_json=?, content_hash=?, retired=0,
+                  version=version+1, updated_at=? WHERE doctrine_id=?""",
+        (json.dumps(fields), json.dumps(tags), _content_hash(fields), _now(), guid))
+    conn.execute("DELETE FROM revisions WHERE guid=? AND release IS NULL", (guid,))
+    return "reverted"
+
+
 def new_guid(conn):
     """A 10-character base91 guid, the shape Anki itself generates."""
     while True:
@@ -116,14 +206,15 @@ KIND_LABELS = {
     "typo": "Typo / spelling",
     "incorrect": "Incorrect information",
     "confusing": "Confusing / unclear",
-    "media": "Image / audio",
+    "media": "Image / video",
     "other": "Other suggestions",
     "staff": "Direct edits",
     "upload": "Re-upload",
+    "tags": "Tags",
     "added": "New notes",
     "retired": "Retired notes",
 }
-KIND_ORDER = ["incorrect", "typo", "confusing", "media", "other", "staff", "upload", "added", "retired"]
+KIND_ORDER = ["incorrect", "typo", "confusing", "tags", "media", "other", "staff", "upload", "added", "retired"]
 
 
 def kind_of(conn, rev):

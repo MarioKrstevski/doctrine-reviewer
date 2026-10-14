@@ -34,14 +34,23 @@ from aqt.utils import tooltip, showInfo, showWarning, openLink
 from . import ping, versions, addon_log, chunk_util, identity, official, payload, resolver, state, sync, sync_plan, sync_state
 
 ADDON_NAME = "Doctrine Editor"
-ADDON_VERSION = "1.7.2"
+ADDON_VERSION = "1.8.0"
 
+# (key, label, what the text box asks for). Keys are stored on the server.
 SUGGESTION_TYPES = [
-    ("typo", "Typo / spelling"),
-    ("incorrect", "Incorrect information"),
-    ("confusing", "Confusing / unclear"),
-    ("media", "Image or audio problem"),
-    ("other", "Other"),
+    ("typo", "Typo / spelling",
+     "e.g. 'recieve' in the answer should be 'receive'."),
+    ("incorrect", "Incorrect information",
+     "e.g. The dose in the answer should be 5 mg, not 50 mg."),
+    ("confusing", "Confusing / unclear",
+     "What is hard to follow, and how would you say it?"),
+    ("tags", "Tags are wrong or missing",
+     "Describe it in your own words: which tag does not fit, or which one is missing and why. "
+     "e.g. This card also belongs to the cardiology lecture."),
+    ("media", "Image or video problem",
+     "Describe what is wrong with the image or video as best you can: which one, "
+     "what looks wrong, and what it should show."),
+    ("other", "Other", "Describe the issue or your suggestion."),
 ]
 
 
@@ -178,17 +187,16 @@ class SuggestionDialog(QDialog):
 
         layout.addWidget(QLabel("What kind of issue is it?"))
         self.type_box = QComboBox()
-        for key, label in SUGGESTION_TYPES:
+        for key, label, _ in SUGGESTION_TYPES:
             self.type_box.addItem(label, key)
         layout.addWidget(self.type_box)
 
         layout.addWidget(QLabel("Describe the issue or your suggestion:"))
         self.text_edit = QTextEdit()
-        self.text_edit.setPlaceholderText(
-            "e.g. The dose in the answer should be 5 mg, not 50 mg."
-        )
         self.text_edit.setMinimumHeight(110)
         layout.addWidget(self.text_edit)
+        self.type_box.currentIndexChanged.connect(self._on_type)
+        self._on_type(self.type_box.currentIndex())
 
         # Optional: propose the exact change. Editable copies of Text and
         # Extra; only fields that differ are sent. Never touches the note.
@@ -229,6 +237,10 @@ class SuggestionDialog(QDialog):
         layout.addLayout(btn_row)
 
         self.result_data = None
+
+    def _on_type(self, index):
+        prompts = {key: prompt for key, _, prompt in SUGGESTION_TYPES}
+        self.text_edit.setPlaceholderText(prompts.get(self.type_box.itemData(index), ""))
 
     def _toggle_propose(self, on):
         for lbl, edit in self.field_edits.values():

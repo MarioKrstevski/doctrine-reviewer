@@ -1,7 +1,9 @@
 """Build a concrete update plan from a sync payload and the local collection.
 
 Pure, so the rules are unit-tested without Anki:
-- only Text and Extra are ever written; tags and other fields are untouched
+- only Text and Extra are ever written; other fields are untouched
+- tags change only as the release says: its added tags are added and its
+  removed tags removed (case-insensitive), so tags the student made stay
 - a note the student does not have is skipped (not added) unless it is in
   `added`; an added note the student already has is updated instead
 - retired notes are reported, never deleted
@@ -11,6 +13,19 @@ Pure, so the rules are unit-tested without Anki:
 """
 
 EDITABLE = ("Text", "Extra")
+
+
+def merge_tags(local_tags, ops):
+    """The student's tags after a release's tag changes. None when nothing changes."""
+    local_tags = list(local_tags or [])
+    remove = {t.lower() for t in (ops.get("remove") or []) if isinstance(t, str)}
+    out = [t for t in local_tags if t.lower() not in remove]
+    have = {t.lower() for t in out}
+    for t in ops.get("add") or []:
+        if isinstance(t, str) and t.strip() and t.lower() not in have:
+            have.add(t.lower())
+            out.append(t)
+    return None if out == local_tags else out
 
 
 def plan(payload, local, media_have):
@@ -27,13 +42,18 @@ def plan(payload, local, media_have):
             continue
         new = wanted(ch.get("fields") or {})
         cur = local[guid].get("fields") or {}
-        if all(cur.get(f, "") == v for f, v in new.items()):
+        text_changes = any(cur.get(f, "") != v for f, v in new.items())
+        new_tags = merge_tags(local[guid].get("tags"), ch["tags"]) if isinstance(ch.get("tags"), dict) else None
+        if not text_changes and new_tags is None:
             continue
         before = ch.get("before") or {}
-        edited = any(cur.get(f, "") != before.get(f, cur.get(f, "")) for f in new)
+        edited = text_changes and any(cur.get(f, "") != before.get(f, cur.get(f, "")) for f in new)
         if edited:
             local_edits += 1
-        updates.append({"guid": guid, "nid": local[guid]["nid"], "fields": new, "local_edit": edited})
+        u = {"guid": guid, "nid": local[guid]["nid"], "fields": new if text_changes else {}, "local_edit": edited}
+        if new_tags is not None:
+            u["tags"] = new_tags
+        updates.append(u)
 
     for ad in payload.get("added") or []:
         guid = ad["guid"]

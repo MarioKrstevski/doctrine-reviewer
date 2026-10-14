@@ -3,8 +3,10 @@ apply only what staff confirmed. No HTTP here.
 
 Inputs are {guid: {"fields": {...}, "tags": [...]}} maps. Rules:
 - editable fields (Text, Extra) that differ are "changed" and can be applied
-- other field changes and tag changes are reported, never applied (tags are
-  the scheduler's; other fields are not edited on the platform)
+- tag changes (ignoring order and case) are listed per note and applied only
+  where staff chose the file's tags
+- other field changes are reported, never applied (they are not edited on
+  the platform)
 - notes with pending platform revisions are "conflicts": shown side by side,
   staff choose "file" or "platform" per note
 - notes missing from the file are never deleted; staff may retire them
@@ -13,7 +15,7 @@ Inputs are {guid: {"fields": {...}, "tags": [...]}} maps. Rules:
 
 import json
 
-from revisions import EDITABLE_FIELDS, add_note, apply_edit
+from revisions import EDITABLE_FIELDS, add_note, apply_edit, apply_tags, retire_note
 
 
 class IdMismatch(ValueError):
@@ -64,7 +66,7 @@ def compare(current, incoming, pending_guids=frozenset(), max_unknown_ratio=0.5)
                 others.append(name)
         if others:
             other[guid] = others
-        if list(cur.get("tags") or []) != list(inc.get("tags") or []):
+        if ({t.lower() for t in cur.get("tags") or []} != {t.lower() for t in inc.get("tags") or []}):
             tag_changes[guid] = (list(cur.get("tags") or []), list(inc.get("tags") or []))
         if diffs:
             if guid in pending_guids:
@@ -78,15 +80,16 @@ def compare(current, incoming, pending_guids=frozenset(), max_unknown_ratio=0.5)
             "tag_changes": tag_changes, "other_field_changes": other, "unchanged": unchanged}
 
 
-def apply(conn, diff, incoming, decisions, user_id, upload_id, deck_id=1):
+def apply(conn, diff, incoming, decisions, user_id, upload_id, deck_id=1, tag_decisions=None):
     """Apply confirmed parts of a diff.
 
     decisions: {guid: "file" | "platform" | "add" | "retire"}. Changed notes
     default to "file"; conflicts and missing notes need an explicit decision;
-    new notes need "add". Everything else is left alone.
+    new notes need "add". tag_decisions: {guid: "file"} applies that note's
+    tags from the file. Everything else is left alone.
     """
     source = f"upload:{upload_id}"
-    out = {"changed": 0, "added": 0, "retired": 0, "kept": 0}
+    out = {"changed": 0, "added": 0, "retired": 0, "kept": 0, "tagged": 0}
     for guid, info in list(diff["changed"].items()) + list(diff["conflicts"].items()):
         fields = info["fields"] if "fields" in info else info
         choice = decisions.get(guid, "file" if guid in diff["changed"] else "platform")
@@ -103,12 +106,20 @@ def apply(conn, diff, incoming, decisions, user_id, upload_id, deck_id=1):
             note_type = inc.get("note_type") or (row["note_type"] if row else "AnKingOverhaul++++++")
             _add_with_guid(conn, guid, note_type, fields, inc.get("tags") or [], user_id, source, deck_id)
             out["added"] += 1
+    for guid, (_, file_tags) in (diff.get("tag_changes") or {}).items():
+        if (tag_decisions or {}).get(guid) == "file":
+            try:
+                if apply_tags(conn, guid, file_tags, user_id, source):
+                    out["tagged"] += 1
+            except LookupError:
+                pass
     for guid in diff["missing"]:
         if decisions.get(guid) == "retire":
-            conn.execute("UPDATE notes SET retired=1 WHERE doctrine_id=?", (guid,))
-            conn.execute("INSERT INTO revisions (guid, field, before, after, user_id, source, created_at) "
-                         "VALUES (?,?,?,?,?,?,datetime('now'))", (guid, "retired", "0", "1", user_id, source))
-            out["retired"] += 1
+            try:
+                retire_note(conn, guid, user_id, source)
+                out["retired"] += 1
+            except LookupError:
+                pass
     return out
 
 

@@ -79,3 +79,25 @@ class VersionSummaryTest(unittest.TestCase):
         self.assertEqual("1 release behind", sp.version_summary("1.2", "1.3", 1)[2])
         self.assertEqual("", sp.version_summary("1.3", "1.3", 0)[2])
         self.assertEqual("Your deck: not recorded yet", sp.version_summary("", "1.3", None)[0])
+
+
+class TagPlanTest(unittest.TestCase):
+    def test_merge_keeps_the_students_own_tags(self):
+        from sync_plan import merge_tags
+        self.assertEqual(["Mine", "keep", "New"], merge_tags(["Mine", "keep", "gone"], {"add": ["New", "KEEP"], "remove": ["Gone"]}))
+        self.assertIsNone(merge_tags(["a", "b"], {"add": ["A"], "remove": ["c"]}), "nothing to change")
+
+    def test_tag_only_entry_updates_tags_and_leaves_text_alone(self):
+        payload = {"changed": [{"guid": "A", "fields": {}, "before": {}, "tags": {"add": ["T2"], "remove": ["T1"]}}],
+                   "added": [], "retired": [], "media": []}
+        local = {"A": {"nid": 1, "fields": {"Text": "my own edit", "Extra": ""}, "tags": ["T1", "Mine"]}}
+        p = plan(payload, local, media_have=set())
+        self.assertEqual([{"guid": "A", "nid": 1, "fields": {}, "local_edit": False, "tags": ["Mine", "T2"]}], p["updates"])
+        self.assertEqual(0, p["counts"]["local_edits"])
+
+    def test_text_and_tags_together(self):
+        payload = {"changed": [{"guid": "A", "fields": {"Text": "new", "Extra": ""}, "before": {"Text": "old", "Extra": ""},
+                                "tags": {"add": ["T2"], "remove": []}}], "added": [], "retired": [], "media": []}
+        local = {"A": {"nid": 1, "fields": {"Text": "old", "Extra": ""}, "tags": []}}
+        u = plan(payload, local, media_have=set())["updates"][0]
+        self.assertEqual(({"Text": "new", "Extra": ""}, ["T2"]), (u["fields"], u["tags"]))
