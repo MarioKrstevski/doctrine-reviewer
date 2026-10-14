@@ -98,7 +98,7 @@ class AddNoteTest(unittest.TestCase):
                 row = note(conn, guid)
                 revs = [dict(r) for r in conn.execute("SELECT * FROM revisions")]
         self.assertEqual(10, len(guid))
-        self.assertTrue(all(c in revisions.BASE91 for c in guid))
+        self.assertTrue(all(c in revisions.GUID_ALPHABET for c in guid))
         self.assertEqual("{{c1::new}}", json.loads(row["fields_json"])["Text"])
         self.assertEqual(["Doctorine::Yield::Step1::Gold"], json.loads(row["tags_json"]))
         self.assertEqual(1, row["version"])
@@ -118,3 +118,12 @@ class AddNoteTest(unittest.TestCase):
             with server.db() as conn:
                 with self.assertRaises(ValueError):
                     revisions.add_note(conn, "AnKingOverhaul++++++", {"Text": "  "}, [], 1)
+
+
+class NewGuidAlphabetTest(unittest.TestCase):
+    def test_new_guids_are_letters_and_digits_only(self):
+        import re
+        with running_server():
+            with server.db() as conn:
+                guids = [revisions.new_guid(conn) for _ in range(500)]
+        self.assertTrue(all(re.fullmatch(r"[A-Za-z0-9]{10}", g) for g in guids), guids[:5])

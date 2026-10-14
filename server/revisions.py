@@ -12,8 +12,11 @@ import json
 import secrets
 
 EDITABLE_FIELDS = ("Text", "Extra")
-BASE91 = ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-          "!#$%&()*+,-./:;<=>?@[]^_`{|}~")
+# Anki's own guids use base91, which includes < > & " ` and other characters that
+# need escaping in HTML and URLs. Cards created on the platform use letters and
+# digits only. Existing guids keep their characters: they are what matches each card
+# in students' collections, so they are escaped wherever they are shown instead.
+GUID_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 
 def _content_hash(fields):
@@ -64,7 +67,7 @@ def apply_edit(conn, guid, new_values, user_id, source):
 def new_guid(conn):
     """A 10-character base91 guid, the shape Anki itself generates."""
     while True:
-        g = "".join(secrets.choice(BASE91) for _ in range(10))
+        g = "".join(secrets.choice(GUID_ALPHABET) for _ in range(10))
         if conn.execute("SELECT 1 FROM notes WHERE doctrine_id=?", (g,)).fetchone() is None:
             return g
 
